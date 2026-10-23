@@ -1,0 +1,13 @@
+[package]
+name = "lumakit-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumakit-ai.workspace = true
+lumakit-ports.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "lumakit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumakit-support.workspace = true
+lumakit-observability.workspace = true
+lumakit-runtime.workspace = true
+lumakit-ports.workspace = true
+lumakit-ai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+zeroize.workspace = true
+
+[features]
+live-provider = []
+[lints]
+workspace = true

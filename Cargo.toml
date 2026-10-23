@@ -1,0 +1,65 @@
+[workspace]
+members = [
+  "crates/lumakit-support",
+  "crates/lumakit-observability",
+  "crates/lumakit-runtime",
+  "crates/lumakit-ports",
+  "crates/lumakit-ai",
+  "crates/lumakit-ui",
+  "crates/lumakit-egui",
+  "examples/chat-host",
+  "examples/lumakit-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+lumakit-support = { path = "crates/lumakit-support" }
+lumakit-observability = { path = "crates/lumakit-observability" }
+lumakit-runtime = { path = "crates/lumakit-runtime" }
+lumakit-ports = { path = "crates/lumakit-ports" }
+lumakit-ai = { path = "crates/lumakit-ai" }
+lumakit-ui = { path = "crates/lumakit-ui" }
+egui = "=0.33.3"
+eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+lumakit-egui = { path = "crates/lumakit-egui" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+zeroize = "1"
+base64 = "0.22"
+sha2 = "0.10"
+getrandom = "0.3"
+rusqlite = { version = "0.40", features = ["bundled"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+missing_errors_doc = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

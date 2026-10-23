@@ -1,0 +1,13 @@
+[package]
+name = "lumakit-chat-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe.workspace = true
+lumakit-ai.workspace = true
+lumakit-ui.workspace = true
+lumakit-egui.workspace = true
+lumakit-support.workspace = true
+zeroize.workspace = true
