@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 egui.workspace = true
-egui_commonmark = { version = "=0.22.0", default-features = false }
+egui_commonmark = { version = "=0.26.0", default-features = false }
 pulldown-cmark = { version = "0.13", default-features = false }
 lumakit-ai.workspace = true
 lumakit-ui.workspace = true

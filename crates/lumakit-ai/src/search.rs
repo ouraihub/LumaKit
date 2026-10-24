@@ -8,8 +8,11 @@ use std::{future::Future, net::IpAddr, pin::Pin};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
+    /// 搜索来源的标题。
     pub title: String,
+    /// 搜索来源的链接地址。
     pub url: String,
+    /// 搜索来源的摘要文本。
     pub snippet: String,
 }
 
@@ -17,8 +20,11 @@ pub struct SearchHit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
+    /// 本次搜索对应的查询文本。
     pub query: String,
+    /// 返回结果的搜索提供方标识。
     pub provider: String,
+    /// 按提供方顺序保留的搜索来源列表。
     pub hits: Vec<SearchHit>,
 }
 
@@ -49,7 +55,9 @@ impl Default for SearchPreferences {
 
 /// Async boundary implemented by an external search adapter.
 pub trait SearchProvider: Send + Sync {
+    /// 返回搜索提供方的稳定标识。
     fn id(&self) -> &str;
+    /// 按查询文本和用户偏好异步获取搜索结果，失败时返回 AI 错误。
     fn search<'a>(
         &'a self,
         query: &'a str,
@@ -60,14 +68,21 @@ pub trait SearchProvider: Send + Sync {
 /// Native search capability and the protocol-specific tool selected for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeSearchDecision {
+    /// 用于选择原生搜索工具的模型协议。
     pub protocol: Protocol,
+    /// 模型是否明确声明支持原生搜索。
     pub declared: bool,
+    /// 原生搜索是否已启用。
     pub enabled: bool,
+    /// 用户是否优先使用模型原生搜索。
     pub preferred: bool,
+    /// 全部门控满足且协议受支持时选择的工具名称，否则为 `None`。
     pub tool: Option<&'static str>,
 }
 
 impl NativeSearchDecision {
+    /// 根据能力声明、启用状态和用户偏好选择协议支持的原生搜索工具。
+    /// OpenAI Chat 协议不会选择原生搜索工具。
     pub fn new(protocol: Protocol, declared: bool, enabled: bool, preferred: bool) -> Self {
         let tool = if declared && enabled && preferred {
             match protocol {
@@ -87,6 +102,7 @@ impl NativeSearchDecision {
         }
     }
 
+    /// 返回当前决策是否已选择可用的原生搜索工具。
     pub fn use_native(self) -> bool {
         self.tool.is_some()
     }

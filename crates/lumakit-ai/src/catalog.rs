@@ -3,30 +3,90 @@ use crate::{AiConnection, ModelRef, Protocol, providers::ModelCapabilities};
 use lumakit_support::secrets::SavedKey;
 use serde::{Deserialize, Serialize};
 
+/// 已保存模型的标识、能力与录入来源。
 #[derive(Clone, Serialize, Deserialize)]
-pub struct ModelEntry { pub id: String, pub capabilities: ModelCapabilities, pub manual: bool }
+pub struct ModelEntry {
+    /// 模型标识。
+    pub id: String,
+    /// 模型声明支持的功能。
+    pub capabilities: ModelCapabilities,
+    /// 是否为手动录入的模型。
+    pub manual: bool,
+    /// 已保存的模型元数据和实际请求控制。
+    #[serde(default)]
+    pub settings: crate::model_config::ModelSettings,
+}
+/// 已保存线路的地址、协议、模型和凭据选择。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EndpointEntry {
-    pub id: String, pub name: String, pub base_url: String, pub protocol: Protocol,
-    pub keys: Vec<SavedKey>, pub models: Vec<ModelEntry>, pub selected_key: Option<String>, pub selected_model: Option<String>,
+    /// 线路标识。
+    pub id: String,
+    /// 线路显示名称。
+    pub name: String,
+    /// 请求基础地址，解析连接时会再次校验。
+    pub base_url: String,
+    /// 请求使用的协议。
+    pub protocol: Protocol,
+    /// 已保存的封装凭据。
+    pub keys: Vec<SavedKey>,
+    /// 已保存的模型列表。
+    pub models: Vec<ModelEntry>,
+    /// 首选凭据标识；不存在或未匹配时解析连接使用首个凭据。
+    pub selected_key: Option<String>,
+    /// 已保存的模型选择标识；解析连接仍以传入的模型引用为准。
+    pub selected_model: Option<String>,
 }
+/// 已保存的服务商及其启用状态和线路。
 #[derive(Clone, Serialize, Deserialize)]
-pub struct ProviderEntry { pub id: String, pub name: String, pub enabled: bool, pub endpoints: Vec<EndpointEntry> }
+pub struct ProviderEntry {
+    /// 服务商标识。
+    pub id: String,
+    /// 服务商显示名称。
+    pub name: String,
+    /// 是否允许从该服务商解析连接。
+    pub enabled: bool,
+    /// 服务商的已保存线路。
+    pub endpoints: Vec<EndpointEntry>
+}
 
 /// 只接收已保存快照；草稿从不参与请求。
 pub struct ModelCatalog { providers: Vec<ProviderEntry> }
 impl ModelCatalog {
+    /// 使用已保存的服务商快照创建目录。
     pub fn new(providers: Vec<ProviderEntry>) -> Self { Self { providers } }
+    /// 返回目录中的服务商只读切片。
     pub fn providers(&self) -> &[ProviderEntry] { &self.providers }
+    /// 校验模型引用和线路地址，并解封选中凭据以构造连接。
+    ///
+    /// 服务商停用、线路或模型不匹配、地址无效或凭据解封失败时返回错误。
     pub fn resolve(&self, model: &ModelRef) -> Result<AiConnection, String> {
         let provider = self.providers.iter().find(|p| p.enabled && p.id == model.provider).ok_or("所选服务商已停用或删除，请重新选择模型")?;
         let endpoint = provider.endpoints.iter().find(|e| e.id == model.endpoint && e.protocol == model.protocol).ok_or("所选线路已更改或删除，请重新选择模型")?;
-        if !endpoint.models.iter().any(|m| m.id == model.model) { return Err("所选模型已删除，请重新选择模型".into()); }
+        let entry = endpoint.models.iter().find(|m| m.id == model.model).ok_or("所选模型已删除，请重新选择模型")?;
+        entry.settings.validate(endpoint.protocol)?;
+        if entry.settings.model_type != crate::model_config::ModelType::Chat { return Err("所选模型不是聊天类型，请使用对应业务接口".into()); }
         let key = endpoint.selected_key.as_ref().and_then(|id| endpoint.keys.iter().find(|k| &k.id == id)).or_else(|| endpoint.keys.first());
-        Ok(AiConnection { base_url: validate_url(&endpoint.base_url)?, protocol: endpoint.protocol, model: model.model.clone(), api_key: key.map(SavedKey::open).transpose()? })
+        let mut settings = entry.settings.clone();
+        settings.supports_streaming = entry.capabilities.streaming;
+        settings.supports_tools = settings.supports_tools.or(entry.capabilities.tools.then_some(true));
+        Ok(AiConnection { base_url: validate_url(&endpoint.base_url)?, protocol: endpoint.protocol, model: model.model.clone(), api_key: key.map(SavedKey::open).transpose()?, settings })
+    }
+    /// Resolves a saved model while requiring a specific non-chat consumer type.
+    pub fn resolve_for(&self, model: &ModelRef, expected: crate::model_config::ModelType) -> Result<AiConnection, String> {
+        let provider = self.providers.iter().find(|p| p.enabled && p.id == model.provider).ok_or("所选服务商已停用或删除，请重新选择模型")?;
+        let endpoint = provider.endpoints.iter().find(|e| e.id == model.endpoint && e.protocol == model.protocol).ok_or("所选线路已更改或删除，请重新选择模型")?;
+        let entry = endpoint.models.iter().find(|m| m.id == model.model).ok_or("所选模型已删除，请重新选择模型")?;
+        entry.settings.validate(endpoint.protocol)?;
+        if entry.settings.model_type != expected { return Err("所选模型类型与当前业务不匹配".into()); }
+        let key = endpoint.selected_key.as_ref().and_then(|id| endpoint.keys.iter().find(|k| &k.id == id)).or_else(|| endpoint.keys.first());
+        let mut settings = entry.settings.clone(); settings.supports_streaming = entry.capabilities.streaming; settings.supports_tools = settings.supports_tools.or(entry.capabilities.tools.then_some(true));
+        Ok(AiConnection { base_url: validate_url(&endpoint.base_url)?, protocol: endpoint.protocol, model: model.model.clone(), api_key: key.map(SavedKey::open).transpose()?, settings })
     }
 }
 
+/// 校验基础地址并移除末尾斜杠；仅允许 HTTPS 或回环主机的 HTTP。
+///
+/// 拒绝超过 4096 字节、缺少主机名或含凭据、查询参数、片段的地址。
 pub fn validate_url(raw: &str) -> Result<String, String> {
     if raw.len() > 4096 { return Err("基础地址过长，最多 4096 字节".into()); }
     let url = reqwest::Url::parse(raw.trim()).map_err(|_| "基础地址无效，请填写完整 HTTPS 地址".to_owned())?;
@@ -35,4 +95,23 @@ pub fn validate_url(raw: &str) -> Result<String, String> {
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() { return Err("地址不得包含用户名、密码、查询参数或片段".into()); }
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) { return Err("仅允许 HTTPS；HTTP 仅限回环主机".into()); }
     Ok(url.to_string().trim_end_matches('/').to_owned())
+}
+
+#[cfg(test)]
+mod model_settings_tests {
+    use super::*;
+    #[test]
+    fn resolver_preserves_unknown_tools_and_rejects_non_chat() {
+        let model = ModelRef { provider:"p".into(),endpoint:"e".into(),model:"m".into(),protocol:Protocol::OpenAiChat };
+        let entry = ModelEntry { id:"m".into(),capabilities:ModelCapabilities::default(),manual:true,settings:Default::default() };
+        let mut providers = vec![ProviderEntry { id:"p".into(),name:"p".into(),enabled:true,endpoints:vec![EndpointEntry { id:"e".into(),name:"e".into(),base_url:"https://example.com/v1".into(),protocol:Protocol::OpenAiChat,keys:Vec::new(),models:vec![entry],selected_key:None,selected_model:None }] }];
+        assert_eq!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_tools,None);
+        providers[0].endpoints[0].models[0].capabilities.tools = true;
+        assert_eq!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_tools,Some(true));
+        providers[0].endpoints[0].models[0].settings.supports_tools = Some(false);
+        assert_eq!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_tools,Some(false));
+        providers[0].endpoints[0].models[0].settings.supports_tools = None;
+        providers[0].endpoints[0].models[0].settings.model_type = crate::model_config::ModelType::Embedding;
+        assert!(ModelCatalog::new(providers).resolve(&model).unwrap_err().contains("不是聊天类型"));
+    }
 }

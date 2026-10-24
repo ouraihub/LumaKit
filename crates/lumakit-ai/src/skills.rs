@@ -7,64 +7,105 @@ use std::{
 };
 use thiserror::Error;
 
+/// SKILL.md 文档允许的最大字节数（64 KiB）。
 pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+/// 许可证内容的最大字节数（32 KiB）。
 pub const MAX_LICENSE_BYTES: usize = 32 * 1024;
+/// 技能名称允许的最大字节数。
 pub const MAX_NAME_BYTES: usize = 64;
+/// 技能描述允许的最大字节数。
 pub const MAX_DESCRIPTION_BYTES: usize = 1024;
+/// 技能版本字符串允许的最大字节数。
 pub const MAX_VERSION_BYTES: usize = 64;
 
+/// 技能解析、安装、快照或存储过程中发生的错误。
 #[derive(Debug, Error)]
 pub enum SkillError {
+    /// 文档格式、字段或内容不符合限制。
     #[error("invalid SKILL.md: {0}")]
     Invalid(String),
+    /// 存储中不存在指定标识的技能。
     #[error("skill not found: {0}")]
     NotFound(String),
+    /// 确认摘要与预览摘要或技能摘要不一致。
     #[error("digest confirmation failed")]
     DigestMismatch,
+    /// 快照请求的技能修订号与当前存储不一致。
     #[error("skill revision mismatch for {id}: expected {expected}, found {actual}")]
     RevisionMismatch {
+        /// 修订号不匹配的技能标识。
         id: String,
+        /// 引用所要求的修订号。
         expected: u64,
+        /// 存储中技能的实际修订号。
         actual: u64,
     },
+    /// 技能正文的总字节数超过预算。
     #[error("skill budget exceeded: {used} > {limit} bytes")]
-    BudgetExceeded { used: usize, limit: usize },
+    BudgetExceeded {
+        /// 技能正文实际占用的总字节数。
+        used: usize,
+        /// 允许的最大正文总字节数。
+        limit: usize,
+    },
+    /// 读取或保存技能存储时发生 I/O 错误。
     #[error("skill store I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// 技能存储的 JSON 序列化或反序列化失败。
     #[error("skill store JSON failed: {0}")]
     Json(#[from] serde_json::Error),
 }
 
+/// 包含元数据、正文、来源及安装修订号的技能。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Skill {
+    /// 技能标识；解析文档时取自名称。
     pub id: String,
+    /// 由 ASCII 字母、数字、点、连字符或下划线组成的名称。
     pub name: String,
+    /// 技能用途的简短描述。
     pub description: String,
+    /// 文档声明的版本字符串。
     pub version: String,
+    /// 去除前置元数据及正文开头换行后的正文。
     pub body: String,
+    /// 可选的许可证内容；解析文档时默认为无。
     #[serde(default)]
     pub license: Option<String>,
+    /// 安装时分配的存储修订号；新解析的技能为零。
     pub revision: u64,
+    /// 原始文档字节的内容摘要，用于安装确认。
     pub digest: String,
+    /// 调用方提供的技能来源描述。
     pub origin: String,
 }
 
+/// 固定技能标识及修订号的引用，用于构建快照。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillRef {
+    /// 引用的技能标识。
     pub id: String,
+    /// 引用要求的技能修订号。
     pub revision: u64,
 }
 
+/// 按引用顺序复制并通过正文预算检查的技能快照。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillSnapshot {
+    /// 创建快照时存储的整体修订号。
     pub store_revision: u64,
+    /// 按请求引用顺序排列的技能副本。
     pub skills: Vec<Skill>,
+    /// 快照中所有技能正文的总字节数。
     pub total_body_bytes: usize,
 }
 
+/// 安装前解析得到的技能及待确认摘要。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkillPreview {
+    /// 待安装的技能；已存在时沿用当前修订号。
     pub skill: Skill,
+    /// 需要调用方确认的文档摘要。
     pub digest: String,
 }
 
@@ -74,6 +115,7 @@ struct SkillState {
     skills: BTreeMap<String, Skill>,
 }
 
+/// 以 JSON 文件持久化技能及整体修订号的存储。
 #[derive(Debug)]
 pub struct SkillStore {
     path: PathBuf,
@@ -229,6 +271,7 @@ pub fn digest(bytes: &[u8]) -> String {
 }
 
 impl SkillStore {
+    /// 打开并读取 JSON 存储；文件不存在时使用空存储，不立即写入文件。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SkillError> {
         let path = path.as_ref().to_owned();
         let state = if path.exists() {
@@ -239,6 +282,7 @@ impl SkillStore {
         Ok(Self { path, state })
     }
 
+    /// 解析文档并生成安装预览，不修改存储；已有技能保留当前修订号。
     pub fn preview(
         &self,
         document: &str,
@@ -252,6 +296,7 @@ impl SkillStore {
         Ok(SkillPreview { skill, digest })
     }
 
+    /// 解析文档，核对确认摘要后安装或替换同标识技能并保存。
     pub fn install(
         &mut self,
         document: &str,
@@ -262,6 +307,9 @@ impl SkillStore {
         self.install_preview(&preview, confirmed_digest)
     }
 
+    /// 核对预览及技能摘要，分配新的整体修订号并保存技能。
+    ///
+    /// 此方法不重新解析预览；保存失败时内存中的修改不会回滚。
     pub fn install_preview(
         &mut self,
         preview: &SkillPreview,
@@ -280,13 +328,18 @@ impl SkillStore {
         Ok(SkillRef { id, revision })
     }
 
+    /// 按标识借用当前技能，不存在时返回 `None`。
     pub fn get(&self, id: &str) -> Option<&Skill> {
         self.state.skills.get(id)
     }
+    /// 返回存储当前的整体修订号。
     pub fn revision(&self) -> u64 {
         self.state.revision
     }
 
+    /// 按引用顺序复制技能，并检查每个修订号及正文总字节预算。
+    ///
+    /// 技能缺失、修订号不匹配或正文总字节数超过 `budget` 时返回错误。
     pub fn snapshot(&self, refs: &[SkillRef], budget: usize) -> Result<SkillSnapshot, SkillError> {
         let mut skills = Vec::with_capacity(refs.len());
         for reference in refs {
@@ -328,6 +381,7 @@ impl SkillStore {
     }
 }
 
+/// 累加技能正文的字节数，未超过 `limit` 时返回总数，否则返回预算错误。
 pub fn check_budget(skills: &[Skill], limit: usize) -> Result<usize, SkillError> {
     let used = skills.iter().map(|skill| skill.body.len()).sum();
     if used > limit {

@@ -1,3 +1,4 @@
+//! 无界面消费共享库；默认输出演示状态，显式设置服务地址后才发起模型请求。
 use lumakit_ai::{
     AiConnection, AiError, AiHost, Approval, RunRequest, ToolCall, ToolFuture, ToolOutput, ToolSpec,
 };
@@ -34,6 +35,7 @@ impl AiHost for Host {
             protocol: model.protocol,
             api_key: std::env::var("LUMAKIT_AI_KEY").ok().map(Zeroizing::new),
             model: model.model.clone(),
+            settings: Default::default(),
         })
     }
     fn call_tool(&self, _: ToolCall, _: tokio_util::sync::CancellationToken) -> ToolFuture {

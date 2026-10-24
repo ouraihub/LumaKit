@@ -1,3 +1,4 @@
+//! 纯文本流式聊天的请求编码、响应处理及失败边界集成测试。
 use lumakit_ai::{AiConnection, AiError, ChatMessage, Protocol, stream_chat};
 use serde_json::{Value, json};
 use std::{
@@ -25,6 +26,7 @@ fn connection(base_url: String, protocol: Protocol) -> AiConnection {
         protocol,
         api_key: Some(Zeroizing::new(KEY.into())),
         model: "loopback-model".into(),
+        settings: Default::default(),
     }
 }
 
@@ -99,8 +101,27 @@ fn server(
         }
         let payload: Value = serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
         assert_eq!(payload["model"], "loopback-model");
-        assert_eq!(payload["stream"], true);
-        assert!(payload.get("tools").is_none());
+        let json_response = body.starts_with('{');
+        assert_eq!(payload["stream"], !json_response);
+        if json_response {
+            let limit = if protocol == Protocol::OpenAiResponses { "max_output_tokens" } else { "max_tokens" };
+            assert_eq!(payload[limit], 8192);
+            assert!(payload.get("stream_options").is_none());
+            match protocol {
+                Protocol::OpenAiChat => {
+                    assert_eq!(payload["reasoning_effort"], "high");
+                    assert!(payload.get("tools").is_none());
+                }
+                Protocol::OpenAiResponses => {
+                    assert_eq!(payload["reasoning"]["effort"], "high");
+                    assert_eq!(payload["tools"][0]["type"], "web_search");
+                }
+                Protocol::AnthropicMessages => {
+                    assert_eq!(payload["thinking"], json!({"type":"enabled","budget_tokens":1638}));
+                    assert_eq!(payload["tools"][0]["type"], "web_search_20250305");
+                }
+            }
+        } else { assert!(payload.get("tools").is_none()); }
         let messages = if protocol == Protocol::OpenAiResponses { &payload["input"] } else { &payload["messages"] };
         assert_eq!(messages.as_array().unwrap().len(), 3);
         assert_eq!(messages[0], json!({"role":"user","content":"之前的问题"}));
@@ -113,7 +134,8 @@ fn server(
         }
         // status=0：已连接，但上游尚未返回响应头。
         if status != 0 {
-            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + usize::from(hold) * 100).unwrap();
+            let content_type = if json_response { "application/json" } else { "text/event-stream" };
+            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + usize::from(hold) * 100).unwrap();
             let chunk_size = if body.len() > 8192 { 4096 } else { 1 };
             for chunk in body.as_bytes().chunks(chunk_size) {
                 if socket.write_all(chunk).is_err() {
@@ -247,4 +269,40 @@ async fn openai_responses_text_chat_loopback() {
     assert_eq!(partial, "被截断的回复");
     assert!(error.to_string().contains("provider response incomplete"));
     worker.join().unwrap();
+}
+
+#[tokio::test]
+async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
+    use lumakit_ai::{model_config::*, stream_chat_with_usage};
+    for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+        // 固定协议响应不是请求回显：真实 HTTP 请求必须先通过 fixture 的字段断言。
+        let body = match protocol {
+            Protocol::OpenAiChat => json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"完成"}}],"usage":{"prompt_tokens":200,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":50}}}),
+            Protocol::OpenAiResponses => json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"完成"}]}],"usage":{"input_tokens":200,"output_tokens":20,"input_tokens_details":{"cached_tokens":50}}}),
+            Protocol::AnthropicMessages => json!({"stop_reason":"end_turn","content":[{"type":"text","text":"完成"}],"usage":{"input_tokens":150,"output_tokens":20,"cache_read_input_tokens":50}}),
+        }.to_string();
+        let (url, worker) = server(protocol,200,body,false,None);
+        let pricing = ModelPricing { currency:"CNY".into(), tiers: vec![
+            PriceTier { min_input_tokens:0,input:1.0,output:2.0,cache_read:None,cache_write:None },
+            PriceTier { min_input_tokens:200,input:2.0,output:4.0,cache_read:Some(0.5),cache_write:Some(3.0) },
+        ] };
+        let mut c = connection(url,protocol);
+        c.settings = ModelSettings {
+            context_window:Some(32768),max_output:Some(8192),supports_streaming:false,
+            native_web_search:protocol != Protocol::OpenAiChat,
+            reasoning:Some(ReasoningConfig { dialect:if protocol == Protocol::AnthropicMessages { ReasoningDialect::AnthropicBudget } else { ReasoningDialect::OpenAi }, efforts:vec![ReasoningEffort::High],budget_tokens:if protocol == Protocol::AnthropicMessages { Some(2048) } else { None } }),
+            pricing:Some(pricing.clone()),..Default::default()
+        };
+        let mut deltas = Vec::new();
+        let run = stream_chat_with_usage(c,history(),CancellationToken::new(),|text| deltas.push(text)).await.unwrap();
+        worker.join().unwrap();
+        assert_eq!(run.text,"完成");
+        assert_eq!(deltas,["完成"]);
+        assert_eq!(run.rounds.len(),1);
+        let round = &run.rounds[0];
+        assert_eq!(round.usage,Some(TokenUsage {input_tokens:200,output_tokens:20,cache_read_tokens:50,cache_write_tokens:0}));
+        assert_eq!(round.pricing,Some(pricing));
+        assert!((round.cost.unwrap()-0.000405).abs()<1e-12);
+        assert!(run.tool_calls.is_empty());
+    }
 }

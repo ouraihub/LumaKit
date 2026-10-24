@@ -28,7 +28,12 @@ pub enum SqliteError {
     Io(#[from] io::Error),
     /// The database was written by a newer application version.
     #[error("database version {actual} is newer than supported version {supported}")]
-    FutureVersion { actual: u32, supported: u32 },
+    FutureVersion {
+        /// 数据库实际记录的版本。
+        actual: u32,
+        /// 当前迁移列表支持的最高版本。
+        supported: u32,
+    },
     /// The migration list is not strictly ordered or contains version zero.
     #[error("migrations must be strictly ordered and start at a non-zero version")]
     InvalidMigrations,

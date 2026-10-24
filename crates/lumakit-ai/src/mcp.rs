@@ -48,9 +48,12 @@ impl McpServerConfig {
 /// A tool advertised by an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpTool {
+    /// 服务端用于标识和调用此工具的名称。
     pub name: String,
+    /// 工具用途说明；服务端未提供时为空字符串。
     #[serde(default)]
     pub description: String,
+    /// 工具调用参数的 JSON Schema，对应协议中的 `inputSchema`。
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
 }
@@ -77,24 +80,38 @@ impl McpTool {
 /// Result of an MCP tool call. A transport failure after sending is unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpCallResult {
+    /// 工具成功返回的文本，各文本片段以换行连接。
     Text(String),
+    /// 工具报告的错误文本，或不受支持的非文本结果说明。
     Error(String),
+    /// HTTP 或协议故障导致无法确定工具是否已执行及其结果。
     Unknown,
 }
 
 /// Errors raised while configuring or speaking MCP.
 #[derive(Debug, Error)]
 pub enum McpError {
+    /// 服务端 URL 无法解析或不符合端点安全策略。
     #[error("invalid MCP URL: {0}")]
     InvalidUrl(String),
+    /// 服务端尚未同时获得启用和信任授权。
     #[error("MCP server is not enabled and trusted")]
     NotAllowed,
+    /// HTTP 请求、响应读取或状态检查失败。
     #[error("MCP HTTP request failed: {0}")]
     Http(String),
+    /// 服务端返回的 JSON-RPC 错误码和说明。
     #[error("MCP JSON-RPC error {code}: {message}")]
-    Rpc { code: i64, message: String },
+    Rpc {
+        /// 服务端返回的 JSON-RPC 错误码。
+        code: i64,
+        /// 服务端返回的错误说明。
+        message: String,
+    },
+    /// 服务端响应不符合预期的 MCP 协议结构。
     #[error("invalid MCP response: {0}")]
     Protocol(String),
+    /// 工具名称、描述长度或输入 Schema 不符合客户端限制。
     #[error("invalid MCP tool: {0}")]
     InvalidTool(String),
 }

@@ -1,5 +1,6 @@
 //! Shared, UI-free contracts for LumaKit desktop applications.
 pub mod sqlite;
+/// 随机配置 ID 与系统加密凭据；明文仅在显式解密时短暂持有。
 pub mod secrets;
 pub use secrets::new_id;
 use serde::{Serialize, de::DeserializeOwned};
@@ -10,20 +11,32 @@ use std::{
 };
 use thiserror::Error;
 
+/// 数据目录、文件锁和版本化设置操作失败的原因。
 #[derive(Debug, Error)]
 pub enum SupportError {
+    /// 应用标识不合法，或无法取得可执行文件所在目录。
     #[error("invalid app slug")]
     InvalidAppSlug,
+    /// 文件系统、写入探针或随机标识生成失败。
     #[error("path operation failed")]
     Io(#[from] std::io::Error),
+    /// 设置 JSON 编码或解码失败，调用方不应覆盖原文件。
     #[error("settings serialization failed")]
     Json(#[from] serde_json::Error),
+    /// 文件版本高于当前支持值；拒绝加载，避免旧程序误写新格式。
     #[error("settings version {0} is newer than this application")]
     FutureVersion(u32),
+    /// 未能取得独占文件锁，可能已被其它实例持有。
     #[error("another process is using this data directory")]
     AlreadyOpen,
 }
 
+/// 校验 1–32 字节的小写字母、数字或连字符标识，再返回可执行文件旁的可写 data 目录。
+///
+/// 标识不用于目录隔离；不同标识仍使用同一便携目录。
+///
+/// # Errors
+/// 标识不合法返回 [`SupportError::InvalidAppSlug`]；目录创建或可写探测失败返回 I/O 错误。
 pub fn data_root(app_slug: &str) -> Result<PathBuf, SupportError> {
     if app_slug.is_empty()
         || app_slug.len() > 32
@@ -50,6 +63,10 @@ pub fn portable_data_root() -> Result<PathBuf, SupportError> {
 #[derive(Debug)]
 pub struct FileLock { _file: File }
 impl FileLock {
+    /// 创建父目录并取得独占文件锁；持有本值期间保持锁定，释放本值后解锁。
+    ///
+    /// # Errors
+    /// 创建或打开失败返回 I/O 错误；任何内核锁定失败均映射为 [`SupportError::AlreadyOpen`]。
     pub fn acquire(path: &Path) -> Result<Self, SupportError> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) { fs::create_dir_all(parent)?; }
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
@@ -76,6 +93,10 @@ pub fn atomic_write(path: &Path, write: impl FnOnce(&mut BufWriter<File>) -> Res
     result
 }
 
+/// 将值与 schemaVersion 一起原子保存；替换失败时保留旧文件。
+///
+/// # Errors
+/// JSON 序列化或文件创建、同步、替换失败时返回错误。
 pub fn save_versioned<T: Serialize>(
     path: &Path,
     version: u32,
@@ -86,6 +107,10 @@ pub fn save_versioned<T: Serialize>(
     atomic_write(path, |writer| { serde_json::to_writer(writer, &Envelope { version, value })?; Ok(()) })
 }
 
+/// 读取版本与值；文件不存在返回 None，缺省 schemaVersion 按 0 处理，不自动迁移。
+///
+/// # Errors
+/// 先检查版本上限，再解码值；新版本返回 [`SupportError::FutureVersion`]，读取或格式错误原样返回。
 pub fn load_versioned<T: DeserializeOwned>(
     path: &Path,
     supported: u32,
@@ -103,6 +128,9 @@ pub fn load_versioned<T: DeserializeOwned>(
     Ok(Some((version, serde_json::from_slice::<Envelope<T>>(&bytes)?.value)))
 }
 
+/// 按 Unicode 字符脱敏：超过八字符保留前后各四个，其余替换为星号；短值全部遮蔽。
+///
+/// 空串显示一个星号；此方法只改变显示，不提供加密或安全存储。
 pub fn mask_secret(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= 8 {

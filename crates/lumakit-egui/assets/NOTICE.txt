@@ -1,0 +1,4 @@
+LumaKit embeds the original Phosphor.ttf icon font distributed with egui-phosphor 0.11.0.
+Source: https://github.com/amPerl/egui-phosphor
+The original font bytes and existing glyph mappings are retained; no egui-phosphor runtime dependency is required.
+Distributed under the accompanying MIT or Apache-2.0 terms in LICENSE-MIT and LICENSE-APACHE.

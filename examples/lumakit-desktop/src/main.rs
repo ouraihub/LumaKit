@@ -74,6 +74,7 @@ impl AiHost for DemoAiHost {
             protocol: model.protocol,
             api_key: std::env::var("LUMAKIT_AI_KEY").ok().map(Zeroizing::new),
             model: model.model.clone(),
+            settings: Default::default(),
         })
     }
 
@@ -216,14 +217,14 @@ impl DesktopApp {
 }
 
 impl eframe::App for DesktopApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.dark {
-            ctx.set_visuals(egui::Visuals::dark());
+            ui.ctx().set_visuals(egui::Visuals::dark());
         } else {
-            ctx.set_visuals(egui::Visuals::light());
+            ui.ctx().set_visuals(egui::Visuals::light());
         }
 
-        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+        egui::Panel::top("topbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("LumaKit");
                 ui.separator();
@@ -235,19 +236,22 @@ impl eframe::App for DesktopApp {
                 });
             });
         });
-        egui::SidePanel::left("sidebar").resizable(false).default_width(64.0).show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                for (index, icon) in ["⌂", "▢", "✣", "✎", "▤", "文"].iter().enumerate() {
-                    if ui
-                        .add_sized([40.0, 42.0], egui::Button::new(RichText::new(*icon).size(20.0)))
-                        .clicked()
-                    {
-                        self.active = index;
+        egui::Panel::left("sidebar")
+            .resizable(false)
+            .default_size(64.0)
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    for (index, icon) in ["⌂", "▢", "✣", "✎", "▤", "文"].iter().enumerate() {
+                        if ui
+                            .add_sized([40.0, 42.0], egui::Button::new(RichText::new(*icon).size(20.0)))
+                            .clicked()
+                        {
+                            self.active = index;
+                        }
                     }
-                }
+                });
             });
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.active == 0 {
                 self.launcher(ui);
             } else {

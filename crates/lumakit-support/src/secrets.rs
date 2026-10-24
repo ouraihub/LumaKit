@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 use std::fmt::Write as _;
 
+/// 用系统随机源生成 16 字节随机值，编码为 32 位小写十六进制标识。
+///
+/// # Errors
+/// 系统随机源或标识编码失败时返回可展示的错误信息。
 pub fn new_id() -> Result<String, String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| "无法生成配置标识，请重试".to_owned())?;
@@ -11,20 +15,32 @@ pub fn new_id() -> Result<String, String> {
     Ok(id)
 }
 
+/// 可序列化的加密凭据；不存储明文，解密依赖当前平台与用户环境。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SavedKey {
+    /// 稳定凭据标识；替换密钥不会改变它。
     pub id: String,
+    /// 用于界面展示的固定遮罩，不反映密钥长度。
     pub masked: String,
+    /// 系统保护后的密文字节；不能作为明文 API key 使用。
     pub ciphertext: Vec<u8>,
 }
 
 impl SavedKey {
+    /// 生成标识，校验并加密密钥；成功后才返回完整凭据。
+    ///
+    /// # Errors
+    /// 随机标识生成、密钥校验或系统加密失败时返回错误。
     pub fn new(value: &str) -> Result<Self, String> {
         let mut key = Self { id: new_id()?, masked: String::new(), ciphertext: Vec::new() };
         key.replace(value)?;
         Ok(key)
     }
 
+    /// 去除首尾空白后替换密钥；校验或加密失败保留原密文和标识。
+    ///
+    /// # Errors
+    /// 空值、超过 4096 字节、含控制字符或系统加密失败时返回错误。
     pub fn replace(&mut self, value: &str) -> Result<(), String> {
         let value = value.trim();
         if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
@@ -37,6 +53,10 @@ impl SavedKey {
         Ok(())
     }
 
+    /// 显式解密为释放时清零的字符串；不要将返回值写入日志或持久化。
+    ///
+    /// # Errors
+    /// 平台不支持、用户环境不匹配、密文损坏或解密后非 UTF-8 时返回错误。
     pub fn open(&self) -> Result<Zeroizing<String>, String> {
         let bytes = Zeroizing::new(open_secret(&self.ciphertext).map_err(|_| "无法解密此密钥，请在原 Windows 用户下运行或重新填写".to_owned())?);
         let text = std::str::from_utf8(&bytes).map_err(|_| "已保存密钥格式无效".to_owned())?;
