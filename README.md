@@ -2,6 +2,8 @@
 
 Rust 原生桌面应用基础框架：不依赖浏览器、不依赖 WebView、不依赖 Tauri。
 
+共享界面修改须先读 [AGENTS.md](AGENTS.md)：聊天布局与交互以既定参考为准，禁止擅自发挥，必须完成实窗验收。
+
 
 ## 当前基线与目标能力
 
@@ -23,6 +25,7 @@ Rust 原生桌面应用基础框架：不依赖浏览器、不依赖 WebView、�
 - `lumakit-ai::search`：搜索结果清理、黑名单和原生搜索能力判定。
 - `lumakit-ai::history`：历史迁移、候选关系、崩溃恢复、图片元数据和有限重试策略；目标 schema 由聊天设计定义。
 - `lumakit-ai::chat::ChatSession`：UI 中立的会话、尝试、候选、事件、媒体引用、流式任务、保存恢复与关闭仲裁；当前文本链路是基线，能力按设计继续增长。
+- `ChatSession::toolbar/set_toolbar` 保存同一 `chat.db` 全局共用的工具栏显示偏好，默认固定新对话和网络搜索；`ChatAction::SetToolbar` 由宿主转交会话。固定/取消固定不创建对话、不修改搜索或生图请求控制；保存失败保留原偏好，旧记录缺字段使用默认值，未知工具忽略但不丢弃历史。
 - `lumakit-egui::install_icon_font`：宿主在 `set_fonts` 前注册随组件分发的 Phosphor 字体；回复栏使用无边框图标、可访问名称及悬停说明，次要动作进入原生更多菜单。LumaDesk 与独立 chat-host 使用同一注册函数，避免独立宿主显示方框。
 - `lumakit-ai::catalog::ModelCatalog`：已保存的多线路、多密钥目录，按完整模型身份解析连接；`lumakit-support::secrets` 提供系统加密凭据。
 

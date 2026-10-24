@@ -1,7 +1,7 @@
-//! 固定头尾分区的紧凑聊天输入区；业务动作由宿主执行，附件与图片显式打开。
+//! 参考 AutoNote 的紧凑聊天输入区；业务动作由宿主执行，安全本地图片内联预览。
 use egui::{Align, Button, FontId, Frame, Id, Layout, Margin, Rect, RichText, ScrollArea, TextEdit, TextStyle, Ui, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use lumakit_ai::{ModelRef, chat::{Attempt, ChatSession}, history::TurnStatus, model_config::{ModelSettings, ReasoningEffort}};
+use lumakit_ai::{ModelRef, chat::{Attempt, ChatSession, ToolbarTool}, history::TurnStatus, model_config::{ModelSettings, ReasoningEffort}};
 use lumakit_ui::chat::{ChatAction, ModelOption};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::{collections::HashMap, fmt::Debug, hash::Hash};
@@ -100,6 +100,7 @@ pub struct ChatPanel {
     last_offset: f32,
     frame: u64,
     markdown: HashMap<String, MarkdownEntry>,
+    media: crate::chat_media::MediaPreview,
     geometry: ChatGeometry,
 }
 impl ChatPanel {
@@ -108,12 +109,12 @@ impl ChatPanel {
         Self { id: Id::unique(instance_id), conversation: None, draft: String::new(), expanded: false,
             composing: false, history_open: false, quick_open: false, history_search: String::new(), delete: None, edit: None,
             model_search: String::new(), follow: true, to_bottom: true,
-            last_offset: 0.0, frame: 0, markdown: HashMap::new(), geometry: ChatGeometry::default() }
+            last_offset: 0.0, frame: 0, markdown: HashMap::new(), media: Default::default(), geometry: ChatGeometry::default() }
     }
     /// 上次 show 捕获的实际布局，不重新计算坐标。
     pub fn geometry(&self) -> &ChatGeometry { &self.geometry }
 
-    /// 仅绘制并返回动作；模型目录与当前模型设置按引用传入，不复制连接配置。
+    /// 仅绘制并返回动作；设置始终属于 history.model 聊天模型，生图目录仅供工具选择。
     pub fn show(&mut self, ui: &mut Ui, session: &ChatSession, options: &[ModelOption], image_options: &[ModelOption], model_settings: Option<&ModelSettings>) -> Vec<ChatAction> {
         self.frame = self.frame.wrapping_add(1);
         self.geometry = ChatGeometry::default();
@@ -152,22 +153,31 @@ impl ChatPanel {
                 }).response.rect;
 
             let composer = session.composer();
+            let toolbar = session.toolbar();
             let mut web_search = composer.web_search;
             let mut reasoning = composer.reasoning;
             let mut image_mode = composer.image_mode;
             let mut image_model = composer.image_model.as_ref();
-            let active_options = if composer.image_mode { image_options } else { options };
-            let picked = if composer.image_mode { composer.image_model.as_ref() } else { session.history().model.as_ref() };
-            let valid_model = picked.is_some_and(|model| active_options.iter().any(|option| same_model(&option.model, model)));
-            let model_error = if active_options.is_empty() { if composer.image_mode { "尚未配置图片模型，请打开模型设置。" } else { "尚未配置聊天模型，请打开模型设置。" } }
-                else if !valid_model { "请选择有效模型。" } else { "" };
+            let picked = session.history().model.as_ref();
+            let valid_chat = picked.is_some_and(|model| options.iter().any(|option| same_model(&option.model, model)));
+            let tools_supported = model_settings.is_none_or(|settings| settings.supports_tools != Some(false));
+            let valid_image = image_model.is_some_and(|model| image_options.iter().any(|option| same_model(&option.model, model)));
+            let valid_model = valid_chat && (!composer.image_mode || (valid_image && tools_supported));
+            let model_error = if options.is_empty() { "尚未配置聊天模型，请打开模型设置。" }
+                else if !valid_chat { "请选择有效聊天模型。" }
+                else if composer.image_mode && !tools_supported { "当前聊天模型不支持工具调用，请更换聊天模型或关闭生图。" }
+                else if composer.image_mode && image_options.is_empty() { "尚未配置生图模型，请打开模型设置或关闭生图。" }
+                else if composer.image_mode && !valid_image { "请选择有效生图模型，聊天将通过工具调用生成图片。" } else { "" };
             let has_notice = !session.notice().is_empty() || !model_error.is_empty() || session.save_failed();
             let attachment_height = if session.draft_attachments().is_empty() { 0.0 } else { 36.0 };
-            let budget = (ui.available_height() - 106.0 - attachment_height).max(16.0);
+            let narrow_toolbar = ui.available_width() - 40.0 < 560.0;
+            let toolbar_height = if narrow_toolbar { CONTROL * 2.0 + 8.0 } else { CONTROL };
+            let composer_overhead = 40.0 + toolbar_height;
+            let budget = (ui.available_height() - composer_overhead - attachment_height).max(16.0);
             let notice_height = if has_notice { 40.0_f32.min(budget * 0.35) } else { 0.0 };
             let editor_height = (if self.expanded { ui.available_height() * 0.4 } else { 64.0 })
                 .min((budget - notice_height - if has_notice { 8.0 } else { 0.0 }).max(16.0));
-            let composer_height = editor_height + 106.0 + attachment_height + notice_height + if has_notice { 8.0 } else { 0.0 };
+            let composer_height = editor_height + composer_overhead + attachment_height + notice_height + if has_notice { 8.0 } else { 0.0 };
             self.geometry.composer = egui::Panel::bottom(self.id.with("composer"))
                 .exact_size(composer_height).frame(Frame::new().inner_margin(Margin::symmetric(12, 8)))
                 .show(ui, |ui| {
@@ -198,76 +208,73 @@ impl ChatPanel {
                             ui.add_enabled_ui(unlocked, |ui| {
                                 ui.add(TextEdit::multiline(&mut self.draft).id(self.id.with("draft"))
                                     .frame(Frame::NONE).desired_width(f32::INFINITY).desired_rows(3)
-                                    .hint_text(if composer.image_mode { "描述要生成的图片…" } else { "输入消息…" })).accessible_name("消息输入")
+                                    .hint_text("输入消息…")).accessible_name("消息输入")
                             }).inner
                         });
                     self.geometry.editor = editor.inner_rect;
                     if editor.inner.changed() {
                         if selected.is_none() { actions.push(ChatAction::New); }
                         actions.push(ChatAction::Draft(self.draft.clone()));
-                        if self.draft == "/" { self.quick_open = true; }
                     }
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(unlocked, |ui| {
-                            if composer.image_mode {
-                                egui::ComboBox::from_id_salt(self.id.with("image-model")).width((ui.available_width() - 78.0).max(60.0).min(300.0))
-                                    .selected_text(picked.and_then(|m| image_options.iter().find(|o| same_model(m, &o.model))).map(model_label).unwrap_or_else(|| "选择图片模型".into())).truncate().show_ui(ui, |ui| {
-                                        for option in image_options {
-                                            if ui.selectable_label(picked.is_some_and(|m| same_model(m, &option.model)), model_label(option)).clicked() { image_model = Some(&option.model); }
-                                        }
-                                    });
-                                if ui.button("退出生图").clicked() { image_mode = false; }
-                            } else {
-                                let label = picked.and_then(|m| options.iter().find(|o| same_model(&o.model, m))).map(model_label).unwrap_or_else(|| "选择模型".into());
-                                model_picker(ui, self.id.with("models"), &label, &mut self.model_search, options, picked, false, &mut actions);
-                            }
-                        });
-                    });
-                    self.geometry.buttons = ui.horizontal(|ui| {
+                    self.geometry.buttons = ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        if crate::icons::action(ui, unlocked, "\u{E34C}", "新对话").clicked() { actions.push(ChatAction::New); }
-                        let search = ui.add_enabled(unlocked && !composer.image_mode, crate::icons::button("\u{E288}").selected(web_search))
-                            .on_hover_text("联网搜索").accessible_name("联网搜索");
-                        if search.clicked() { web_search = !web_search; }
-                        ui.add_enabled_ui(unlocked, |ui| {
-                            egui::containers::menu::MenuButton::from_button(crate::icons::button("\u{E3D4}")).ui(ui, |ui| {
-                                if ui.button("上传附件").on_hover_text("最多 4 个附件；UTF-8 文本合计不超过 1 MiB，图片每张不超过 4 MiB").clicked() { actions.push(ChatAction::UploadAttachment); ui.close(); }
-                                if ui.button("生成图片").clicked() { image_mode = true; web_search = false; reasoning = None; ui.close(); }
-                                if ui.button("输入快捷面板").clicked() { self.quick_open = true; ui.close(); }
-                                if ui.button(if self.expanded { "收起输入" } else { "展开输入" }).clicked() { self.expanded = !self.expanded; ui.close(); }
-                                ui.label("Ctrl / ⌘ + Enter 发送；Enter 换行");
-                            }).0.on_hover_text("添加附件与输入工具").accessible_name("添加附件与输入工具");
-                        });
-                        ui.add_enabled_ui(unlocked && !composer.image_mode, |ui| {
-                            egui::ComboBox::from_id_salt(self.id.with("reasoning")).width(64.0)
-                                .selected_text(reasoning_label(reasoning)).show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut reasoning, None, "默认");
-                                    if let Some(config) = model_settings.and_then(|s| s.reasoning.as_ref()) {
-                                        for &effort in &config.efforts { ui.selectable_value(&mut reasoning, Some(effort), reasoning_label(Some(effort))); }
-                                    }
-                                }).response.on_hover_text("推理强度：默认沿用模型配置").accessible_name("推理强度");
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let send = if session.busy() {
-                                let response = crate::icons::action(ui, true, "\u{E46C}", "停止生成");
-                                if response.clicked() { actions.push(ChatAction::Stop); }
-                                response
-                            } else {
-                                let response = crate::icons::action(ui, unlocked && valid_model && !self.draft.trim().is_empty(), "\u{E08E}", "发送消息 · Ctrl+Enter");
-                                if response.clicked() || (shortcut && !self.draft.trim().is_empty()) {
-                                    actions.push(ChatAction::Send); self.follow = true; self.to_bottom = true;
+                        ui.horizontal(|ui| {
+                            if toolbar.contains(&ToolbarTool::NewConversation) && crate::icons::action(ui, unlocked, "\u{E34C}", "新对话").clicked() { actions.push(ChatAction::New); }
+                            ui.add_enabled_ui(unlocked, |ui| {
+                                egui::containers::menu::MenuButton::from_button(crate::icons::button("\u{E3D4}")).ui(ui, |ui| {
+                                    if !toolbar.contains(&ToolbarTool::NewConversation) && ui.button("新对话").clicked() { actions.push(ChatAction::New); ui.close(); }
+                                    if !toolbar.contains(&ToolbarTool::WebSearch) && ui.selectable_label(web_search, "网络搜索").clicked() { web_search = !web_search; ui.close(); }
+                                    if !toolbar.contains(&ToolbarTool::Attachment) && ui.button("上传附件").on_hover_text("最多 4 个附件；UTF-8 文本合计不超过 1 MiB，图片每张不超过 4 MiB").clicked() { actions.push(ChatAction::UploadAttachment); ui.close(); }
+                                    let painting_notice = if !valid_chat { "请先配置并选择有效聊天模型。" }
+                                        else if !tools_supported { "当前聊天模型不支持工具调用，请更换聊天模型。" }
+                                        else if image_options.is_empty() { "尚未配置生图模型，请打开模型设置。" }
+                                        else { "选择生图模型后，聊天可调用图片生成工具。" };
+                                    if !toolbar.contains(&ToolbarTool::GenerateImage) && ui.add_enabled(image_mode || (valid_chat && tools_supported && valid_image), Button::new("生成图片").selected(image_mode)).on_hover_text(painting_notice).clicked() { image_mode = !image_mode; ui.close(); }
+                                    ui.add_enabled_ui(valid_chat && tools_supported && !image_options.is_empty(), |ui| {
+                                        ui.menu_button("生图模型", |ui| {
+                                            ui.label(RichText::new("选择生图模型").weak().small());
+                                            for option in image_options {
+                                                if ui.selectable_label(image_model.is_some_and(|m| same_model(m, &option.model)), model_label(option)).clicked() {
+                                                    image_model = Some(&option.model);
+                                                    image_mode = true;
+                                                    ui.close();
+                                                }
+                                            }
+                                        }).response.on_hover_text(painting_notice);
+                                    });
+                                    if !valid_chat || !tools_supported || image_options.is_empty() { ui.label(RichText::new(painting_notice).weak()); }
+                                    if ui.button("快捷面板").clicked() { self.quick_open = true; ui.close(); }
+                                    if ui.button(if self.expanded { "收起输入" } else { "展开输入" }).clicked() { self.expanded = !self.expanded; ui.close(); }
+                                    ui.label("Ctrl / ⌘ + Enter 发送；Enter 换行");
+                                }).0.on_hover_text("添加附件与输入工具").accessible_name("添加附件与输入工具");
+                                if image_mode && !toolbar.contains(&ToolbarTool::GenerateImage) {
+                                    let source = image_model.and_then(|m| image_options.iter().find(|o| same_model(m, &o.model)));
+                                    if ui.add(Button::new("生成图片 ×").selected(true)).on_hover_text(source.map(model_label).unwrap_or_else(|| "尚未选择有效生图模型".into()))
+                                        .accessible_name("关闭生成图片").clicked() { image_mode = false; }
                                 }
-                                response
-                            };
-                            self.geometry.send_stop = send.rect;
-                            if session.save_failed() {
-                                if crate::icons::action(ui, true, "\u{E038}", "重试保存").clicked() { actions.push(ChatAction::Save); }
-                            } else if !self.follow {
-                                if crate::icons::action(ui, true, "\u{E03E}", "回到底部").clicked() { self.follow = true; self.to_bottom = true; }
-                            } else if ui.available_width() > 36.0 {
-                                ui.add_sized([ui.available_width(), CONTROL], egui::Label::new(RichText::new(composer_usage(session)).weak().small()).truncate()).on_hover_text("上一回答的服务商实际 token 用量；不是草稿估算");
+                            });
+                            if toolbar.contains(&ToolbarTool::Attachment) && crate::icons::action(ui, unlocked, "\u{E39A}", "上传附件").clicked() { actions.push(ChatAction::UploadAttachment); }
+                            if toolbar.contains(&ToolbarTool::GenerateImage) && ui.add_enabled(unlocked && (image_mode || (valid_chat && tools_supported && valid_image)), crate::icons::button("\u{E2C8}").selected(image_mode))
+                                .on_hover_text("生成图片；在添加菜单中选择生图模型").accessible_name("生成图片").clicked() { image_mode = !image_mode; }
+                            if toolbar.contains(&ToolbarTool::WebSearch) && ui.add_enabled(unlocked, crate::icons::button("\u{E288}").selected(web_search))
+                                .on_hover_text("网络搜索").accessible_name("网络搜索").clicked() { web_search = !web_search; }
+                            if !narrow_toolbar {
+                                ui.add_enabled_ui(unlocked, |ui| {
+                                    model_picker(ui, self.id.with("models"), 136.0, &mut self.model_search, options, picked, &mut actions);
+                                });
+                                self.send_tools(ui, session, unlocked, valid_model, shortcut, &mut reasoning, model_settings, &mut actions);
                             }
                         });
+                        if narrow_toolbar {
+                            // 窄窗主动换行，避免左侧标签挤出发送键或覆盖模型名。
+                            ui.horizontal(|ui| {
+                                let picker_width = (ui.available_width() - 140.0).clamp(64.0, 136.0);
+                                ui.add_enabled_ui(unlocked, |ui| {
+                                    model_picker(ui, self.id.with("models"), picker_width, &mut self.model_search, options, picked, &mut actions);
+                                });
+                                self.send_tools(ui, session, unlocked, valid_model, shortcut, &mut reasoning, model_settings, &mut actions);
+                            });
+                        }
                     }).response.rect;
                     });
                 }).response.rect;
@@ -300,12 +307,12 @@ impl ChatPanel {
                             if let Some((last, previous)) = turn.attempts.split_last() {
                                 if !previous.is_empty() {
                                     egui::CollapsingHeader::new(format!("之前的 {} 次回答", previous.len())).id_salt("attempts").show(ui, |ui| {
-                                        for attempt in previous { self.answer(ui, &conversation.id, &turn.id, attempt, false, unlocked, options, image_options, &mut actions); }
+                                        for attempt in previous { self.answer(ui, session, &conversation.id, &turn.id, attempt, false, unlocked, options, image_options, &mut actions); }
                                     });
                                 }
-                                self.answer(ui, &conversation.id, &turn.id, last, index + 1 == conversation.turns.len(), unlocked, options, image_options, &mut actions);
+                                self.answer(ui, session, &conversation.id, &turn.id, last, index + 1 == conversation.turns.len(), unlocked, options, image_options, &mut actions);
                             }
-                            ui.add_space(16.0);
+                            ui.add_space(12.0);
                         });
                     }
                     if conversation.turns.is_empty() { ui.add_space(24.0); ui.label(RichText::new("开始一个新对话").weak()); }
@@ -322,11 +329,48 @@ impl ChatPanel {
             if !upward && offset >= max_offset - 8.0 && offset > self.last_offset + 1.0 { self.follow = true; }
             self.last_offset = offset;
             self.history_modal(ui, session, &mut actions);
-            self.quick_modal(ui, unlocked, &mut actions);
+            self.quick_modal(ui, unlocked, session.toolbar(), &mut actions);
             self.edit_modal(ui, &mut actions);
         });
         self.markdown.retain(|_, entry| self.frame.wrapping_sub(entry.used) <= 120);
         actions
+    }
+
+    fn send_tools(&mut self, ui: &mut Ui, session: &ChatSession, unlocked: bool, valid_model: bool, shortcut: bool,
+        reasoning: &mut Option<ReasoningEffort>, model_settings: Option<&ModelSettings>, actions: &mut Vec<ChatAction>) {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let send = if session.busy() {
+                let response = crate::icons::action(ui, true, "\u{E46C}", "停止生成");
+                if response.clicked() { actions.push(ChatAction::Stop); }
+                response
+            } else {
+                let response = crate::icons::action(ui, unlocked && valid_model && !self.draft.trim().is_empty(), "\u{E08E}", "发送消息 · Ctrl+Enter");
+                if response.clicked() || (shortcut && !self.draft.trim().is_empty()) {
+                    actions.push(ChatAction::Send); self.follow = true; self.to_bottom = true;
+                }
+                response
+            };
+            self.geometry.send_stop = send.rect;
+            if session.save_failed() {
+                if crate::icons::action(ui, true, "\u{E038}", "重试保存").clicked() { actions.push(ChatAction::Save); }
+            } else if !self.follow {
+                if crate::icons::action(ui, true, "\u{E03E}", "回到底部").clicked() { self.follow = true; self.to_bottom = true; }
+            } else {
+                ui.menu_button("用量", |ui| {
+                    ui.label(composer_usage(session));
+                    ui.label(RichText::new("上一回答的服务商实际 token 用量；不是草稿估算").weak().small());
+                }).response.on_hover_text(composer_usage(session)).accessible_name("用量详情");
+            }
+            ui.add_enabled_ui(unlocked, |ui| {
+                ui.menu_button(reasoning_label(*reasoning), |ui| {
+                    ui.label(RichText::new("推理强度").weak().small());
+                    ui.selectable_value(reasoning, None, "默认");
+                    if let Some(config) = model_settings.and_then(|s| s.reasoning.as_ref()) {
+                        for &effort in &config.efforts { ui.selectable_value(reasoning, Some(effort), reasoning_label(Some(effort))); }
+                    }
+                }).response.on_hover_text("推理强度：默认沿用模型配置").accessible_name("推理强度");
+            });
+        });
     }
 
     fn consume_send_shortcut(&mut self, ui: &Ui, enabled: bool) -> bool {
@@ -361,48 +405,70 @@ impl ChatPanel {
         })
     }
 
-    fn answer(&mut self, ui: &mut Ui, conversation_id: &str, turn_id: &str, attempt: &Attempt, retry: bool, unlocked: bool,
+    fn answer(&mut self, ui: &mut Ui, session: &ChatSession, conversation_id: &str, turn_id: &str, attempt: &Attempt, retry: bool, unlocked: bool,
         options: &[ModelOption], image_options: &[ModelOption], actions: &mut Vec<ChatAction>) {
         ui.push_id(&attempt.id, |ui| {
             Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(12)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    let image_attempt = image_options.iter().any(|option| same_model(&option.model, &attempt.model)) || !attempt.generated.is_empty();
+                    let image_attempt = !options.iter().any(|option| same_model(&option.model, &attempt.model))
+                        && !attempt.tool_events.iter().any(|event| event.name == "generate_image")
+                        && (image_options.iter().any(|option| same_model(&option.model, &attempt.model)) || !attempt.generated.is_empty());
                     let source = options.iter().chain(image_options).find(|option| same_model(&option.model, &attempt.model));
-                    ui.label(RichText::new(source.map(model_label).unwrap_or_else(|| format!("{} · {} / {}",
-                        attempt.model.model, attempt.model.provider, attempt.model.endpoint))).color(ui.visuals().text_color()).size(12.0));
-                    ui.add_space(4.0);
-                    if attempt.text.is_empty() && attempt.status == TurnStatus::Running { ui.spinner(); ui.label("正在等待回复…"); }
-                    if !attempt.text.is_empty() { self.markdown(ui, &attempt.id, &attempt.text); }
-                    for image in &attempt.generated {
-                        if ui.button("查看生成图片").clicked() { actions.push(ChatAction::OpenMedia(image.id.clone())); }
-                    }
-                    if let Some(error) = &attempt.error {
-                        ScrollArea::vertical().id_salt("error").max_height(88.0).show(ui, |ui| {
-                            ui.colored_label(ui.visuals().error_fg_color, error);
+                    ui.label(RichText::new(source.map_or(attempt.model.model.as_str(), |option| option.name.as_str())).weak().size(12.0))
+                        .on_hover_text(source.map(model_label).unwrap_or_else(|| format!("{} · {} / {}", attempt.model.model, attempt.model.provider, attempt.model.endpoint)));
+                    if !attempt.reasoning.is_empty() {
+                        egui::CollapsingHeader::new("思考过程").id_salt("reasoning").show(ui, |ui| {
+                            ScrollArea::vertical().id_salt("reasoning-text").max_height(180.0).show(ui, |ui| {
+                                for block in &attempt.reasoning {
+                                    ui.label(block.get("text").or_else(|| block.get("thinking")).and_then(|text| text.as_str()).map_or_else(|| block.to_string(), str::to_owned));
+                                }
+                            });
                         });
                     }
-                    match attempt.status {
-                        TurnStatus::Running => { ui.label(RichText::new("正在生成…").weak().small()); }
-                        TurnStatus::Cancelled => { ui.label(RichText::new("已停止，保留部分回答").weak().small()); }
-                        TurnStatus::Failed => { ui.label(RichText::new("回答失败").color(ui.visuals().error_fg_color).small()); }
-                        TurnStatus::Completed => {}
-                    }
-                    if attempt.rounds.is_empty() && attempt.status != TurnStatus::Running {
-                        ui.label(RichText::new("用量未提供 · 费用未知").weak().small());
-                    }
-                    for (index, round) in attempt.rounds.iter().enumerate() {
-                        ui.label(RichText::new(format!("第 {} 轮 · {}", index + 1, usage_label(round))).weak().small())
-                            .on_hover_text("使用本次请求保存的用量和价格快照；不同币种不换算，费用不含搜索等额外服务费。缓存读取与写入已包含在输入token中。");
-                    }
-                    if !attempt.reasoning.is_empty() {
-                        ui.label(RichText::new(format!("推理 · {} 块", attempt.reasoning.len())).weak().small());
-                    }
                     for event in &attempt.tool_events {
-                        ui.label(RichText::new(format!("工具 · {} · {}", event.name, if event.is_error { "失败" } else if event.result.is_some() { "完成" } else { "等待" })).weak().small());
+                        let summary = tool_summary(event);
+                        let text = RichText::new(summary).small();
+                        let text = if event.is_error { text.color(ui.visuals().error_fg_color) } else { text.weak() };
+                        egui::CollapsingHeader::new(text).id_salt(("tool-details", &event.id)).default_open(false).show(ui, |ui| {
+                            ScrollArea::vertical().id_salt(("tool-text", &event.id)).max_height(180.0).show(ui, |ui| {
+                                ui.label(format!("工具：{}\n调用 ID：{}", event.name, event.id));
+                                ui.label(format!("参数：{}", event.arguments));
+                                if let Some(result) = &event.result { ui.label(result); }
+                                if let Some(error) = &event.error { ui.colored_label(ui.visuals().error_fg_color, error); }
+                            });
+                        });
+                    }
+                    if !attempt.tool_events.is_empty() || !attempt.reasoning.is_empty() { ui.add_space(4.0); }
+                    self.media.show(ui, session, &attempt.generated, actions);
+                    if !attempt.generated.is_empty() { ui.add_space(4.0); }
+                    if attempt.text.is_empty() && attempt.status == TurnStatus::Running { ui.spinner(); ui.label("正在等待回复…"); }
+                    if !attempt.text.is_empty() { self.markdown(ui, &attempt.id, &attempt.text); }
+                    match attempt.status {
+                        TurnStatus::Running if !attempt.text.is_empty() => { ui.label(RichText::new("正在生成…").weak().small()); }
+                        TurnStatus::Cancelled => { ui.label(RichText::new("已停止，保留部分回答").weak().small()); }
+                        TurnStatus::Failed if !attempt.tool_events.iter().any(|event| event.is_error) => {
+                            ui.label(RichText::new("回答失败，请重试或更换模型").color(ui.visuals().error_fg_color).small());
+                        }
+                        _ => {}
+                    }
+                    if let Some(error) = &attempt.error {
+                        egui::CollapsingHeader::new("诊断详情").id_salt("attempt-error").default_open(false).show(ui, |ui| {
+                            ScrollArea::vertical().id_salt("error").max_height(120.0).show(ui, |ui| {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            });
+                        });
+                    }
+                    if attempt.status != TurnStatus::Running || !attempt.rounds.is_empty() {
+                        egui::CollapsingHeader::new(RichText::new("用量详情").weak().small()).id_salt("usage").show(ui, |ui| {
+                            if attempt.rounds.is_empty() { ui.label(RichText::new("用量未提供 · 费用未知").weak().small()); }
+                            for (index, round) in attempt.rounds.iter().enumerate() {
+                                ui.label(RichText::new(format!("第 {} 轮 · {}", index + 1, usage_label(round))).weak().small());
+                            }
+                            ui.label(RichText::new("按请求保存的用量与价格快照；不同币种不换算，费用不含搜索等额外服务费。缓存读写已包含在输入 token 中。").weak().small());
+                        });
                     }
                     ui.add_space(4.0);
-                    ui.separator();
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let complete = unlocked && attempt.status == TurnStatus::Completed;
@@ -420,16 +486,17 @@ impl ChatPanel {
                             });
                             }
                         }
-                        if crate::icons::action(ui, unlocked, "\u{E4A6}", "删除回答").clicked() { actions.push(ChatAction::DeleteAttempt { conversation_id: conversation_id.into(), turn_id: turn_id.into(), attempt_id: attempt.id.clone() }); }
-                        if crate::icons::action(ui, complete && !attempt.text.is_empty(), "\u{E236}", "保存到笔记").clicked() { actions.push(ChatAction::SaveNote { attempt_id: attempt.id.clone(), markdown: attempt.text.clone() }); }
-                        if crate::icons::action(ui, complete && !attempt.text.is_empty(), "\u{E428}", "插入编辑器").clicked() { actions.push(ChatAction::InsertMarkdown { attempt_id: attempt.id.clone(), markdown: attempt.text.clone() }); }
+                        // 次要写入动作收进更多菜单，避免操作行挤占窄窗正文。
                         if crate::icons::action(ui, unlocked, "\u{E2F0}", "选择上下文").clicked() { actions.push(ChatAction::SelectAttempt { conversation_id: conversation_id.into(), turn_id: turn_id.into(), attempt_id: attempt.id.clone() }); }
                         egui::containers::menu::MenuButton::from_button(crate::icons::button("\u{E1FE}")).ui(ui, |ui| {
+                            if ui.add_enabled(complete && !attempt.text.is_empty(), Button::new("保存到笔记")).clicked() { ui.close(); actions.push(ChatAction::SaveNote { attempt_id: attempt.id.clone(), markdown: attempt.text.clone() }); }
+                            if ui.add_enabled(complete && !attempt.text.is_empty(), Button::new("插入编辑器")).clicked() { ui.close(); actions.push(ChatAction::InsertMarkdown { attempt_id: attempt.id.clone(), markdown: attempt.text.clone() }); }
                             if ui.add_enabled(complete, Button::new("编辑")).clicked() { ui.close(); self.edit = Some((conversation_id.into(), turn_id.into(), attempt.id.clone(), attempt.text.clone(), attempt.text.clone())); }
                             if ui.add_enabled(unlocked, Button::new("分支")).clicked() { ui.close(); actions.push(ChatAction::ForkAttempt { conversation_id: conversation_id.into(), turn_id: turn_id.into(), attempt_id: attempt.id.clone() }); }
                             if ui.add_enabled(unlocked, Button::new("复制对话")).clicked() { ui.close(); actions.push(ChatAction::CopyConversation { conversation_id: conversation_id.into() }); }
                             ui.separator();
                             if ui.add_enabled(complete && !attempt.text.is_empty(), Button::new("导出 Markdown")).clicked() { ui.close(); actions.push(ChatAction::ExportMarkdown { attempt_id: attempt.id.clone(), markdown: attempt.text.clone() }); }
+                            if ui.add_enabled(unlocked, Button::new("删除回答")).clicked() { ui.close(); actions.push(ChatAction::DeleteAttempt { conversation_id: conversation_id.into(), turn_id: turn_id.into(), attempt_id: attempt.id.clone() }); }
                         }).0.on_hover_text("更多操作").accessible_name("更多操作");
                     });
                 });
@@ -460,31 +527,23 @@ impl ChatPanel {
             });
         }
     }
-    fn quick_modal(&mut self, ui: &Ui, unlocked: bool, actions: &mut Vec<ChatAction>) {
+    fn quick_modal(&mut self, ui: &Ui, unlocked: bool, toolbar: &[ToolbarTool], actions: &mut Vec<ChatAction>) {
         if !self.quick_open { return; }
-        let response = egui::Modal::new(self.id.with("quick-input")).show(ui.ctx(), |ui| {
+        let mut pending = toolbar.to_vec();
+        let response = egui::Modal::new(self.id.with("quick-toolbar")).show(ui.ctx(), |ui| {
             ui.set_max_width((ui.ctx().content_rect().width() - 48.0).min(360.0));
-            ui.heading("输入快捷面板");
-            for (label, prompt) in QUICK_PROMPTS {
-                if ui.add_enabled(unlocked, Button::new(*label)).clicked() {
-                    self.insert_prompt(prompt, actions);
-                    self.quick_open = false;
+            ui.heading("自定义工具栏");
+            ui.add_enabled_ui(unlocked, |ui| {
+                for (tool, label) in TOOLBAR_TOOLS {
+                    toolbar_switch(ui, &mut pending, *tool, label);
                 }
-            }
-            ui.separator();
-            if ui.button(if self.expanded { "收起输入" } else { "展开输入" }).clicked() { self.expanded = !self.expanded; }
-            ui.label("Ctrl / ⌘ + Enter 发送；Enter 换行");
+                ui.separator();
+                if ui.add_enabled(pending != DEFAULT_TOOLBAR, Button::new("恢复默认")).clicked() { pending = DEFAULT_TOOLBAR.to_vec(); }
+            });
             if ui.button("关闭").clicked() { self.quick_open = false; }
         });
+        if pending != toolbar { actions.push(ChatAction::SetToolbar(pending)); }
         if response.should_close() { self.quick_open = false; }
-    }
-
-    fn insert_prompt(&mut self, prompt: &str, actions: &mut Vec<ChatAction>) {
-        if self.draft == "/" { self.draft.clear(); }
-        if !self.draft.is_empty() { self.draft.push_str("\n\n"); }
-        self.draft.push_str(prompt);
-        if self.conversation.is_none() { actions.push(ChatAction::New); }
-        actions.push(ChatAction::Draft(self.draft.clone()));
     }
 
     fn history_modal(&mut self, ui: &Ui, session: &ChatSession, actions: &mut Vec<ChatAction>) {
@@ -553,11 +612,23 @@ impl ChatPanel {
         if close { self.edit = None; }
     }
 }
-const QUICK_PROMPTS: &[(&str, &str)] = &[
-    ("总结要点", "请总结以下内容，提炼关键结论和待办事项：\n"),
-    ("润色文字", "请在保留原意和事实的前提下润色以下文字：\n"),
-    ("解释代码", "请解释以下代码的作用、关键步骤及潜在问题：\n"),
+const DEFAULT_TOOLBAR: &[ToolbarTool] = &[ToolbarTool::NewConversation, ToolbarTool::WebSearch];
+const TOOLBAR_TOOLS: &[(ToolbarTool, &str)] = &[
+    (ToolbarTool::NewConversation, "新对话"),
+    (ToolbarTool::WebSearch, "网络搜索"),
+    (ToolbarTool::Attachment, "上传附件"),
+    (ToolbarTool::GenerateImage, "生成图片"),
 ];
+
+fn toolbar_switch(ui: &mut Ui, toolbar: &mut Vec<ToolbarTool>, tool: ToolbarTool, label: &str) -> egui::Response {
+    let mut pinned = toolbar.contains(&tool);
+    let response = crate::switch(ui, &mut pinned, label);
+    if response.changed() {
+        *toolbar = TOOLBAR_TOOLS.iter().map(|(item, _)| *item)
+            .filter(|item| if *item == tool { pinned } else { toolbar.contains(item) }).collect();
+    }
+    response
+}
 
 fn reasoning_label(effort: Option<ReasoningEffort>) -> &'static str {
     match effort {
@@ -602,9 +673,11 @@ pub fn open_media(path: &std::path::Path) -> Result<(), String> {
     result.map(|_| ()).map_err(|e| format!("无法打开图片：{e}"))
 }
 
-fn model_picker(ui: &mut Ui, id: Id, label: &str, search: &mut String, options: &[ModelOption],
-    picked: Option<&ModelRef>, retry: bool, actions: &mut Vec<ChatAction>) {
-    egui::ComboBox::from_id_salt(id).width(ui.available_width().min(320.0)).selected_text(label)
+fn model_picker(ui: &mut Ui, id: Id, width: f32, search: &mut String, options: &[ModelOption],
+    picked: Option<&ModelRef>, actions: &mut Vec<ChatAction>) {
+    let source = picked.and_then(|model| options.iter().find(|option| same_model(&option.model, model)));
+    let label = source.map_or("选择模型", |option| option.name.as_str());
+    egui::ComboBox::from_id_salt(id).width(width).selected_text(label)
         .truncate().show_ui(ui, |ui| {
             ui.add(TextEdit::singleline(search).hint_text("搜索模型、服务商、端点"));
             let query = search.to_lowercase();
@@ -621,13 +694,19 @@ fn model_picker(ui: &mut Ui, id: Id, label: &str, search: &mut String, options: 
                     group = Some(source);
                 }
                 if ui.selectable_label(picked.is_some_and(|picked| same_model(picked, &option.model)), label).clicked() {
-                    actions.push(if retry { ChatAction::RetryWith(option.model.clone()) }
-                        else { ChatAction::SelectModel(option.model.clone()) });
+                    actions.push(ChatAction::SelectModel(option.model.clone()));
                     ui.close();
                 }
             }
             if !found { ui.label("没有匹配的模型"); }
-        });
+        }).response.on_hover_text(source.map(model_label).unwrap_or_else(|| "选择聊天模型".into())).accessible_name("聊天模型");
+}
+
+fn tool_summary(event: &lumakit_ai::ToolEvent) -> String {
+    let name = if event.name == "generate_image" { "图片生成" } else { &event.name };
+    let status = if event.is_error { "失败，请重试或更换模型" }
+        else if event.result.is_some() { "完成" } else { "进行中…" };
+    format!("{name}{status}")
 }
 
 fn usage_label(round: &lumakit_ai::RoundUsage) -> String {
@@ -705,13 +784,52 @@ mod tests {
         }).drop_without_applying_deltas();
         actions
     }
+    #[test]
+    fn failed_generator_keeps_raw_diagnostics_and_rounds_out_of_default_view() {
+        let (_root, session, options) = fixture();
+        let mut attempt = session.selected().unwrap().turns[0].attempts[0].clone();
+        attempt.text.clear();
+        attempt.error = Some("RAW_ATTEMPT_DIAGNOSTIC".into());
+        attempt.tool_events.push(lumakit_ai::ToolEvent {
+            id: "private-request-id".into(), name: "generate_image".into(), arguments: Default::default(),
+            approval: None, result: Some("RAW_GENERATOR_JSON".into()), is_error: true,
+            error: Some("RAW_UPSTREAM_ERROR".into()),
+        });
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new("diagnostics");
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                panel.answer(ui, &session, "conversation", "turn", &attempt, true, true, &options, &[], &mut Vec::new());
+            });
+        });
+        fn visible_text(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(shape) => text.push_str(shape.galley.text()),
+                egui::Shape::Vec(shapes) => for shape in shapes { visible_text(shape, text); },
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for shape in &output.shapes { visible_text(&shape.shape, &mut text); }
+        assert!(text.contains(&tool_summary(&attempt.tool_events[0])));
+        for diagnostic in ["RAW_ATTEMPT_DIAGNOSTIC", "RAW_GENERATOR_JSON", "RAW_UPSTREAM_ERROR", "private-request-id"] {
+            assert!(!text.contains(diagnostic), "{text}");
+        }
+        assert!(!text.contains(&usage_label(&attempt.rounds[0])));
+        output.drop_without_applying_deltas();
+    }
+
 
     #[test]
     fn actual_layout_keeps_footer_reachable_for_long_content() {
         let (_root, mut session, options) = fixture();
         session.report("保存或请求错误，详细说明\n".repeat(300));
-        for (width, height, scale) in [(860.0, 560.0, 1.0), (1200.0, 800.0, 1.0), (860.0, 560.0, 2.0), (860.0, 220.0, 1.0), (480.0, 480.0, 1.0), (375.0, 480.0, 1.0), (320.0, 480.0, 1.0)] {
+        for (width, height, scale) in [(860.0, 560.0, 1.0), (1200.0, 800.0, 1.0), (860.0, 560.0, 2.0), (860.0, 220.0, 1.0), (768.0, 480.0, 1.0), (414.0, 480.0, 1.0), (375.0, 480.0, 1.0), (320.0, 480.0, 1.0), (320.0, 900.0, 1.0)] {
             for expanded in [false, true] {
+                for toolbar in [DEFAULT_TOOLBAR.to_vec(), TOOLBAR_TOOLS.iter().map(|(tool, _)| *tool).collect()] {
+                    session.set_toolbar(toolbar);
+                for image_mode in [false, true] {
+                    session.set_composer(lumakit_ai::chat::ComposerSettings { image_mode, ..Default::default() });
                 for options in [&options[..], &[][..]] {
                     let ctx = egui::Context::default();
                     let mut panel = ChatPanel::new("layout");
@@ -723,11 +841,49 @@ mod tests {
                     assert!(g.editor.bottom() <= g.buttons.top() + 0.5, "{g:?}");
                     assert!(g.composer.contains_rect(g.send_stop), "{g:?}");
                     assert!(g.send_stop.bottom() <= height && g.send_stop.right() <= width, "{g:?}");
+                    assert!(g.buttons.left() >= g.composer.left() && g.buttons.right() <= g.composer.right() + 0.5, "{g:?}");
+                    assert!(g.buttons.contains_rect(g.send_stop), "{g:?}");
                     assert!(g.send_stop.height() >= CONTROL, "{g:?}");
                     assert!(g.editor.height() >= 16.0, "{g:?}");
                 }
+                }
+                }
             }
         }
+    }
+
+    #[test]
+    fn painting_controls_preserve_chat_settings_and_validate_both_models() {
+        let (_root, mut session, options) = fixture();
+        let ctx = egui::Context::default();
+        let mut panel = ChatPanel::new("painting");
+        let focus = panel.id.with("draft");
+        let painting = ModelOption { model: ModelRef { model: "painting".into(), ..options[0].model.clone() }, name: "绘图".into(), provider: "来源A".into(), endpoint: "端点A".into() };
+        session.set_composer(lumakit_ai::chat::ComposerSettings { web_search: true, reasoning: Some(ReasoningEffort::High), image_mode: true, image_model: Some(painting.model.clone()) });
+        let mut frame = |session: &ChatSession, options: &[ModelOption], images: &[ModelOption], settings: Option<&ModelSettings>, events| {
+            let mut actions = Vec::new();
+            ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(375.0, 480.0))), events, ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| { actions = panel.show(ui, session, options, images, settings); });
+            }).drop_without_applying_deltas();
+            actions
+        };
+        frame(&session, &options, std::slice::from_ref(&painting), None, vec![]);
+        ctx.memory_mut(|memory| memory.request_focus(focus));
+        let enter = || egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::CTRL };
+        let actions = frame(&session, &options, std::slice::from_ref(&painting), None, vec![enter()]);
+        assert!(actions.iter().any(|action| matches!(action, ChatAction::Send)));
+        assert!(!actions.iter().any(|action| matches!(action, ChatAction::SetComposer(_))));
+        let unsupported = ModelSettings { supports_tools: Some(false), ..Default::default() };
+        for (chat, images, settings) in [(&options[..], &[][..], None), (&[][..], std::slice::from_ref(&painting), None), (&options[..], std::slice::from_ref(&painting), Some(&unsupported))] {
+            let actions = frame(&session, chat, images, settings, vec![enter()]);
+            assert!(!actions.iter().any(|action| matches!(action, ChatAction::Send)));
+        }
+        session.set_composer(lumakit_ai::chat::ComposerSettings { web_search: true, reasoning: Some(ReasoningEffort::High), image_mode: true, image_model: None });
+        let actions = frame(&session, &options, std::slice::from_ref(&painting), None, vec![enter()]);
+        assert!(!actions.iter().any(|action| matches!(action, ChatAction::Send | ChatAction::SetComposer(_))));
+        assert!(session.composer().web_search);
+        assert_eq!(session.composer().reasoning, Some(ReasoningEffort::High));
+        assert!(session.history().model.as_ref().is_some_and(|model| same_model(model, &options[0].model)));
     }
 
     #[test]
@@ -825,17 +981,37 @@ mod tests {
         assert!(panel.last_offset <= offset);
     }
     #[test]
-    fn quick_prompt_appends_real_draft_and_creates_conversation_first() {
-        let mut panel = ChatPanel::new("quick");
-        panel.draft = "原文".into();
-        let mut actions = Vec::new();
-        panel.insert_prompt(QUICK_PROMPTS[0].1, &mut actions);
-        assert!(matches!(actions.first(), Some(ChatAction::New)));
-        assert!(matches!(actions.last(), Some(ChatAction::Draft(text)) if text == &format!("原文\n\n{}", QUICK_PROMPTS[0].1)));
-        panel.draft = "/".into();
-        panel.insert_prompt(QUICK_PROMPTS[1].1, &mut actions);
-        assert_eq!(panel.draft, QUICK_PROMPTS[1].1);
-        assert_eq!(reasoning_label(None), "默认");
-        assert_eq!(reasoning_label(Some(ReasoningEffort::None)), "关闭");
+    fn toolbar_switch_only_changes_pinning_not_draft_or_request_settings() {
+        let (_root, mut session, options) = fixture();
+        session.set_composer(lumakit_ai::chat::ComposerSettings { web_search: true, image_mode: true, ..Default::default() });
+        let draft = session.selected().unwrap().draft.clone();
+        let ctx = egui::Context::default();
+        let mut toolbar = TOOLBAR_TOOLS.iter().map(|(tool, _)| *tool).collect::<Vec<_>>();
+        for (tool, label) in TOOLBAR_TOOLS {
+            let mut frame = |events| {
+                let mut response = None;
+                ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                    response = Some(toolbar_switch(ui, &mut toolbar, *tool, label));
+                }).drop_without_applying_deltas();
+                response.unwrap()
+            };
+            let response = frame(vec![]);
+            ctx.memory_mut(|memory| memory.request_focus(response.id));
+            assert!(frame(vec![egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true,
+                repeat: false, modifiers: egui::Modifiers::NONE }]).changed());
+            frame(vec![egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: false,
+                repeat: false, modifiers: egui::Modifiers::NONE }]);
+            assert!(!toolbar.contains(tool));
+        }
+        session.set_toolbar(toolbar);
+        let mut panel = ChatPanel::new("pin-only");
+        panel.quick_open = true;
+        let actions = draw(&ctx, &mut panel, &session, &options, Vec2::new(375.0, 480.0), 1.0, vec![]);
+        assert!(actions.is_empty());
+        assert_eq!(panel.draft, draft);
+        assert_eq!(session.selected().unwrap().draft, draft);
+        assert!(session.composer().web_search);
+        assert!(session.composer().image_mode);
+        assert!(session.toolbar().is_empty());
     }
 }

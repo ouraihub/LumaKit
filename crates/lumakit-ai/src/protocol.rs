@@ -70,7 +70,8 @@ pub(crate) fn encode(
                 };
                 encoded.push(json!({"role":"user", "content":content}));
             }
-            (_, Message::Assistant { text, tool_calls, .. }) if connection.protocol == Protocol::OpenAiResponses => {
+            (_, Message::Assistant { text, tool_calls, reasoning_blocks }) if connection.protocol == Protocol::OpenAiResponses => {
+                encoded.extend(reasoning_blocks.iter().filter(|block| block["type"] == "reasoning").cloned());
                 if !text.is_empty() || tool_calls.is_empty() { encoded.push(json!({"role":"assistant", "content":text})); }
                 encoded.extend(tool_calls.iter().map(|call| {
                     json!({
@@ -281,6 +282,7 @@ impl Decoder {
                 if value["status"] != "completed" { return Err("provider response incomplete".into()); }
                 for item in value["output"].as_array().ok_or("invalid Responses output")? {
                     if item["type"] == "function_call" { self.start(&item["id"], &item["call_id"], &item["name"])?; self.append(&item["id"], &item["arguments"])?; }
+                    if item["type"] == "reasoning" { self.reasoning_blocks.push(item.clone()); }
                     if let Some(content) = item["content"].as_array() { for block in content { if block["type"] == "output_text" { text.push_str(block["text"].as_str().unwrap_or_default()); } } }
                 }
             }
@@ -394,6 +396,7 @@ impl Decoder {
     fn responses(&mut self, value: &Value) -> Result<Option<String>, String> {
         match value["type"].as_str().unwrap_or_default() {
             "response.output_text.delta" => Ok(value["delta"].as_str().map(str::to_owned)),
+            "response.output_item.done" if value["item"]["type"] == "reasoning" => { self.reasoning_blocks.push(value["item"].clone()); Ok(None) }
             "response.output_item.added" if value["item"]["type"] == "function_call" => self.start(
                 &value["item"]["id"],
                 &value["item"]["call_id"],
@@ -403,6 +406,9 @@ impl Decoder {
                 self.append(&value["item_id"], &value["delta"])
             }
             "response.completed" => {
+                if let Some(output) = value["response"]["output"].as_array() {
+                    self.reasoning_blocks = output.iter().filter(|item| item["type"] == "reasoning").cloned().collect();
+                }
                 self.done = true;
                 Ok(None)
             }

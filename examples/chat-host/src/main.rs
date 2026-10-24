@@ -27,12 +27,45 @@ impl Host {
         let image_options = std::env::var("LUMAKIT_AI_IMAGE_MODEL").ok().filter(|m| !m.trim().is_empty()).map(|name| vec![ModelOption { model: ModelRef { model: name.clone(), protocol: Protocol::OpenAiChat, ..model.clone() }, name, provider: "独立宿主".into(), endpoint: "主线路".into() }]).unwrap_or_default();
         Ok(Self { session, panel: ChatPanel::new("independent-host"), options: vec![ModelOption { name: model.model.clone(), provider: "独立宿主".into(), endpoint: "主线路".into(), model }], image_options, settings, base, picker: None })
     }
-    fn resolve(&self, model: &ModelRef) -> Result<AiConnection, String> {
-        let image = self.image_options.iter().any(|o| o.model.model == model.model && o.model.endpoint == model.endpoint && o.model.protocol == model.protocol && o.model.provider == model.provider);
-        if !image && !self.options.iter().any(|o| o.model.model == model.model && o.model.endpoint == model.endpoint && o.model.protocol == model.protocol && o.model.provider == model.provider) { return Err("模型已失效".into()); }
+    fn resolve(&self, model: &ModelRef, image: bool) -> Result<AiConnection, String> {
+        let options = if image { &self.image_options } else { &self.options };
+        if !options.iter().any(|o| same_model(&o.model, model)) { return Err(if image { "生图模型已失效" } else { "聊天模型已失效" }.into()); }
         let settings = if image { lumakit_ai::model_config::ModelSettings { model_type: lumakit_ai::model_config::ModelType::Image, ..Default::default() } } else { self.settings.clone() };
         Ok(AiConnection { base_url: self.base.clone(), protocol: model.protocol, model: model.model.clone(), api_key: std::env::var("LUMAKIT_AI_KEY").ok().map(zeroize::Zeroizing::new), settings })
     }
+    /// 聊天连接始终负责对话；生图连接仅作为本轮工具使用，重试沿用原轮快照。
+    fn request(&mut self, retry: bool, override_model: Option<ModelRef>) {
+        let override_selected = override_model.is_some();
+        let prepared = (|| {
+            let requested = match override_model { Some(model) => model, None => self.session.request_model(retry)? };
+            let legacy_image = retry && !override_selected
+                && !self.options.iter().any(|option| same_model(&option.model, &requested))
+                && self.image_options.iter().any(|option| same_model(&option.model, &requested));
+            let chat_model = if legacy_image {
+                self.session.history().model.clone().ok_or("旧版生图重试需要先选择聊天模型。")?
+            } else { requested };
+            let chat = self.resolve(&chat_model, false)?;
+            let painting = self.session.request_painting_model(retry)?.map(|model| self.resolve(&model, true)).transpose()?;
+            Ok::<_, String>((chat_model, chat, painting, override_selected || legacy_image))
+        })();
+        match prepared {
+            Ok((model, chat, painting, explicit_model)) => {
+                if explicit_model { self.session.select_model(model); }
+                match (retry, explicit_model, painting) {
+                    (false, _, Some(painting)) => self.session.send_with_painting(chat, painting),
+                    (false, _, None) => self.session.send(chat),
+                    (true, true, Some(painting)) => self.session.retry_with_model_and_painting(chat, painting),
+                    (true, false, Some(painting)) => self.session.retry_with_painting(chat, painting),
+                    (true, true, None) => self.session.retry_with(chat),
+                    (true, false, None) => self.session.retry(chat),
+                }
+            }
+            Err(error) => self.session.report(error),
+        }
+    }
+}
+fn same_model(a: &ModelRef, b: &ModelRef) -> bool {
+    a.provider == b.provider && a.endpoint == b.endpoint && a.model == b.model && a.protocol == b.protocol
 }
 impl eframe::App for Host {
     fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
@@ -60,6 +93,7 @@ impl eframe::App for Host {
                 match action {
                     ChatAction::New => self.session.new_conversation(), ChatAction::Select(id) => self.session.select_conversation(&id), ChatAction::Delete(id) => self.session.delete_conversation(&id), ChatAction::Draft(text) => self.session.set_draft(text), ChatAction::SelectModel(model) => self.session.select_model(model), ChatAction::Stop => self.session.cancel(), ChatAction::Save => self.session.retry_save(),
                     ChatAction::SetComposer(settings) => self.session.set_composer(settings),
+                    ChatAction::SetToolbar(tools) => self.session.set_toolbar(tools),
                     ChatAction::RemoveAttachment(id) => self.session.remove_attachment(&id),
                     ChatAction::UploadAttachment => if self.picker.is_none() {
                         let (tx, rx) = std::sync::mpsc::channel();
@@ -73,8 +107,10 @@ impl eframe::App for Host {
                     },
                     ChatAction::OpenMedia(id) => if let Err(error) = self.session.media_path(&id).and_then(|path| lumakit_egui::chat::open_media(&path)) { self.session.report(error); }, 
                     ChatAction::SaveNote { .. } | ChatAction::InsertMarkdown { .. } | ChatAction::ExportMarkdown { .. } => self.session.report("此验收宿主未接入笔记宿主动作".into()), ChatAction::OpenSettings => self.session.report("此验收宿主通过环境变量配置模型".into()), ChatAction::EditAttempt { .. } => {}, ChatAction::SubmitEdit { conversation_id, turn_id, attempt_id, expected_text, next_text } => { if let Err(error) = self.session.edit_attempt(&conversation_id, &turn_id, &attempt_id, &expected_text, &next_text) { self.session.report(error); } }, ChatAction::DeleteAttempt { conversation_id, turn_id, attempt_id } => { if let Err(error) = self.session.delete_attempt(&conversation_id, &turn_id, &attempt_id) { self.session.report(error); } }, ChatAction::SelectAttempt { conversation_id, turn_id, attempt_id } => { if let Err(error) = self.session.select_attempt(&conversation_id, &turn_id, &attempt_id) { self.session.report(error); } }, ChatAction::ForkAttempt { conversation_id, turn_id, attempt_id } => { if let Err(error) = self.session.fork_attempt(&conversation_id, &turn_id, &attempt_id) { self.session.report(error); } }, ChatAction::CopyConversation { conversation_id } => { if let Err(error) = self.session.copy_conversation(&conversation_id) { self.session.report(error); } },
-                    ChatAction::Send | ChatAction::Retry => { let retry = matches!(action, ChatAction::Retry); match self.session.request_model(retry).and_then(|m| self.resolve(&m)) { Ok(c) => if retry { self.session.retry(c); } else { self.session.send(c); }, Err(e) => self.session.report(e) } },
-                    ChatAction::RetryWith(model) => match self.resolve(&model) { Ok(c) => { self.session.select_model(model); self.session.retry_with(c); }, Err(e) => self.session.report(e) }, ChatAction::TranslateAttempt { .. } | ChatAction::SubmitTranslation { .. } => self.session.report("独立验收宿主暂未接入翻译模型选择".into()),
+                    ChatAction::Send => self.request(false, None),
+                    ChatAction::Retry => self.request(true, None),
+                    ChatAction::RetryWith(model) => self.request(true, Some(model)),
+                    ChatAction::TranslateAttempt { .. } | ChatAction::SubmitTranslation { .. } => self.session.report("独立验收宿主暂未接入翻译模型选择".into()),
                 }
             }
         });

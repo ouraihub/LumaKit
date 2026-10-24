@@ -122,6 +122,13 @@ pub async fn stream_chat_with_usage<F>(
 where
     F: FnMut(String) + Send,
 {
+    let messages = validated_messages(&connection, messages, &cancel)?;
+    let result = round(&http_client()?, &connection, None, &messages, &[], &cancel, &mut on_text).await?;
+    if !result.tool_calls.is_empty() { return Err(AiError::Provider("unexpected tool calls in text chat".into())); }
+    Ok(result)
+}
+
+fn validated_messages(connection: &AiConnection, messages: Vec<ChatMessage>, cancel: &CancellationToken) -> Result<Vec<Message>, AiError> {
     if messages.is_empty() || messages.len() % 2 == 0 { return Err(AiError::Provider("chat must start and end with a user message".into())); }
     let mut bytes = 0usize;
     for (index, message) in messages.iter().enumerate() {
@@ -140,25 +147,11 @@ where
     }
     if connection.model.trim().is_empty() { return Err(AiError::ModelNotConfigured); }
     if cancel.is_cancelled() { return Err(AiError::Cancelled); }
-    let messages: Vec<_> = messages.into_iter().map(|message| match message {
+    Ok(messages.into_iter().map(|message| match message {
         ChatMessage::User(text) => Message::User { text, images: Vec::new() },
         ChatMessage::UserImages { text, images } => Message::User { text, images },
         ChatMessage::Assistant(text) => Message::Assistant { text, tool_calls: Vec::new(), reasoning_blocks: Vec::new() },
-    }).collect();
-    let result = round(
-        &http_client()?,
-        &connection,
-        None,
-        &messages,
-        &[],
-        &cancel,
-        &mut on_text,
-    )
-    .await?;
-    if !result.tool_calls.is_empty() {
-        return Err(AiError::Provider("unexpected tool calls in text chat".into()));
-    }
-    Ok(result)
+    }).collect())
 }
 
 /// 发送文本会话；不需要持久化用量时只返回正文。
@@ -243,6 +236,20 @@ pub struct ToolEvent {
     pub error: Option<String>,
 }
 
+/// 运行中的工具状态及已完成模型轮次；失败前已产生的内容也可即时保存。
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    /// 同一调用标识的最新状态。
+    Tool(ToolEvent),
+    /// 已完成的模型轮次及独立推理块。
+    Round {
+        /// 本轮用量与价格。
+        usage: Vec<RoundUsage>,
+        /// 本轮推理内容。
+        reasoning: Vec<serde_json::Value>,
+    },
+}
+
 /// 工具调用的授权决定。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Approval {
@@ -265,6 +272,16 @@ pub enum AiError {
     /// 服务商、网络或响应解析错误说明。
     #[error("AI provider error: {0}")]
     Provider(String),
+    /// 上游 HTTP 拒绝；保留状态码、请求 ID 与有界脱敏正文，不依赖字符串判断状态。
+    #[error("provider returned HTTP {status} (request_id={request_id}): {body}")]
+    Http {
+        /// 上游 HTTP 状态码。
+        status: u16,
+        /// 上游响应的白名单请求标识；缺失时为 unavailable。
+        request_id: String,
+        /// 最多 8 KiB 的脱敏错误正文，超限时整段丢弃。
+        body: String,
+    },
     /// 请求已取消。
     #[error("request cancelled")]
     Cancelled,
@@ -315,98 +332,87 @@ impl<H: AiHost> AiRuntime<H> {
         let Ok(connection) = self.host.connection(&model) else { return Vec::new(); };
         if connection.settings.model_type != model_config::ModelType::Chat || connection.settings.supports_tools == Some(false) { Vec::new() } else { self.host.tools(request) }
     }
-    /// 流式运行请求并依次处理工具，最多五轮后返回已收集文本。
-    ///
-    /// 文本增量交给回调；取消、上游或宿主错误立即返回错误。
-    /// 未知或拒绝的工具会作为文本结果回传模型，而不执行。
-    pub async fn run<F>(
-        &self,
-        request: RunRequest,
-        cancel: CancellationToken,
-        mut on_text: F,
-    ) -> Result<AiRun, AiError>
-    where
-        F: FnMut(String) + Send,
-    {
+    /// 使用单条用户输入运行；完整历史入口见 `run_with_history`。
+    pub async fn run<F>(&self, request: RunRequest, cancel: CancellationToken, on_text: F) -> Result<AiRun, AiError>
+    where F: FnMut(String) + Send {
+        let messages = vec![ChatMessage::User(request.input.clone())];
+        self.run_with_history(request, messages, cancel, on_text, |_| {}).await
+    }
+
+    /// 校验并保留完整文本/视觉历史，复用同一授权与工具续轮循环。
+    /// 工具失败作为错误结果回传模型；取消立即终止，重复调用标识不重复执行。
+    pub async fn run_with_history<F, E>(&self, request: RunRequest, messages: Vec<ChatMessage>, cancel: CancellationToken, mut on_text: F, mut on_event: E) -> Result<AiRun, AiError>
+    where F: FnMut(String) + Send, E: FnMut(RunEvent) + Send {
         let model = self.host.select_model(&request)?;
         let connection = self.host.connection(&model)?;
+        let mut messages = validated_messages(&connection, messages, &cancel)?;
         let system = self.host.system_prompt(&request)?;
-        let tools = if connection.settings.supports_tools == Some(false) { Vec::new() } else { self.host.tools(&request) };
-        let mut messages = vec![Message::User { text: request.input, images: Vec::new() }];
+        let tools = self.host.tools(&request);
+        if connection.settings.supports_tools == Some(false) && !tools.is_empty() { return Err(AiError::Provider("所选模型声明不支持工具".into())); }
         let mut text = String::new();
         let mut rounds = Vec::new();
+        let mut reasoning = Vec::new();
+        let mut completed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for _ in 0..5 {
-            let round = round(
-                &self.http,
-                &connection,
-                system.as_deref(),
-                &messages,
-                &tools,
-                &cancel,
-                &mut on_text,
-            )
-            .await?;
+            let round = round(&self.http, &connection, system.as_deref(), &messages, &tools, &cancel, &mut on_text).await?;
+            if round.text.len() > (1024 * 1024usize).saturating_sub(text.len()) { return Err(AiError::Provider("回答超过 1 MiB，已停止。".into())); }
             text.push_str(&round.text);
+            on_event(RunEvent::Round { usage: round.rounds.clone(), reasoning: round.reasoning_blocks.clone() });
             rounds.extend(round.rounds);
-            if round.tool_calls.is_empty() {
-                return Ok(AiRun {
-                    text,
-                    tool_calls: Vec::new(),
-                    rounds,
-                    reasoning_blocks: Vec::new(),
-                });
-            }
-            messages.push(Message::Assistant {
-                text: round.text,
-                tool_calls: round.tool_calls.clone(),
-                reasoning_blocks: round.reasoning_blocks,
-            });
+            reasoning.extend(round.reasoning_blocks.iter().cloned());
+            if round.tool_calls.is_empty() { return Ok(AiRun { text, tool_calls: Vec::new(), rounds, reasoning_blocks: reasoning }); }
+            messages.push(Message::Assistant { text: round.text, tool_calls: round.tool_calls.clone(), reasoning_blocks: round.reasoning_blocks });
             for call in round.tool_calls {
-                if cancel.is_cancelled() {
-                    return Err(AiError::Cancelled);
-                }
-                let Some(spec) = tools.iter().find(|tool| tool.name == call.name) else {
-                    messages.push(Message::Tool {
-                        call_id: call.id,
-                        text: "error unknown_tool".into(),
-                    });
+                if cancel.is_cancelled() { return Err(AiError::Cancelled); }
+                if let Some(output) = completed.get(&call.id) {
+                    messages.push(Message::Tool { call_id: call.id, text: output.clone() });
                     continue;
-                };
-                let approval = self.host.authorize(
-                    &call,
-                    if spec.requires_approval {
-                        Approval::Ask
-                    } else {
-                        Approval::Allow
-                    },
-                );
-                let approval = if approval == Approval::Ask {
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Err(AiError::Cancelled),
-                        approval = self.host.approve(call.clone(), cancel.clone()) => approval,
+                }
+                let mut event = ToolEvent { id: call.id.clone(), name: call.name.clone(), arguments: call.arguments.clone(), approval: None, result: None, is_error: false, error: None };
+                on_event(RunEvent::Tool(event.clone()));
+                let spec = tools.iter().find(|tool| tool.name == call.name);
+                let output = if let Some(spec) = spec {
+                    let approval = self.host.authorize(&call, if spec.requires_approval { Approval::Ask } else { Approval::Allow });
+                    let approval = if approval == Approval::Ask {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                event.is_error = true;
+                                event.error = Some("工具审批已取消。".into());
+                                on_event(RunEvent::Tool(event));
+                                return Err(AiError::Cancelled);
+                            },
+                            approval = self.host.approve(call.clone(), cancel.clone()) => approval,
+                        }
+                    } else { approval };
+                    event.approval = Some(approval);
+                    on_event(RunEvent::Tool(event.clone()));
+                    match approval {
+                        Approval::Deny | Approval::Ask => ToolOutput { text: "该工具调用已被拒绝，未执行。".into(), is_error: true },
+                        Approval::Allow => {
+                            let result = tokio::select! { biased; _ = cancel.cancelled() => Err(AiError::Cancelled), result = self.host.call_tool(call.clone(), cancel.clone()) => result };
+                            match result {
+                                Ok(output) => output,
+                                Err(AiError::Cancelled) => {
+                                    event.is_error = true;
+                                    event.error = Some("工具执行已取消。".into());
+                                    on_event(RunEvent::Tool(event));
+                                    return Err(AiError::Cancelled);
+                                },
+                                Err(error) => ToolOutput { text: format!("工具执行失败；不得声称操作成功，也不要自动重试相同失败请求。{error}"), is_error: true },
+                            }
+                        }
                     }
-                } else {
-                    approval
-                };
-                let output = match approval {
-                    Approval::Deny | Approval::Ask => ToolOutput {
-                        text: "该工具调用已被拒绝，未执行。".into(),
-                        is_error: true,
-                    },
-                    Approval::Allow => self.host.call_tool(call.clone(), cancel.clone()).await?,
-                };
-                messages.push(Message::Tool {
-                    call_id: call.id,
-                    text: output.text,
-                });
+                } else { ToolOutput { text: "error unknown_tool".into(), is_error: true } };
+                event.is_error = output.is_error;
+                event.error = output.is_error.then(|| output.text.clone());
+                event.result = Some(output.text.clone());
+                on_event(RunEvent::Tool(event));
+                completed.insert(call.id.clone(), output.text.clone());
+                messages.push(Message::Tool { call_id: call.id, text: output.text });
             }
         }
-        Ok(AiRun {
-            text,
-            tool_calls: Vec::new(),
-            rounds,
-            reasoning_blocks: Vec::new(),
-        })
+        Err(AiError::Provider("工具续轮超过五轮，已停止；已保留输出和工具结果。".into()))
     }
 }
 
@@ -576,6 +582,9 @@ fn endpoint(connection: &AiConnection) -> Result<String, AiError> {
 fn http_client() -> Result<reqwest::Client, AiError> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .user_agent(concat!("lumakit/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(network)
 }
@@ -602,27 +611,43 @@ async fn provider_response(
     secret: Option<&Zeroizing<String>>,
     cancel: &CancellationToken,
 ) -> AiError {
-    let status = response.status();
+    let status = response.status().as_u16();
+    // 只读请求标识白名单，绝不打印 Authorization、Cookie 或全部响应头。
+    let request_id = ["x-request-id", "request-id", "x-oneapi-request-id", "x-new-api-request-id", "trace-id", "cf-ray"]
+        .iter().filter_map(|name| response.headers().get(*name).and_then(|value| value.to_str().ok()).filter(|value| value.len() <= 256).map(|value| (*name, value)))
+        .map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(", ");
+    let request_id = if request_id.is_empty() { "unavailable".into() } else { request_id };
+    let url = response.url();
+    // URL 查询参数可能带凭据；日志只保留无查询的源和路径。
+    let endpoint = format!("{}{}", url.origin().ascii_serialization(), url.path());
     let read = async {
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(network)? {
             if chunk.len() > 8192 - body.len() {
-                // 丢弃超限正文，避免截断后留下半个密钥。
-                return Ok::<_, AiError>(format!("provider returned {status}: error body exceeds 8192 bytes"));
+                return Ok::<_, AiError>("error body exceeds 8192 bytes; omitted".to_owned());
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(format!("provider returned {status}: {}", String::from_utf8_lossy(&body)))
+        Ok(String::from_utf8_lossy(&body).into_owned())
     };
-    tokio::select! {
+    let body = tokio::select! {
         biased;
-        _ = cancel.cancelled() => AiError::Cancelled,
+        _ = cancel.cancelled() => return AiError::Cancelled,
         result = tokio::time::timeout(std::time::Duration::from_secs(10), read) => match result {
-            Ok(Ok(body)) => provider_error(body, secret),
-            Ok(Err(error)) => error,
-            Err(_) => AiError::Provider(format!("provider returned {status}: error body read timed out")),
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "error body read timed out".into(),
         },
-    }
+    };
+    let redact = |value: String| match secret.filter(|secret| !secret.is_empty()) {
+        Some(secret) => value.replace(secret.as_str(), "***"),
+        None => value,
+    };
+    let endpoint = redact(endpoint);
+    let request_id = redact(request_id);
+    let body = redact(body);
+    tracing::error!(target: "lumakit_ai::http", event = "ai.http.rejected", %endpoint, status, request_id = ?request_id, "上游拒绝请求；错误正文仅返回调用方，不写入日志");
+    AiError::Http { status, request_id, body }
 }
 
 #[cfg(test)]

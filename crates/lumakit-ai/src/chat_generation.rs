@@ -1,10 +1,79 @@
-//! OpenAI 兼容图片生成；不复用文本接口，不向外部图片 URL 发送密钥。
-use super::ImageRef;
-use crate::{AiConnection, AiError, AiRun, images, model_config::{ModelType, RoundUsage, TokenUsage}};
+//! 绘图工具宿主与有界 OpenAI 兼容图片客户端；不向外部图片 URL 发送密钥。
+use super::{Event, ImageRef};
+use crate::{AiConnection, AiError, AiHost, AiRun, Approval, ModelRef, RunRequest, ToolCall, ToolFuture, ToolOutput, ToolSpec, images, model_config::{ModelType, RoundUsage, TokenUsage}};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{io::Write, path::Path};
+use serde::{Deserialize, Serialize};
+use std::{io::Write, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc}};
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+enum ImageSize {
+    #[default]
+    #[serde(rename = "1024x1024")]
+    Square,
+    #[serde(rename = "1024x1536")]
+    Portrait,
+    #[serde(rename = "1536x1024")]
+    Landscape,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ImageRequest {
+    prompt: String,
+    #[serde(default)]
+    size: ImageSize,
+}
+impl ImageRequest {
+    fn parse(value: serde_json::Value) -> Result<Self, AiError> {
+        let mut request: Self = serde_json::from_value(value).map_err(|_| error("绘图参数无效：prompt 为文字，size 仅支持 1024x1024、1024x1536、1536x1024。"))?;
+        if request.prompt.trim().len() != request.prompt.len() { request.prompt = request.prompt.trim().to_owned(); }
+        if request.prompt.is_empty() || request.prompt.chars().count() > 4000 { return Err(error("绘图提示必须包含 1 至 4000 个 Unicode 字符。")); }
+        Ok(request)
+    }
+}
+
+pub(super) struct PaintingHost {
+    pub model: ModelRef,
+    pub chat: AiConnection,
+    pub painting: Option<AiConnection>,
+    pub root: PathBuf,
+    pub tx: mpsc::SyncSender<Event>,
+    pub wake: Arc<dyn Fn() + Send + Sync>,
+    pub executions: Arc<AtomicUsize>,
+}
+impl AiHost for PaintingHost {
+    fn select_model(&self, _: &RunRequest) -> Result<ModelRef, AiError> { Ok(self.model.clone()) }
+    fn connection(&self, _: &ModelRef) -> Result<AiConnection, AiError> { Ok(self.chat.clone()) }
+    fn system_prompt(&self, _: &RunRequest) -> Result<Option<String>, AiError> { Ok(None) }
+    fn tools(&self, _: &RunRequest) -> Vec<ToolSpec> {
+        if self.painting.is_none() { return Vec::new(); }
+        vec![ToolSpec {
+            name: "generate_image".into(), description: "仅当用户要求图片、绘画、插图或照片时生成一张图片；描述完整画面、构图与氛围，每次回复最多调用两次。失败时如实报告，不得声称已生成，不要重试同一失败请求。".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":4000},"size":{"type":"string","enum":["1024x1024","1024x1536","1536x1024"]}},"required":["prompt"],"additionalProperties":false}),
+            read_only: false, requires_approval: false,
+        }]
+    }
+    fn authorize(&self, _: &ToolCall, default: Approval) -> Approval { default }
+    fn call_tool(&self, call: ToolCall, cancel: CancellationToken) -> ToolFuture {
+        let painting = self.painting.clone();
+        let root = self.root.clone();
+        let tx = self.tx.clone();
+        let wake = self.wake.clone();
+        let executions = self.executions.clone();
+        Box::pin(async move {
+            if cancel.is_cancelled() { return Err(AiError::Cancelled); }
+            if call.name != "generate_image" { return Err(error("未知绘图工具。")); }
+            if executions.fetch_add(1, Ordering::Relaxed) >= 2 { return Err(error("每次回复最多执行两次图片生成（失败也计入）；未再次请求图片接口。")); }
+            let request = ImageRequest::parse(call.arguments)?;
+            tracing::info!(event = "ai.image.tool", call_id = %call.id, prompt_chars = request.prompt.chars().count(), size = ?request.size, "执行绘图工具");
+            let (run, images) = generate(painting.ok_or_else(|| error("尚未配置绘图连接。"))?, request, &root, &cancel).await?;
+            let text = serde_json::json!({"message":format!("Generated {} image(s).", images.len()),"images":images}).to_string();
+            tx.send(Event::Generated { images, rounds: run.rounds }).map_err(|_| error("绘图会话已关闭。"))?;
+            wake();
+            Ok(ToolOutput { text, is_error: false })
+        })
+    }
+}
 pub(super) fn validate(connection: &AiConnection) -> Result<(), String> {
     if connection.protocol == crate::Protocol::AnthropicMessages { return Err("图片生成仅支持 OpenAI 兼容 images/generations 接口。".into()); }
     if connection.settings.model_type != ModelType::Image { return Err("请选择已保存的图片模型。".into()); }
@@ -16,13 +85,17 @@ pub(super) fn validate(connection: &AiConnection) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) async fn generate(connection: AiConnection, prompt: String, root: &Path, cancel: &CancellationToken) -> Result<(AiRun, Vec<ImageRef>), AiError> {
+async fn generate(connection: AiConnection, request: ImageRequest, root: &Path, cancel: &CancellationToken) -> Result<(AiRun, Vec<ImageRef>), AiError> {
     validate(&connection).map_err(AiError::Provider)?;
     let http = crate::http_client()?;
     let url = format!("{}/images/generations", connection.base_url.trim_end_matches('/'));
-    let mut request = http.post(url).timeout(std::time::Duration::from_secs(120)).json(&serde_json::json!({"model": connection.model, "prompt": prompt, "n": 1, "size": "1024x1024"}));
+    let mut body = serde_json::to_value(request).map_err(|_| error("无法编码绘图请求。"))?;
+    body["model"] = serde_json::json!(connection.model);
+    body["n"] = serde_json::json!(1);
+    let mut request = http.post(url).timeout(std::time::Duration::from_secs(120)).json(&body);
     if let Some(key) = &connection.api_key { request = request.bearer_auth(key.as_str()); }
     let response = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = request.send() => result.map_err(crate::network)? };
+    tracing::info!(event = "ai.image.response", status = response.status().as_u16(), "Image generation response received");
     if !response.status().is_success() { return Err(crate::provider_response(response, connection.api_key.as_ref(), cancel).await); }
     let body = read_body(response, 24 * 1024 * 1024, cancel).await?;
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| error("图片接口返回了无效 JSON。"))?;
@@ -41,7 +114,7 @@ pub(super) async fn generate(connection: AiConnection, prompt: String, root: &Pa
             // 先解析并固定公网地址，避免 DNS 重绑定；禁止重定向及代理绕过固定解析。
             let addresses: Vec<_> = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::lookup_host((host, port))) => result.map_err(|_| error("图片主机解析超时。"))?.map_err(|_| error("图片主机解析失败。"))? }.collect();
             if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) { return Err(error("生成图片 URL 必须指向公网地址。")); }
-            let download = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().resolve_to_addrs(host, &addresses).build().map_err(crate::network)?;
+            let download = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).no_proxy().user_agent(concat!("lumakit/", env!("CARGO_PKG_VERSION"))).connect_timeout(std::time::Duration::from_secs(10)).resolve_to_addrs(host, &addresses).build().map_err(crate::network)?;
             let response = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = download.get(url.clone()).timeout(std::time::Duration::from_secs(60)).send() => result.map_err(crate::network)? };
             if !response.status().is_success() { return Err(error("生成图片下载失败；不跟随重定向。")); }
             read_body(response, images::MAX_IMAGE_BYTES, cancel).await?
@@ -66,6 +139,7 @@ pub(super) async fn generate(connection: AiConnection, prompt: String, root: &Pa
     })();
     if let Err(error) = save { for image in &stored { let _ = std::fs::remove_file(root.join(&image.storage_key)); } return Err(error); }
     let usage = value.get("usage").and_then(|usage| Some(TokenUsage { input_tokens: usage.get("input_tokens")?.as_u64()?, output_tokens: usage.get("output_tokens")?.as_u64()?, cache_read_tokens: 0, cache_write_tokens: 0 }));
+    tracing::info!(event = "ai.image.stored", count = stored.len(), "Generated images stored");
     Ok((AiRun { text: String::new(), tool_calls: Vec::new(), rounds: vec![RoundUsage { usage, pricing: None, cost: None }], reasoning_blocks: Vec::new() }, stored))
 }
 
@@ -85,5 +159,25 @@ fn public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => { let [a, b, c, _] = ip.octets(); !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || a == 0 || a >= 240 || (a == 100 && (64..=127).contains(&b)) || (a == 192 && b == 0 && c == 0) || (a == 192 && b == 0 && c == 2) || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100))) || (a == 203 && b == 0 && c == 113)) }
         std::net::IpAddr::V6(ip) => { let segments = ip.segments(); if let Some(ip) = ip.to_ipv4_mapped() { public_ip(ip.into()) } else { segments[0] & 0xe000 == 0x2000 && !(segments[0] == 0x2001 && segments[1] < 0x0200) && !(segments[0] == 0x2001 && segments[1] == 0x0db8) && !(segments[0] == 0x2002) } }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_arguments_are_typed_unicode_bounded_and_square_by_default() {
+        let request = ImageRequest::parse(serde_json::json!({"prompt":format!(" {} ", "🙂".repeat(4000))})).unwrap();
+        assert_eq!(request.prompt.chars().count(), 4000);
+        assert_eq!(serde_json::to_value(request).unwrap()["size"], "1024x1024");
+        for args in [
+            serde_json::json!({"prompt":"🙂".repeat(4001)}),
+            serde_json::json!({"prompt":" \n "}),
+            serde_json::json!({"prompt":1}),
+            serde_json::json!({"prompt":"图","size":"auto"}),
+            serde_json::json!({"prompt":"图","n":2}),
+            serde_json::json!({"prompt":"图","image_ids":["private"]}),
+        ] { assert!(ImageRequest::parse(args).is_err()); }
     }
 }

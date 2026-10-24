@@ -31,6 +31,8 @@ pub enum ChatAction {
     Draft(String),
     /// 保存输入区的搜索、推理和图片模式设置。
     SetComposer(lumakit_ai::chat::ComposerSettings),
+    /// 保存所有对话共用的工具栏显示偏好，不改变请求设置。
+    SetToolbar(Vec<lumakit_ai::chat::ToolbarTool>),
     /// 由宿主选择本地文件，再交给会话校验和保存。
     UploadAttachment,
     /// 移除尚未发送的附件。

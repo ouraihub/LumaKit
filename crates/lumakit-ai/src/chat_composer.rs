@@ -4,6 +4,35 @@ use crate::{images, history::TurnStatus, model_config::ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::{Read, Write}, path::{Path, PathBuf}};
 
+/// 可固定到输入区工具栏的操作；只控制显示，不改变请求设置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolbarTool {
+    /// 新建对话。
+    NewConversation,
+    /// 原生网络搜索。
+    WebSearch,
+    /// 上传附件。
+    Attachment,
+    /// 生成图片。
+    GenerateImage,
+}
+
+fn default_toolbar() -> Vec<ToolbarTool> {
+    vec![ToolbarTool::NewConversation, ToolbarTool::WebSearch]
+}
+
+fn canonical_toolbar(tools: &[ToolbarTool]) -> Vec<ToolbarTool> {
+    [ToolbarTool::NewConversation, ToolbarTool::WebSearch, ToolbarTool::Attachment, ToolbarTool::GenerateImage]
+        .into_iter().filter(|tool| tools.contains(tool)).collect()
+}
+
+fn deserialize_toolbar<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<ToolbarTool>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    // 新宿主保存的未知工具只忽略该项，不能让整份草稿和历史读取失败。
+    let tools: Vec<ToolbarTool> = values.into_iter().filter_map(|value| serde_json::from_value(value).ok()).collect();
+    Ok(canonical_toolbar(&tools))
+}
+
 /// 每个对话保存的输入控制；None 使用模型已保存的默认推理强度。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComposerSettings {
@@ -11,7 +40,7 @@ pub struct ComposerSettings {
     pub web_search: bool,
     /// 显式推理强度。
     pub reasoning: Option<ReasoningEffort>,
-    /// 使用图片生成接口。
+    /// 向聊天模型公开绘图工具；保留原字段名以兼容已保存控制。
     pub image_mode: bool,
     /// 图片生成使用的模型。
     pub image_model: Option<ModelRef>,
@@ -37,13 +66,31 @@ pub(super) struct InputSnapshot {
     pub settings: ComposerSettings,
     pub attachments: Vec<Attachment>,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ComposerData {
     pub drafts: BTreeMap<String, InputSnapshot>,
     pub turns: BTreeMap<String, InputSnapshot>,
+    #[serde(default = "default_toolbar", deserialize_with = "deserialize_toolbar")]
+    pub toolbar: Vec<ToolbarTool>,
+}
+
+impl Default for ComposerData {
+    fn default() -> Self {
+        Self { drafts: BTreeMap::new(), turns: BTreeMap::new(), toolbar: default_toolbar() }
+    }
 }
 
 impl ChatSession {
+    /// 所有对话共用的工具栏显示偏好。
+    pub fn toolbar(&self) -> &[ToolbarTool] { &self.composer_data.toolbar }
+    /// 保存工具栏显示偏好；不创建对话或更改输入控制，失败时撤销。
+    pub fn set_toolbar(&mut self, tools: Vec<ToolbarTool>) {
+        if !self.mutable() { return; }
+        let tools = canonical_toolbar(&tools);
+        if self.composer_data.toolbar == tools { return; }
+        let before = std::mem::replace(&mut self.composer_data.toolbar, tools);
+        if !self.save() { self.composer_data.toolbar = before; }
+    }
     /// 当前对话的输入控制。
     pub fn composer(&self) -> &ComposerSettings {
         self.history.selected.as_ref().and_then(|id| self.composer_data.drafts.get(id)).map(|draft| &draft.settings).unwrap_or(&self.default_composer)
@@ -123,6 +170,8 @@ impl ChatSession {
         if let Some(draft) = self.composer_data.drafts.get_mut(&conversation) { draft.attachments.retain(|attachment| attachment.id != id); }
         if !self.save() { self.composer_data = before; }
     }
+    /// 仅作预览缓存的范围身份，避免不同数据目录的同 ID 图片串图；读取仍须经过 media_path 校验。
+    pub fn media_scope(&self) -> &Path { &self.media_root }
     /// 只允许打开历史已登记且位于受控目录内的媒体。
     pub fn media_path(&self, id: &str) -> Result<PathBuf, String> {
         let image = self.history.conversations.iter().flat_map(|conversation| &conversation.turns).flat_map(|turn| &turn.attempts).flat_map(|attempt| &attempt.generated)
@@ -156,7 +205,7 @@ pub(super) fn context(turns: &[Turn], input: &str, attachments: &[Attachment], d
     let mut bytes = 0usize;
     for turn in turns {
         let selected = turn.selected_attempt.as_ref().and_then(|id| turn.attempts.iter().find(|attempt| &attempt.id == id));
-        let attempt = selected.or_else(|| turn.attempts.last()).filter(|attempt| attempt.status == TurnStatus::Completed && attempt.kind == AttemptKind::Reply && attempt.generated.is_empty() && !data.turns.get(&turn.id).is_some_and(|snapshot| snapshot.settings.image_mode));
+        let attempt = selected.or_else(|| turn.attempts.last()).filter(|attempt| attempt.status == TurnStatus::Completed && attempt.kind == AttemptKind::Reply && (!attempt.text.trim().is_empty() || (attempt.generated.is_empty() && !data.turns.get(&turn.id).is_some_and(|snapshot| snapshot.settings.image_mode))));
         if let Some(attempt) = attempt {
             if attempt.text.trim().is_empty() { return Err("已完成的历史回答为空，无法形成有效上下文。".into()); }
             let attachments = data.turns.get(&turn.id).map_or(&[][..], |snapshot| snapshot.attachments.as_slice());

@@ -67,18 +67,68 @@ fn count(path: &Path, table: &str) -> i64 {
     Connection::open(path).unwrap().query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap()
 }
 
+#[test]
+fn toolbar_preferences_are_global_compatible_and_atomic() {
+    use lumakit_ai::chat::ToolbarTool::{Attachment, GenerateImage, NewConversation, WebSearch};
+    let root = Directory::new();
+    let path = root.path();
+    let mut session = open(&path);
+    assert_eq!(session.toolbar(), &[NewConversation, WebSearch]);
+    session.set_toolbar(vec![GenerateImage, Attachment, GenerateImage]);
+    assert!(session.history().conversations.is_empty());
+    assert_eq!(session.toolbar(), &[Attachment, GenerateImage]);
+    assert!(!session.composer().web_search && !session.composer().image_mode);
+    session.new_conversation();
+    session.set_draft("保留草稿".into());
+    let first = session.selected().unwrap().id.clone();
+    session.new_conversation();
+    session.select_conversation(&first);
+    assert_eq!(session.toolbar(), &[Attachment, GenerateImage]);
+    drop(session);
+    let mut session = open(&path);
+    assert_eq!(session.toolbar(), &[Attachment, GenerateImage]);
+    assert_eq!(session.selected().unwrap().draft, "保留草稿");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_toolbar BEFORE UPDATE ON chat_meta WHEN NEW.key='composer' BEGIN SELECT RAISE(ABORT, 'injected toolbar failure'); END;").unwrap();
+    session.set_toolbar(vec![]);
+    assert!(session.save_failed());
+    assert_eq!(session.toolbar(), &[Attachment, GenerateImage]);
+    db.execute_batch("DROP TRIGGER reject_toolbar;").unwrap();
+    session.retry_save();
+    drop(session);
+    let mut composer: Value = serde_json::from_str(&db.query_row::<String, _, _>("SELECT value FROM chat_meta WHERE key='composer'", [], |row| row.get(0)).unwrap()).unwrap();
+    composer.as_object_mut().unwrap().remove("toolbar");
+    db.execute("UPDATE chat_meta SET value=?1 WHERE key='composer'", [composer.to_string()]).unwrap();
+    let session = open(&path);
+    assert_eq!(session.toolbar(), &[NewConversation, WebSearch]);
+    assert_eq!(session.selected().unwrap().draft, "保留草稿");
+    drop(session);
+    composer["toolbar"] = json!(["FutureTool", "Attachment", "Attachment"]);
+    db.execute("UPDATE chat_meta SET value=?1 WHERE key='composer'", [composer.to_string()]).unwrap();
+    let mut session = open(&path);
+    assert_eq!(session.toolbar(), &[Attachment]);
+    assert_eq!(session.selected().unwrap().draft, "保留草稿");
+    session.set_toolbar(vec![]);
+    drop(session);
+    assert!(open(&path).toolbar().is_empty());
+}
+
 // 真 HTTP 回环：读取宿主实际发送的正文，保持响应可覆盖停止和缺失结束帧。
 fn server(responses: Vec<(String, bool)>) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
     server_path(responses, "/v1/chat/completions")
 }
 
 fn server_path(responses: Vec<(String, bool)>, path: &'static str) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+    server_steps(responses.into_iter().map(|(body, hold)| (path, 200, body, hold)).collect())
+}
+
+fn server_steps(responses: Vec<(&'static str, u16, String, bool)>) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        for (body, hold) in responses {
+        for (path, status, body, hold) in responses {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
                 match listener.accept() {
@@ -102,6 +152,7 @@ fn server_path(responses: Vec<(String, bool)>, path: &'static str) -> (String, m
                 if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request[..end]);
                     assert!(headers.starts_with(&format!("POST {path} HTTP/1.1")));
+                    assert!(headers.to_ascii_lowercase().contains("user-agent: lumakit/"));
                     let length = headers.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
@@ -116,7 +167,7 @@ fn server_path(responses: Vec<(String, bool)>, path: &'static str) -> (String, m
                 request.extend_from_slice(&bytes[..count]);
             }
             tx.send(serde_json::from_slice(&request[start..start + length]).unwrap()).unwrap();
-            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + if hold { 100 } else { 0 });
+            let header = format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + if hold { 100 } else { 0 });
             if socket.write_all(header.as_bytes()).is_ok() && socket.write_all(body.as_bytes()).is_ok() && hold {
                 let mut byte = [0];
                 let _ = socket.read(&mut byte);
@@ -194,39 +245,84 @@ fn composer_attachments_restart_retry_and_wire_controls() {
     worker.join().unwrap();
 }
 
+fn painting_connection(url: &str, name: &str) -> AiConnection {
+    let mut c = connection(url, name);
+    c.settings.model_type = lumakit_ai::model_config::ModelType::Image;
+    c
+}
+fn tool_calls(calls: &[(&str, Value)]) -> String {
+    let calls: Vec<_> = calls.iter().enumerate().map(|(index, (id, args))| json!({"index":index,"id":id,"function":{"name":"generate_image","arguments":args.to_string()}})).collect();
+    format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]}))
+}
+fn image_response() -> String { json!({"data":[{"b64_json":"iVBORw0KGgo="}],"usage":{"input_tokens":12,"output_tokens":24}}).to_string() }
+
 #[test]
-fn generated_images_are_persisted_and_not_text_context() {
-    use lumakit_ai::{chat::ComposerSettings, model_config::ModelType};
+fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
+    use lumakit_ai::{chat::ComposerSettings, model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort}};
     let root = Directory::new();
     let path = root.path();
     let mut session = setup(&path);
-    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image-model")), ..Default::default() });
-    session.set_draft("画一张图".into());
-    let (url, requests, worker) = server_path(vec![(json!({"data":[{"b64_json":"iVBORw0KGgo="}],"usage":{"input_tokens":12,"output_tokens":24}}).to_string(), false)], "/v1/images/generations");
-    let mut c = connection(&url, "image-model"); c.settings.model_type = ModelType::Image;
-    session.send(c);
+    let (url, requests, worker) = server_steps(vec![
+        ("/v1/chat/completions", 200, response("之前的回答"), false),
+        ("/v1/chat/completions", 200, tool_calls(&[("paint-1", json!({"prompt":"模型整理的完整画面🙂","size":"1536x1024"}))]), false),
+        ("/v1/images/generations", 200, image_response(), false),
+        ("/v1/chat/completions", 200, response("已生成图片"), false),
+        ("/v1/chat/completions", 200, tool_calls(&[("retry-1", json!({"prompt":"重试画面"}))]), false),
+        ("/v1/images/generations", 200, image_response(), false),
+        ("/v1/chat/completions", 200, response("重新生成完成"), false),
+        ("/v1/chat/completions", 200, response("继续对话"), false),
+    ]);
+    session.set_draft("之前的问题".into());
+    session.send(connection(&url, "source"));
     complete(&mut session);
-    let sent = requests.recv().unwrap();
-    assert_eq!(sent["prompt"], "画一张图");
-    assert_eq!(sent["model"], "image-model");
-    assert!(sent.get("response_format").is_none());
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
-    assert_eq!(attempt.status, TurnStatus::Completed);
-    assert!(attempt.text.is_empty());
+    requests.recv().unwrap();
+    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("painting-original")), reasoning: Some(ReasoningEffort::High), ..Default::default() });
+    session.set_draft("画一张图".into());
+    assert_eq!(session.request_model(false).unwrap().model, "source");
+    session.send(connection(&url, "source"));
+    assert!(!session.busy());
+    assert!(session.notice().contains("send_with_painting"));
+    let chat = || { let mut c = connection(&url, "source"); c.settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::Low, ReasoningEffort::High], budget_tokens: None }); c };
+    session.send_with_painting(chat(), painting_connection(&url, "painting-original"));
+    complete(&mut session);
+    let first = requests.recv().unwrap();
+    let painted = requests.recv().unwrap();
+    let continuation = requests.recv().unwrap();
+    assert_eq!(first["messages"], json!([{"role":"user","content":"之前的问题"},{"role":"assistant","content":"之前的回答"},{"role":"user","content":"画一张图"}]));
+    assert_eq!(first["tools"][0]["function"]["name"], "generate_image");
+    assert_eq!(first["reasoning_effort"], "high");
+    assert_eq!(painted, json!({"model":"painting-original","prompt":"模型整理的完整画面🙂","size":"1536x1024","n":1}));
+    assert!(painted.get("response_format").is_none());
+    assert_eq!(continuation["messages"][4]["role"], "tool");
+    assert!(continuation["messages"][4]["content"].as_str().unwrap().contains("Generated 1 image(s)."));
+    let attempt = &session.selected().unwrap().turns[1].attempts[0];
+    assert_eq!(attempt.model.model, "source");
+    assert_eq!(attempt.text, "已生成图片");
+    assert_eq!(attempt.tool_events[0].approval, Some(lumakit_ai::Approval::Allow));
+    assert!(!attempt.tool_events[0].is_error);
+    assert_eq!(attempt.rounds.len(), 3);
     let id = attempt.generated[0].id.clone();
     assert_eq!(fs::read(session.media_path(&id).unwrap()).unwrap(), b"\x89PNG\r\n\x1a\n");
-    assert!(session.media_path("../chat.db").is_err());
-    worker.join().unwrap();
     drop(session);
     let mut session = open(&path);
     assert!(session.media_path(&id).unwrap().is_file());
-    assert!(session.composer().image_mode);
-    session.set_composer(ComposerSettings::default());
-    session.set_draft("普通聊天".into());
-    let (url, requests, worker) = server(vec![(response("文字回答"), false)]);
-    session.send(connection(&url, "source"));
+    session.select_model(model("different-chat"));
+    session.set_composer(ComposerSettings { image_model: Some(model("different-painting")), ..Default::default() });
+    assert_eq!(session.request_model(true).unwrap().model, "source");
+    assert_eq!(session.request_painting_model(true).unwrap().unwrap().model, "painting-original");
+    session.retry_with_painting(chat(), painting_connection(&url, "painting-original"));
     complete(&mut session);
-    assert_eq!(requests.recv().unwrap()["messages"], json!([{"role":"user","content":"普通聊天"}]));
+    let retry = requests.recv().unwrap();
+    assert_eq!(retry["messages"], first["messages"]);
+    assert_eq!(retry["reasoning_effort"], "high");
+    assert_eq!(requests.recv().unwrap()["size"], "1024x1024");
+    requests.recv().unwrap();
+    session.set_draft("继续".into());
+    session.send(connection(&url, "different-chat"));
+    complete(&mut session);
+    let next = requests.recv().unwrap();
+    assert_eq!(next["messages"][3]["content"], "重新生成完成");
+    assert!(session.media_path(&id).unwrap().is_file());
     worker.join().unwrap();
 }
 
@@ -265,22 +361,33 @@ fn attachment_limits_and_save_failure_preserve_draft() {
 }
 
 #[test]
-fn insecure_image_results_fail_without_losing_the_prompt() {
-    use lumakit_ai::{chat::ComposerSettings, model_config::ModelType};
+fn painting_invalid_failed_duplicate_and_cap_results_never_fake_success() {
+    use lumakit_ai::chat::ComposerSettings;
     let root = Directory::new();
     let mut session = setup(&root.path());
     session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
-    session.set_draft("失败后保留的绘图提示".into());
-    let (url, requests, worker) = server_path(vec![(json!({"data":[{"url":"http://127.0.0.1:1/private"}]}).to_string(), false)], "/v1/images/generations");
-    let mut c = connection(&url, "image"); c.settings.model_type = ModelType::Image;
-    session.send(c);
+    session.set_draft("绘图失败".into());
+    let (url, requests, worker) = server_steps(vec![
+        ("/v1/chat/completions", 200, tool_calls(&[("invalid", json!({"prompt":"x","size":"bad"})), ("failed", json!({"prompt":"画面"}))]), false),
+        ("/v1/images/generations", 400, "不支持的绘图参数".into(), false),
+        ("/v1/chat/completions", 200, tool_calls(&[("failed", json!({"prompt":"重复不得执行"})), ("cap", json!({"prompt":"超过上限不得执行"}))]), false),
+        ("/v1/chat/completions", 200, response("生成失败，未产生图片"), false),
+    ]);
+    session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
     complete(&mut session);
-    requests.recv().unwrap();
+    let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
+    assert_eq!(sent[1]["prompt"], "画面");
+    let results = sent[2]["messages"].as_array().unwrap();
+    assert!(results[2]["content"].as_str().unwrap().contains("参数无效"));
+    assert!(results[3]["content"].as_str().unwrap().contains("HTTP 400"));
+    assert!(results[3]["content"].as_str().unwrap().contains("不要自动重试"));
     let conversation = session.selected().unwrap();
-    assert_eq!(conversation.turns.len(), 1);
-    assert_eq!(conversation.turns[0].attempts[0].status, TurnStatus::Failed);
-    assert!(conversation.turns[0].attempts[0].generated.is_empty());
-    assert_eq!(conversation.draft, "失败后保留的绘图提示");
+    let attempt = &conversation.turns[0].attempts[0];
+    assert_eq!(attempt.status, TurnStatus::Completed);
+    assert!(attempt.generated.is_empty());
+    assert_eq!(attempt.tool_events.len(), 3);
+    assert!(attempt.tool_events.iter().all(|event| event.is_error && event.error.is_some() && event.result.is_some()));
+    assert!(attempt.tool_events[2].result.as_ref().unwrap().contains("最多执行两次"));
     worker.join().unwrap();
 }
 
@@ -882,4 +989,186 @@ fn tool_result_state_is_not_answer_text() {
     assert_eq!(saved.text, "回答");
     assert_eq!(saved.tool_events[0].result.as_deref(), Some("结果"));
     assert!(!saved.tool_events[0].is_error);
+}
+
+#[test]
+fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() {
+    use lumakit_ai::chat::ComposerSettings;
+    let root = Directory::new();
+    let path = root.path();
+    let mut session = setup(&path);
+    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_draft("两张图".into());
+    let calls = tool_calls(&[("one", json!({"prompt":"一"})), ("two", json!({"prompt":"二","size":"1024x1536"})), ("three", json!({"prompt":"三"}))]);
+    let (url, requests, worker) = server_steps(vec![
+        ("/v1/chat/completions", 200, calls, false),
+        ("/v1/images/generations", 200, image_response(), false),
+        ("/v1/images/generations", 200, image_response(), false),
+        ("/v1/chat/completions", 503, "最终文字失败".into(), false),
+    ]);
+    session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+    complete(&mut session);
+    let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
+    assert_eq!(sent[2]["size"], "1024x1536");
+    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    assert_eq!(attempt.status, TurnStatus::Failed);
+    assert_eq!(attempt.generated.len(), 2);
+    assert!(!attempt.tool_events[0].is_error);
+    assert!(!attempt.tool_events[1].is_error);
+    assert!(attempt.tool_events[2].is_error);
+    assert!(attempt.error.as_ref().unwrap().contains("503"));
+    let ids: Vec<_> = attempt.generated.iter().map(|image| image.id.clone()).collect();
+    worker.join().unwrap();
+    drop(session);
+    let reopened = open(&path);
+    let saved = &reopened.selected().unwrap().turns[0].attempts[0];
+    assert_eq!(saved.generated.len(), 2);
+    assert_eq!(saved.tool_events.len(), 3);
+    for id in ids { assert!(reopened.media_path(&id).unwrap().is_file()); }
+}
+
+#[test]
+fn painting_cancellation_during_image_or_continuation_preserves_completed_work() {
+    use lumakit_ai::chat::ComposerSettings;
+    for during_image in [true, false] {
+        let root = Directory::new();
+        let mut session = setup(&root.path());
+        session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+        session.set_draft("可取消绘图".into());
+        let mut steps = vec![("/v1/chat/completions", 200, tool_calls(&[("paint", json!({"prompt":"一张图"}))]), false)];
+        if during_image { steps.push(("/v1/images/generations", 200, "{".into(), true)); }
+        else {
+            steps.push(("/v1/images/generations", 200, image_response(), false));
+            steps.push(("/v1/chat/completions", 200, delta("生成后的部分说明"), true));
+        }
+        let (url, requests, worker) = server_steps(steps);
+        session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+        requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        if !during_image { wait_until(&mut session, |session| !session.selected().unwrap().turns[0].attempts[0].text.is_empty()); }
+        session.cancel();
+        complete(&mut session);
+        let attempt = &session.selected().unwrap().turns[0].attempts[0];
+        assert_eq!(attempt.status, TurnStatus::Cancelled);
+        assert_eq!(attempt.generated.len(), usize::from(!during_image));
+        assert_eq!(attempt.tool_events.len(), 1);
+        assert_eq!(session.selected().unwrap().draft, "可取消绘图");
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn painting_insecure_result_is_error_tool_payload_without_retry() {
+    use lumakit_ai::chat::ComposerSettings;
+    let root = Directory::new();
+    let mut session = setup(&root.path());
+    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_draft("不安全图片".into());
+    let (url, requests, worker) = server_steps(vec![
+        ("/v1/chat/completions", 200, tool_calls(&[("paint", json!({"prompt":"画面"}))]), false),
+        ("/v1/images/generations", 200, json!({"data":[{"url":"http://127.0.0.1:1/private"}]}).to_string(), false),
+        ("/v1/chat/completions", 200, response("图片地址不安全，生成失败"), false),
+    ]);
+    session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+    complete(&mut session);
+    for _ in 0..3 { requests.recv().unwrap(); }
+    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    assert!(attempt.generated.is_empty());
+    assert!(attempt.tool_events[0].is_error);
+    assert!(attempt.tool_events[0].error.as_ref().unwrap().contains("HTTPS"));
+    worker.join().unwrap();
+}
+
+#[test]
+fn legacy_failed_direct_image_retry_explicitly_migrates_chat_source() {
+    let root = Directory::new();
+    let path = root.path();
+    let legacy = json!({"schemaVersion":1,"value":{"selected":"legacy-c","model":model("source"),"conversations":[{"id":"legacy-c","title":"旧绘图","draft":"","turns":[{"id":"legacy-t","input":"原问题不能丢失","attempts":[{"id":"legacy-a","model":model("old-image"),"text":"","status":"failed","error":"原图片接口失败"}]}]}]}});
+    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    drop(open(&path));
+    let composer = json!({"drafts":{},"turns":{"legacy-t":{"settings":{"image_mode":true,"image_model":null,"web_search":false,"reasoning":null},"attachments":[]}}});
+    Connection::open(&path).unwrap().execute("INSERT OR REPLACE INTO chat_meta(key,value) VALUES('composer',?1)", [composer.to_string()]).unwrap();
+    let mut session = open(&path);
+    assert_eq!(session.request_model(true).unwrap().model, "old-image");
+    assert_eq!(session.request_painting_model(true).unwrap().unwrap().model, "old-image");
+    let (url, requests, worker) = server_steps(vec![
+        ("/v1/chat/completions", 200, tool_calls(&[("migrated", json!({"prompt":"原问题对应的画面"}))]), false),
+        ("/v1/images/generations", 200, image_response(), false),
+        ("/v1/chat/completions", 200, response("迁移后生成成功"), false),
+    ]);
+    session.retry_with_model_and_painting(connection(&url, "source"), painting_connection(&url, "old-image"));
+    complete(&mut session);
+    assert_eq!(requests.recv().unwrap()["messages"][0]["content"], "原问题不能丢失");
+    assert_eq!(requests.recv().unwrap()["model"], "old-image");
+    requests.recv().unwrap();
+    let attempts = &session.selected().unwrap().turns[0].attempts;
+    assert_eq!(attempts[0].model.model, "old-image");
+    assert_eq!(attempts[1].model.model, "source");
+    assert_eq!(attempts[1].status, TurnStatus::Completed);
+    worker.join().unwrap();
+    drop(session);
+    let session = open(&path);
+    assert_eq!(session.request_model(true).unwrap().model, "source");
+    assert_eq!(session.request_painting_model(true).unwrap().unwrap().model, "old-image");
+}
+
+#[test]
+fn painting_declared_tool_incapability_rejects_before_network() {
+    use lumakit_ai::chat::ComposerSettings;
+    let root = Directory::new();
+    let mut session = setup(&root.path());
+    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_draft("不支持工具".into());
+    let mut chat = connection("http://127.0.0.1:1/v1", "source");
+    chat.settings.supports_tools = Some(false);
+    session.send_with_painting(chat, painting_connection("http://127.0.0.1:1/v1", "image"));
+    assert!(!session.busy());
+    assert!(session.notice().contains("不支持工具"));
+    assert!(session.selected().unwrap().turns.is_empty());
+    assert_eq!(session.selected().unwrap().draft, "不支持工具");
+}
+
+#[test]
+fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
+    use lumakit_ai::{chat::ComposerSettings, model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort}};
+    let root = Directory::new();
+    let mut session = setup(&root.path());
+    let image = root.0.join("input.png");
+    fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+    session.add_attachment(&image).unwrap();
+    session.select_model(ModelRef { protocol: Protocol::OpenAiResponses, ..model("source") });
+    session.set_composer(ComposerSettings { web_search:true, reasoning:Some(ReasoningEffort::High), image_mode:true, image_model:Some(model("image")) });
+    session.set_draft("参考图片后绘图".into());
+    let reasoning = json!({"type":"reasoning","id":"rs-original","summary":[{"type":"summary_text","text":"独立推理"}],"encrypted_content":"opaque"});
+    let first = json!({"status":"completed","output":[reasoning.clone(),{"type":"function_call","id":"item","call_id":"paint","name":"generate_image","arguments":"{\"prompt\":\"完整构图\"}"}]}).to_string();
+    let final_response = json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"完成绘图"}]}]}).to_string();
+    let (url, requests, worker) = server_steps(vec![
+        ("/v1/responses", 200, first, false),
+        ("/v1/images/generations", 200, image_response(), false),
+        ("/v1/responses", 200, final_response, false),
+    ]);
+    let mut chat = connection(&url, "source");
+    chat.protocol = Protocol::OpenAiResponses;
+    chat.settings.supports_streaming = false;
+    chat.settings.supports_vision = true;
+    chat.settings.reasoning = Some(ReasoningConfig { dialect:ReasoningDialect::OpenAi, efforts:vec![ReasoningEffort::High], budget_tokens:None });
+    session.send_with_painting(chat, painting_connection(&url, "image"));
+    complete(&mut session);
+    let initial = requests.recv().unwrap();
+    requests.recv().unwrap();
+    let continuation = requests.recv().unwrap();
+    assert_eq!(initial["input"][0]["content"][1]["type"], "input_image");
+    for body in [&initial, &continuation] {
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["tools"][0]["name"], "generate_image");
+        assert_eq!(body["tools"][1]["type"], "web_search");
+    }
+    assert_eq!(continuation["input"][0], initial["input"][0]);
+    assert_eq!(continuation["input"][1], reasoning);
+    assert_eq!(continuation["input"][3]["type"], "function_call_output");
+    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    assert_eq!(attempt.status, TurnStatus::Completed);
+    assert_eq!(attempt.reasoning, vec![reasoning]);
+    assert_eq!(attempt.generated.len(), 1);
+    worker.join().unwrap();
 }

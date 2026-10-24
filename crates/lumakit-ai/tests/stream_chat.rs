@@ -135,7 +135,7 @@ fn server(
         // status=0：已连接，但上游尚未返回响应头。
         if status != 0 {
             let content_type = if json_response { "application/json" } else { "text/event-stream" };
-            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + usize::from(hold) * 100).unwrap();
+            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nx-request-id: req-test-{KEY}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + usize::from(hold) * 100).unwrap();
             let chunk_size = if body.len() > 8192 { 4096 } else { 1 };
             for chunk in body.as_bytes().chunks(chunk_size) {
                 if socket.write_all(chunk).is_err() {
@@ -195,9 +195,16 @@ async fn exercise(protocol: Protocol) {
     }
 
     let (url, worker) = server(protocol, 401, format!("rejected {KEY}"), false, None);
-    let error = stream_chat(connection(url, protocol), history(), CancellationToken::new(), |_| {}).await.unwrap_err().to_string();
-    assert!(error.contains("401") && error.contains("***"));
-    assert!(!error.contains(KEY));
+    let error = stream_chat(connection(url, protocol), history(), CancellationToken::new(), |_| {}).await.unwrap_err();
+    match &error {
+        AiError::Http { status, request_id, body } => {
+            assert_eq!(*status, 401);
+            assert_eq!(request_id, "x-request-id=req-test-***");
+            assert_eq!(body, "rejected ***");
+        },
+        other => panic!("上游 HTTP 错误丢失类型和请求标识：{other}"),
+    }
+    assert!(!error.to_string().contains(KEY));
     worker.join().unwrap();
 
     let upstream_error = match protocol {

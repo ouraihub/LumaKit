@@ -16,7 +16,7 @@ pub(crate) mod store;
 mod composer;
 #[path = "chat_generation.rs"]
 mod generation;
-pub use composer::{Attachment, ComposerSettings};
+pub use composer::{Attachment, ComposerSettings, ToolbarTool};
 const MAX_TEXT: usize = 1024 * 1024;
 
 #[allow(missing_docs)]
@@ -186,7 +186,8 @@ pub enum ChatEvent {
 enum Event {
     Delta(String),
     End(Result<crate::AiRun, (TurnStatus, String)>),
-    Generated(Vec<ImageRef>),
+    Generated { images: Vec<ImageRef>, rounds: Vec<crate::RoundUsage> },
+    Runtime(crate::RunEvent),
 }
 struct Job {
     conversation: usize,
@@ -514,22 +515,39 @@ impl ChatSession {
             conversation.turns.last().and_then(|t| t.attempts.last())
                 .map(|a| a.model.clone()).ok_or_else(|| "没有可重试的问题。".into())
         } else {
-            if self.composer().image_mode { self.composer().image_model.clone().ok_or_else(|| "请先选择已保存的图片模型。".into()) }
-            else { self.history.model.clone().ok_or_else(|| "请先选择已保存且已启用的模型。".into()) }
+            self.history.model.clone().ok_or_else(|| "请先选择已保存且已启用的聊天模型。".into())
         }
+    }
+    /// 新请求读取草稿，重试锁定原问题的绘图开关与模型；旧直接绘图记录沿用原来源。
+    pub fn request_painting_model(&self, retry: bool) -> Result<Option<ModelRef>, String> {
+        self.request_model(retry)?;
+        let conversation = self.selected().ok_or("请先新建对话。")?;
+        let settings = if retry {
+            let turn = conversation.turns.last().ok_or("没有可重试的问题。")?;
+            self.composer_data.turns.get(&turn.id).map(|snapshot| &snapshot.settings)
+        } else { Some(self.composer()) };
+        let Some(settings) = settings.filter(|settings| settings.image_mode) else { return Ok(None); };
+        let legacy_model = if retry { conversation.turns.last().and_then(|turn| turn.attempts.first()).map(|attempt| attempt.model.clone()) } else { None };
+        settings.image_model.clone().or(legacy_model).map(Some).ok_or_else(|| "请先选择已保存的绘图模型。".into())
     }
     /// 使用给定连接发送当前草稿；先保存请求记录，再启动后台流式请求。
     ///
     /// 忙碌或保存失败时不操作；校验失败时保留草稿并设置提示。
-    pub fn send(&mut self, connection: AiConnection) { self.start(connection, false, false); }
+    pub fn send(&mut self, connection: AiConnection) { self.start(connection, None, false, false); }
     /// 使用末次尝试的模型重答最后一个问题，保留已有尝试记录。
     ///
     /// 给定连接必须匹配原模型及协议；忙碌或保存失败时不操作。
-    pub fn retry(&mut self, connection: AiConnection) { self.start(connection, true, false); }
+    pub fn retry(&mut self, connection: AiConnection) { self.start(connection, None, true, false); }
     /// 显式换模型重答：宿主先 select_model，再按 history.model 解析真实连接。
-    pub fn retry_with(&mut self, connection: AiConnection) { self.start(connection, true, true); }
+    pub fn retry_with(&mut self, connection: AiConnection) { self.start(connection, None, true, true); }
+    /// 发送聊天请求，模型自行决定是否调用已选择的绘图工具。
+    pub fn send_with_painting(&mut self, chat: AiConnection, painting: AiConnection) { self.start(chat, Some(painting), false, false); }
+    /// 使用原问题的聊天来源、绘图来源与输入控制重试。
+    pub fn retry_with_painting(&mut self, chat: AiConnection, painting: AiConnection) { self.start(chat, Some(painting), true, false); }
+    /// 使用已 select_model 的聊天来源重试；绘图模型与控制仍取原问题快照，可迁移旧直接绘图失败。
+    pub fn retry_with_model_and_painting(&mut self, chat: AiConnection, painting: AiConnection) { self.start(chat, Some(painting), true, true); }
 
-    fn start(&mut self, connection: AiConnection, retry: bool, override_model: bool) {
+    fn start(&mut self, connection: AiConnection, painting: Option<AiConnection>, retry: bool, override_model: bool) {
         if !self.mutable() { return; }
         let prepared = (|| {
             let model = self.request_model(retry && !override_model)?;
@@ -544,22 +562,23 @@ impl ChatSession {
                 conversation.draft.trim().to_owned()
             };
             let ti = if retry { conversation.turns.len() - 1 } else { conversation.turns.len() };
-            let snapshot = if retry { self.composer_data.turns.get(&conversation.turns[ti].id).cloned().unwrap_or_default() }
+            let mut snapshot = if retry { self.composer_data.turns.get(&conversation.turns[ti].id).cloned().unwrap_or_default() }
                 else { self.composer_data.drafts.get(&conversation.id).cloned().unwrap_or_default() };
+            if snapshot.settings.image_mode {
+                let painting_model = self.request_painting_model(retry)?.ok_or("请先配置绘图模型。")?;
+                let painting = painting.as_ref().ok_or("绘图已启用：宿主需同时解析聊天与绘图模型，并调用 send_with_painting / retry_with_painting；不再直接发送原始提示到图片接口。")?;
+                if connection.settings.supports_tools == Some(false) { return Err("所选聊天模型声明不支持工具，请更换聊天模型或关闭生成图片。".into()); }
+                if painting.model != painting_model.model || painting.protocol != painting_model.protocol { return Err("绘图连接与原问题选择的模型不匹配。".into()); }
+                generation::validate(painting)?;
+                snapshot.settings.image_model = Some(painting_model);
+            } else if painting.is_some() { return Err("本问题未启用绘图工具，请使用普通聊天入口。".into()); }
             let mut connection = connection;
-            let messages = if snapshot.settings.image_mode {
-                generation::validate(&connection)?;
-                if snapshot.settings.web_search || snapshot.settings.reasoning.is_some() { return Err("图片生成不支持联网搜索或聊天推理控制，请关闭后发送。".into()); }
-                if snapshot.attachments.iter().any(|attachment| attachment.mime.starts_with("image/")) { return Err("图片生成接口不支持参考图编辑；请移除图片附件。".into()); }
-                vec![composer::user_message(&input, &snapshot.attachments, false, &self.media_root)?]
-            } else {
-                if connection.settings.model_type != crate::model_config::ModelType::Chat { return Err("所选模型不是聊天模型。".into()); }
-                if snapshot.settings.web_search && connection.protocol == crate::Protocol::OpenAiChat { return Err("Chat Completions 不支持原生联网搜索，请选择 Responses 或 Anthropic 线路。".into()); }
-                connection.settings.native_web_search = snapshot.settings.web_search;
-                if let Some(effort) = snapshot.settings.reasoning { connection = connection.with_reasoning_effort(effort)?; }
-                connection.settings.validate(connection.protocol)?;
-                composer::context(&conversation.turns[..ti], &input, &snapshot.attachments, &self.composer_data, connection.settings.supports_vision, &self.media_root)?
-            };
+            if connection.settings.model_type != crate::model_config::ModelType::Chat { return Err("所选模型不是聊天模型。".into()); }
+            if snapshot.settings.web_search && connection.protocol == crate::Protocol::OpenAiChat { return Err("Chat Completions 不支持原生联网搜索，请选择 Responses 或 Anthropic 线路。".into()); }
+            connection.settings.native_web_search = snapshot.settings.web_search;
+            if let Some(effort) = snapshot.settings.reasoning { connection = connection.with_reasoning_effort(effort)?; }
+            connection.settings.validate(connection.protocol)?;
+            let messages = composer::context(&conversation.turns[..ti], &input, &snapshot.attachments, &self.composer_data, connection.settings.supports_vision, &self.media_root)?;
             let attempt = Attempt {
                 id: new_id().map_err(|_| "无法生成回答标识，请重试。".to_owned())?,
                 model, text: String::new(), status: TurnStatus::Running, error: None, rounds: Vec::new(), reasoning: Vec::new(),
@@ -588,8 +607,8 @@ impl ChatSession {
         }
         let ai = conversation.turns[ti].attempts.len();
         conversation.turns[ti].attempts.push(attempt);
+        self.composer_data.turns.insert(self.history.conversations[ci].turns[ti].id.clone(), snapshot);
         if !retry {
-            self.composer_data.turns.insert(self.history.conversations[ci].turns[ti].id.clone(), snapshot);
             if let Some(draft) = self.composer_data.drafts.get_mut(&self.history.conversations[ci].id) { draft.attachments.clear(); }
         }
         // 接受请求前必须落盘；失败时完整撤销新增记录，不能留下重复问题或 Running。
@@ -612,11 +631,16 @@ impl ChatSession {
         };
         let (tx, rx) = mpsc::sync_channel(64);
         let media_root = self.media_root.clone();
+        let span = tracing::info_span!("ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, model = %connection.model, protocol = ?connection.protocol, image_mode);
         let worker = thread::Builder::new().name("lumakit-chat".into()).spawn(move || {
-            let result = if image_mode {
-                let prompt = match messages.into_iter().next() { Some(ChatMessage::User(text)) => text, _ => String::new() };
-                run_generation(connection, prompt, &media_root, worker_cancel, &tx, &wake)
-            } else { run_worker(connection, messages, worker_cancel, &tx, &wake) };
+            // worker 独占同步运行时；span 仅在线程入口进入，不跨异步任务持有 guard。
+            let _entered = span.enter();
+            let result = run_session_worker(connection, painting, messages, worker_cancel, &tx, &wake, media_root);
+            match &result {
+                Ok(_) => tracing::info!(event = "ai.request.completed", "AI request completed"),
+                Err((TurnStatus::Cancelled, _)) => tracing::info!(event = "ai.request.cancelled", "AI request cancelled"),
+                Err(_) => tracing::error!(event = "ai.request.failed", "AI 请求失败；详情仅保存到会话，不记录私有正文"),
+            }
             let _ = tx.send(Event::End(result));
             wake();
         });
@@ -668,15 +692,21 @@ impl ChatSession {
             if !self.active_identity_matches() { continue; }
             let terminal = self.job.as_ref().is_some_and(|job| job.terminal);
             if terminal { continue; }
+            let persist = !matches!(&event, Event::Delta(_) | Event::End(_));
             if let Some(attempt) = self.active_attempt() {
                 match event {
                     Event::Delta(text) => { if text.len() <= MAX_TEXT.saturating_sub(attempt.text.len()) { attempt.text.push_str(&text); } }
-                    Event::Generated(images) => { attempt.generated = images; }
+                    Event::Generated { images, rounds } => { attempt.generated.extend(images); attempt.rounds.extend(rounds); }
+                    Event::Runtime(crate::RunEvent::Tool(event)) => {
+                        if let Some(previous) = attempt.tool_events.iter_mut().find(|previous| previous.id == event.id) { *previous = event; }
+                        else { attempt.tool_events.push(event); }
+                    }
+                    Event::Runtime(crate::RunEvent::Round { usage, reasoning }) => { attempt.rounds.extend(usage); attempt.reasoning.extend(reasoning); }
                     Event::End(result) => {
                         let attempt_id = self.job.as_ref().map(|job| job.attempt).and_then(|attempt| self.history.conversations.get(self.job.as_ref()?.conversation)?.turns.get(self.job.as_ref()?.turn)?.attempts.get(attempt)).map(|attempt| attempt.id.clone());
                         if let Some(attempt) = self.active_attempt() {
                             match result {
-                                Ok(result) => { attempt.text = result.text; attempt.rounds = result.rounds; attempt.reasoning = result.reasoning_blocks; attempt.status = TurnStatus::Completed; attempt.error = None; }
+                                Ok(result) => { attempt.text = result.text; attempt.status = TurnStatus::Completed; attempt.error = None; }
                                 Err((status, error)) => { attempt.status = status; attempt.error = Some(error); }
                             }
                         }
@@ -688,6 +718,8 @@ impl ChatSession {
                     }
                 }
             }
+            // 工具与媒体先落盘，后续聊天失败或进程重启也不会丢失已完成的绘图。
+            if persist { self.save(); }
             if ended { break; }
         }
         if ended {
@@ -726,14 +758,6 @@ impl Drop for ChatSession {
     }
 }
 
-fn run_generation(connection: AiConnection, prompt: String, root: &Path, cancel: CancellationToken, tx: &mpsc::SyncSender<Event>, wake: &Arc<dyn Fn() + Send + Sync>) -> Result<crate::AiRun, (TurnStatus, String)> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| (TurnStatus::Failed, "无法启动图片网络运行时。".into()))?;
-    match runtime.block_on(generation::generate(connection, prompt, root, &cancel)) {
-        Ok((run, images)) => { tx.send(Event::Generated(images)).map_err(|_| (TurnStatus::Failed, "图片会话已关闭。".into()))?; wake(); Ok(run) }
-        Err(AiError::Cancelled) => Err((TurnStatus::Cancelled, "已停止图片生成。".into())),
-        Err(error) => Err((TurnStatus::Failed, format!("图片生成失败：{error}"))),
-    }
-}
 
 fn run_worker(
     connection: AiConnection,
@@ -742,11 +766,28 @@ fn run_worker(
     tx: &mpsc::SyncSender<Event>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) -> Result<crate::AiRun, (TurnStatus, String)> {
+    run_session_worker(connection, None, messages, cancel, tx, wake, PathBuf::new())
+}
+
+fn run_session_worker(
+    connection: AiConnection,
+    painting: Option<AiConnection>,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+    tx: &mpsc::SyncSender<Event>,
+    wake: &Arc<dyn Fn() + Send + Sync>,
+    media_root: PathBuf,
+) -> Result<crate::AiRun, (TurnStatus, String)> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
         .map_err(|_| (TurnStatus::Failed, "无法启动聊天网络运行时，请重试。".into()))?;
     let mut bytes = 0usize;
     let mut overflow = false;
-    let result = runtime.block_on(crate::stream_chat_with_usage(connection, messages, cancel.clone(), |text| {
+    let host = generation::PaintingHost {
+        model: ModelRef { provider: "snapshot".into(), endpoint: "snapshot".into(), model: connection.model.clone(), protocol: connection.protocol },
+        chat: connection, painting, root: media_root, tx: tx.clone(), wake: wake.clone(), executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let engine = crate::AiRuntime::new(Arc::new(host)).map_err(|error| (TurnStatus::Failed, error.to_string()))?;
+    let result = runtime.block_on(engine.run_with_history(crate::RunRequest { input: String::new(), model: None, purpose: "chat".into() }, messages, cancel.clone(), |text| {
         if overflow { return; }
         if text.len() > MAX_TEXT.saturating_sub(bytes) {
             overflow = true;
@@ -766,7 +807,7 @@ fn run_worker(
             wake();
             remaining = &remaining[end..];
         }
-    }));
+    }, |event| { if tx.send(Event::Runtime(event)).is_err() { cancel.cancel(); } wake(); }));
     if overflow {
         return Err((TurnStatus::Failed, "回答超过 1 MiB，已停止；保留已有内容。".into()));
     }
