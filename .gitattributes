@@ -1,0 +1,5 @@
+# 自动转换会让源码反复提示 LF/CRLF；源码与文档统一使用 LF。
+* text=auto eol=lf
+# Windows 批处理使用 LF 时可能被 cmd 错误解析，工作区保留 CRLF。
+*.bat text eol=crlf
+*.cmd text eol=crlf
