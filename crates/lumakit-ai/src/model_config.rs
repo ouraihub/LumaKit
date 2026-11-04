@@ -26,6 +26,20 @@ pub enum ModelType {
 impl ModelType {
     /// 模型选择器使用的分类名称。
     pub fn label(self) -> &'static str { match self { Self::Chat => "聊天", Self::Image => "图片", Self::Video => "视频", Self::Tts => "语音合成", Self::Stt => "语音识别", Self::Embedding => "向量", Self::Rerank => "重排", Self::Unknown => "未知" } }
+    /// 按模型 ID 推断类型（ThinkRail `model_catalog::model_type`）：模型目录只返回 ID 时的初值，
+    /// 用户可在同步列表或模型设置中改正。关键词按序匹配，首个命中生效；都不命中为聊天。
+    pub fn infer(id: &str) -> Self {
+        const TYPES: &[(&[&str], ModelType)] = &[
+            (&["embed"], ModelType::Embedding),
+            (&["rerank"], ModelType::Rerank),
+            (&["tts", "speech"], ModelType::Tts),
+            (&["whisper", "stt", "transcri"], ModelType::Stt),
+            (&["dall-e", "image", "flux", "imagen"], ModelType::Image),
+            (&["video", "sora", "veo"], ModelType::Video),
+        ];
+        let id = id.to_ascii_lowercase();
+        TYPES.iter().find(|(words, _)| words.iter().any(|word| id.contains(word))).map_or(Self::Chat, |&(_, kind)| kind)
+    }
 }
 /// 推理控制的协议编码方言。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,5 +205,20 @@ impl ModelPricing {
         let t = self.tiers.iter().rev().find(|t| u64::from(t.min_input_tokens) <= usage.input_tokens)?;
         let uncached = usage.input_tokens.checked_sub(usage.cache_read_tokens.checked_add(usage.cache_write_tokens)?)?;
         Some((uncached as f64 * t.input + usage.output_tokens as f64 * t.output + usage.cache_read_tokens as f64 * t.cache_read.unwrap_or(t.input) + usage.cache_write_tokens as f64 * t.cache_write.unwrap_or(t.input)) / 1_000_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelType;
+    #[test]
+    fn infer_classifies_catalog_ids_by_name() {
+        for (id, kind) in [
+            ("gpt-5.6-luna", ModelType::Chat), ("codex-auto-review", ModelType::Chat), ("Qwen/Qwen3-VL-235B", ModelType::Chat),
+            ("gpt-image-2", ModelType::Image), ("gpt-image-2.5-flare", ModelType::Image), ("dall-e-3", ModelType::Image), ("black-forest-labs/FLUX.1-dev", ModelType::Image),
+            ("text-embedding-3-large", ModelType::Embedding), ("BAAI/bge-m3", ModelType::Chat),
+            ("BAAI/bge-reranker-v2-m3", ModelType::Rerank), ("whisper-1", ModelType::Stt), ("gpt-4o-transcribe", ModelType::Stt),
+            ("gpt-4o-mini-tts", ModelType::Tts), ("sora-2", ModelType::Video),
+        ] { assert_eq!(ModelType::infer(id), kind, "{id}"); }
     }
 }

@@ -1,6 +1,7 @@
 //! Settings-page building blocks, extracted from ThinkRail Native's settings panels: the grouped
-//! navigation column, groups, rows and fields, link labels, avatars, empty states and notices.
-//! Stateless: callers pass [`Roles`] and their own handlers; nothing here owns settings state.
+//! navigation column, groups, rows and fields, link labels, avatars, empty states, notices and
+//! the dropdown select. Stateless: callers pass [`Roles`] and their own handlers; nothing here
+//! owns settings state.
 
 use gpui_kit::{
     AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement, Role,
@@ -10,6 +11,7 @@ use gpui_kit::{
     component::{
         Icon, Sizable as _,
         button::{Button, ButtonVariants as _},
+        menu::{DropdownMenu as _, PopupMenuItem},
     },
     div,
     prelude::FluentBuilder as _,
@@ -267,6 +269,39 @@ pub fn dot(color: impl Into<gpui_kit::Hsla>) -> AnyElement {
 pub fn row_menu_button(id: impl Into<ElementId>, tooltip: impl Into<SharedString>) -> Button {
     let tooltip = tooltip.into();
     Button::new(id).ghost().xsmall().icon(IconName::Ellipsis).accessibility_label(tooltip.clone()).tooltip(tooltip)
+}
+
+/// The trigger of a [`select`]: the current `value` on the left, a chevron on the right, as in
+/// ThinkRail's line dialog. `name` is what the choice is (e.g. 协议) and reaches assistive
+/// technology as "name：value". Outlined; callers size it (`.w_full()`, `.small()`, `.ghost()`)
+/// and disable it before passing it to [`select`].
+pub fn select_button(id: impl Into<ElementId>, name: impl Into<SharedString>, value: impl Into<SharedString>) -> Button {
+    let value: SharedString = value.into();
+    Button::new(id)
+        .outline()
+        .accessibility_label(format!("{}：{}", name.into(), value))
+        .child(h_flex().w_full().gap(space::S8).child(label(text::UI, value)).child(div().flex_1()).child(Icon::new(IconName::ChevronDown).small()))
+}
+
+/// A single choice as a dropdown: `trigger` (from [`select_button`]) opens a menu of `options`
+/// with `current` checked; picking one calls `on_pick` with its value. Use it for any choice that
+/// can grow (enums, user data); a row of buttons cannot hold many options.
+pub fn select<T: Copy + PartialEq + 'static>(
+    trigger: Button,
+    current: Option<T>,
+    options: impl IntoIterator<Item = (T, SharedString)>,
+    on_pick: impl Fn(T, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let options: Vec<(T, SharedString)> = options.into_iter().collect();
+    let on_pick = std::rc::Rc::new(on_pick);
+    trigger
+        .dropdown_menu(move |menu, _, _| {
+            options.iter().fold(menu, |menu, (value, title)| {
+                let (value, on_pick) = (*value, on_pick.clone());
+                menu.item(PopupMenuItem::new(title.clone()).checked(current == Some(value)).on_click(move |_, window, cx| on_pick(value, window, cx)))
+            })
+        })
+        .into_any_element()
 }
 
 /// Height of a [`list_row`].
