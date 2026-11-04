@@ -3,8 +3,6 @@ use lumakit_ai::{
     AiConnection, AiError, AiHost, Approval, RunRequest, ToolCall, ToolFuture, ToolOutput, ToolSpec,
 };
 use lumakit_observability::{LogHandle, LogLevel};
-use lumakit_ports::{FakeSystemSnapshot, SystemMetrics, SystemSnapshot};
-use lumakit_runtime::Runtime;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -52,11 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = lumakit_support::data_root("lumakit-cli")?;
     let logs = LogHandle::init(&root.join("logs"), LogLevel::Debug, 5 * 1024 * 1024)?;
     tracing::info!(event = "startup", "lumakit.cli.started");
-    let sample = FakeSystemSnapshot(SystemMetrics {
-        cpu_percent: 12,
-        memory_percent: 38,
-    })
-    .sample()?;
     let request = RunRequest {
         input: "读取状态".into(),
         model: Some(lumakit_ai::ModelRef {
@@ -68,12 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         purpose: "desktop".into(),
     };
     let runtime = lumakit_ai::AiRuntime::new(Arc::new(Host))?;
-    println!(
-        "LumaKit CLI | cpu={} memory={} tools={}",
-        sample.cpu_percent,
-        sample.memory_percent,
-        runtime.available_tools(&request).len()
-    );
+    println!("LumaKit CLI | tools={}", runtime.available_tools(&request).len());
     if std::env::var_os("LUMAKIT_AI_URL").is_some() {
         let run = runtime
             .run(
@@ -85,7 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nAI text length={}", run.text.chars().count());
     }
     println!("log={}", logs.status().path.display());
-    let _runtime = Runtime::new();
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 use egui::{Align, Button, FontId, Frame, Id, Layout, Margin, Rect, RichText, ScrollArea, TextEdit, TextStyle, Ui, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use lumakit_ai::{ModelRef, chat::{Attempt, ChatSession, ToolbarTool}, history::TurnStatus, model_config::{ModelSettings, ReasoningEffort}};
-use lumakit_ui::chat::{ChatAction, ModelOption};
+use lumakit_ai::chat::{ChatAction, ModelOption};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::{collections::HashMap, fmt::Debug, hash::Hash};
 

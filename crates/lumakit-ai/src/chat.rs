@@ -16,6 +16,9 @@ pub(crate) mod store;
 mod composer;
 #[path = "chat_generation.rs"]
 mod generation;
+#[path = "chat_action.rs"]
+mod action;
+pub use action::{ChatAction, ModelOption};
 pub use composer::{Attachment, ComposerSettings, ToolbarTool};
 const MAX_TEXT: usize = 1024 * 1024;
 

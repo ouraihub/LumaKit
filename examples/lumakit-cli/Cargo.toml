@@ -7,8 +7,6 @@ license.workspace = true
 [dependencies]
 lumakit-support.workspace = true
 lumakit-observability.workspace = true
-lumakit-runtime.workspace = true
-lumakit-ports.workspace = true
 lumakit-ai.workspace = true
 serde.workspace = true
 serde_json.workspace = true

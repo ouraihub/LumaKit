@@ -1,0 +1,15 @@
+[package]
+name = "lumakit-design"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LumaKit design system for GPUI hosts: themes, tokens, fonts, icons and components."
+
+[dependencies]
+gpui-kit.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ttf-parser.workspace = true
+

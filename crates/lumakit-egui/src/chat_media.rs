@@ -4,7 +4,7 @@ use std::{collections::VecDeque, io::{Cursor, Read}, path::{Path, PathBuf}};
 use egui::{ColorImage, Rect, Sense, TextureHandle, TextureOptions, Ui, Vec2};
 use image::{ImageFormat, ImageReader, Limits};
 use lumakit_ai::chat::{ChatSession, ImageRef};
-use lumakit_ui::chat::ChatAction;
+use lumakit_ai::chat::ChatAction;
 
 const MAX_INPUT: usize = 4 * 1024 * 1024;
 const MAX_DECODE: u64 = 64 * 1024 * 1024;

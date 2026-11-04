@@ -2,7 +2,7 @@
 use eframe::egui;
 use lumakit_ai::{chat::ChatSession, AiConnection, ModelRef, Protocol};
 use lumakit_egui::ChatPanel;
-use lumakit_ui::chat::{ChatAction, ModelOption};
+use lumakit_ai::chat::{ChatAction, ModelOption};
 use std::{path::PathBuf, sync::Arc};
 
 struct Host { session: ChatSession, panel: ChatPanel, options: Vec<ModelOption>, image_options: Vec<ModelOption>, settings: lumakit_ai::model_config::ModelSettings, base: String, picker: Option<std::sync::mpsc::Receiver<Result<Option<PathBuf>, String>>> }
