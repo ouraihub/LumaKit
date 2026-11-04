@@ -45,7 +45,7 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 - `lumakit-ai::search`：搜索结果清理、黑名单和原生搜索能力判定。
 - `lumakit-ai::history`：历史迁移、候选关系、崩溃恢复、图片元数据和有限重试策略；目标 schema 由聊天设计定义。
 - `lumakit-ai::chat::ChatSession`：UI 中立的会话、尝试、候选、事件、媒体引用、流式任务、保存恢复与关闭仲裁；当前文本链路是基线，能力按设计继续增长。
-- `ChatSession::toolbar/set_toolbar` 保存同一 `chat.db` 全局共用的工具栏显示偏好，默认固定新对话和网络搜索；`ChatAction::SetToolbar` 由宿主转交会话。固定/取消固定不创建对话、不修改搜索或生图请求控制；保存失败保留原偏好，旧记录缺字段使用默认值，未知工具忽略但不丢弃历史。
+- `ChatSession::toolbar/set_toolbar` 保存同一 `chat.db` 全局共用的工具栏显示偏好和顺序，去重时保留首次出现的位置，默认固定新对话和网络搜索；`ChatAction::SetToolbar` 由宿主转交会话。固定/取消固定及排序不创建对话、不修改搜索或生图请求控制；保存失败保留原偏好与顺序，旧记录缺字段使用默认值，未知工具忽略但不丢弃历史。
 - `ChatAction`（`lumakit_ai::chat`）：渲染器交给宿主执行的聊天动作；`ModelOption`：无密钥、可展示的模型来源。两个聊天面板共用。
 - `lumakit-ai::catalog::ModelCatalog`：已保存的多线路、多密钥目录，按完整模型身份解析连接；`lumakit-support::secrets` 提供系统加密凭据。
 
@@ -54,6 +54,7 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 ## 聊天面板
 
 - `lumakit-gpui::ChatPanel`：GPUI 聊天面板，样式只取自 `lumakit-design`；Markdown 先经 pulldown-cmark 清理，不加载图片。
+- GPUI 输入区“＋”菜单使用 256px 锚定浮层；“自定义工具栏”提供图标、拖动手柄、显示开关与恢复默认。手柄可拖放或用上下键调整已固定工具的顺序，关闭后重开、应用重启均保留。只列出实际实现的新对话、网络搜索、上传附件、生成图片，不改变请求开关或执行工具。未固定工具仍可从“＋”菜单执行；Esc 或点击外部关闭浮层。
 - `lumakit-egui::ChatPanel`：egui/eframe **0.37.0** 版，Markdown 用 egui_commonmark **0.26.0**；`install_icon_font` 在 `set_fonts` 前注册 Phosphor 图标字体。只服务 LumaDesk `main` 分支与 `examples/chat-host`。
 
 egui 与 GPUI 两条线在同一 `Cargo.lock` 解析版本，所以 `gpui-kit/test-support`（无头窗口测试）目前无法启用；删除 egui 线后再引入。

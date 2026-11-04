@@ -22,8 +22,11 @@ fn default_toolbar() -> Vec<ToolbarTool> {
 }
 
 fn canonical_toolbar(tools: &[ToolbarTool]) -> Vec<ToolbarTool> {
-    [ToolbarTool::NewConversation, ToolbarTool::WebSearch, ToolbarTool::Attachment, ToolbarTool::GenerateImage]
-        .into_iter().filter(|tool| tools.contains(tool)).collect()
+    let mut ordered = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if !ordered.contains(tool) { ordered.push(*tool); }
+    }
+    ordered
 }
 
 fn deserialize_toolbar<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<ToolbarTool>, D::Error> {

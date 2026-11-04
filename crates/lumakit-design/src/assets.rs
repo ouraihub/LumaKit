@@ -90,6 +90,7 @@ gpui_kit::assets::icon_assets!(
         Gauge,
         Image,
         MessageSquarePlus,
+        GripVertical,
         Paperclip
     ]
 );
