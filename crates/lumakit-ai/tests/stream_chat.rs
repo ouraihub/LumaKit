@@ -61,6 +61,18 @@ fn server(
     hold: bool,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> (String, thread::JoinHandle<()>) {
+    server_with_reasoning(protocol, status, body, hold, ready, "loopback-model", None)
+}
+
+fn server_with_reasoning(
+    protocol: Protocol,
+    status: u16,
+    body: String,
+    hold: bool,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+    expected_model: &'static str,
+    expected_effort: Option<&'static str>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let worker = thread::spawn(move || {
@@ -100,8 +112,26 @@ fn server(
             request.extend_from_slice(&chunk[..count]);
         }
         let payload: Value = serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
-        assert_eq!(payload["model"], "loopback-model");
+        assert_eq!(payload["model"], expected_model);
         let json_response = body.starts_with('{');
+        if let Some(effort) = expected_effort {
+            match protocol {
+                Protocol::OpenAiChat => assert_eq!(payload["reasoning_effort"], effort),
+                Protocol::OpenAiResponses => assert_eq!(payload["reasoning"]["effort"], effort),
+                Protocol::AnthropicMessages if effort == "none" => {
+                    assert_eq!(payload["thinking"]["type"], "disabled");
+                    assert!(payload.get("output_config").is_none());
+                }
+                Protocol::AnthropicMessages => {
+                    assert_eq!(payload["thinking"]["type"], "adaptive");
+                    assert_eq!(payload["output_config"]["effort"], effort);
+                }
+            }
+        } else if !json_response {
+            for field in ["reasoning", "reasoning_effort", "thinking", "output_config", "enable_thinking", "thinking_budget"] {
+                assert!(payload.get(field).is_none(), "unexpected {field}: {payload}");
+            }
+        }
         assert_eq!(payload["stream"], !json_response);
         if json_response {
             let limit = if protocol == Protocol::OpenAiResponses { "max_output_tokens" } else { "max_tokens" };
@@ -300,6 +330,7 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
             reasoning:Some(ReasoningConfig { dialect:if protocol == Protocol::AnthropicMessages { ReasoningDialect::AnthropicBudget } else { ReasoningDialect::OpenAi }, efforts:vec![ReasoningEffort::High],budget_tokens:if protocol == Protocol::AnthropicMessages { Some(2048) } else { None } }),
             pricing:Some(pricing.clone()),..Default::default()
         };
+        c = c.with_reasoning_effort(ReasoningEffort::High).unwrap();
         let mut deltas = Vec::new();
         let run = stream_chat_with_usage(c,history(),CancellationToken::new(),|text| deltas.push(text)).await.unwrap();
         worker.join().unwrap();
@@ -307,9 +338,48 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
         assert_eq!(deltas,["完成"]);
         assert_eq!(run.rounds.len(),1);
         let round = &run.rounds[0];
-        assert_eq!(round.usage,Some(TokenUsage {input_tokens:200,output_tokens:20,cache_read_tokens:50,cache_write_tokens:0}));
+        assert_eq!(round.usage,Some(TokenUsage {input_tokens:200,output_tokens:20,cache_read_tokens:50,cache_write_tokens:0,reasoning_tokens:None}));
         assert_eq!(round.pricing,Some(pricing));
         assert!((round.cost.unwrap()-0.000405).abs()<1e-12);
+        assert!(!round.request_id.is_empty());
+        assert!(round.started_at_ms.is_some());
+        assert!(round.duration_ms.is_some());
+        assert!(!round.legacy);
+        assert_eq!(round.cost_source, lumakit_ai::model_config::CostSource::Estimate);
         assert!(run.tool_calls.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn catalog_reasoning_is_explicit_in_real_http_requests() {
+    use lumakit_ai::model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort};
+    for (protocol, model) in [
+        (Protocol::OpenAiChat, "gpt-6.1-sol"),
+        (Protocol::OpenAiResponses, "gpt-6.1-sol"),
+        (Protocol::AnthropicMessages, "claude-opus-5-5"),
+    ] {
+        for (selected, disabled, expected) in [(None, false, None), (Some(ReasoningEffort::Max), false, Some("max")), (None, true, None)] {
+            let (url, worker) = server_with_reasoning(protocol, 200, delta(protocol, "完成") + &done(protocol), false, None, model, expected);
+            let mut c = connection(url, protocol);
+            c.model = model.into();
+            c.settings.reasoning_disabled = disabled;
+            assert!(c.settings.reasoning.is_none());
+            if let Some(effort) = selected { c = c.with_reasoning_effort(effort).unwrap(); }
+            assert_eq!(stream_chat(c, history(), CancellationToken::new(), |_| {}).await.unwrap(), "完成");
+            worker.join().unwrap();
+        }
+        let (url, worker) = server_with_reasoning(protocol, 200, delta(protocol, "完成") + &done(protocol), false, None, model, Some("none"));
+        let mut c = connection(url, protocol);
+        c.model = model.into();
+        assert!(c.clone().with_reasoning_effort(ReasoningEffort::None).is_err());
+        c.settings.reasoning = Some(ReasoningConfig {
+            dialect: if protocol == Protocol::AnthropicMessages { ReasoningDialect::AnthropicAdaptive } else { ReasoningDialect::OpenAi },
+            efforts: vec![ReasoningEffort::High, ReasoningEffort::None],
+            budget_tokens: None,
+        });
+        c.settings.reasoning_disabled = true; // Existing explicit metadata still takes precedence.
+        let c = c.with_reasoning_effort(ReasoningEffort::None).unwrap();
+        assert_eq!(stream_chat(c, history(), CancellationToken::new(), |_| {}).await.unwrap(), "完成");
+        worker.join().unwrap();
     }
 }

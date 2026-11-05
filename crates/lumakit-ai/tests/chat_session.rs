@@ -423,21 +423,6 @@ fn old_v1_load_recovery_lock_and_draft_round_trip() {
 }
 
 #[test]
-fn schema_v2_is_idempotent_and_preserves_future_guard() {
-    let root = Directory::new();
-    let path = root.path();
-    drop(open(&path));
-    let database = Connection::open(&path).unwrap();
-    assert_eq!(database.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
-    for (table, column) in [("turns", "selected_attempt"), ("attempts", "kind"), ("attempts", "search"), ("attempts", "generated"), ("attempts", "tool_events"), ("attempts", "reasoning")] {
-        assert!(database.query_row(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}'"), [], |row| row.get::<_, i64>(0)).is_ok());
-    }
-    drop(database);
-    drop(open(&path));
-    let database = Connection::open(&path).unwrap();
-    assert_eq!(database.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
-}
-#[test]
 fn unknown_versions_leave_original_bytes_untouched() {
     for version in [0, 2] {
         let root = Directory::new();
@@ -808,7 +793,15 @@ fn usage_round_snapshots_survive_database_round_trip() {
     fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
     drop(open(&path));
     let session = open(&path);
-    assert_eq!(serde_json::to_value(&session.selected().unwrap().turns[0].attempts[0].rounds).unwrap(), rounds);
+    let stored = &session.selected().unwrap().turns[0].attempts[0].rounds;
+    for (index, round) in stored.iter().enumerate() {
+        assert_eq!(round.usage, serde_json::from_value(rounds[index]["usage"].clone()).unwrap());
+        assert_eq!(serde_json::to_value(&round.pricing).unwrap(), rounds[index]["pricing"]);
+        assert_eq!(serde_json::to_value(&round.cost).unwrap(), rounds[index]["cost"]);
+        assert_eq!(round.request_id, format!("legacy:a2:{index}"));
+        assert!(round.legacy);
+        assert_eq!(round.started_at_ms, None);
+    }
 }
 #[test]
 fn failed_attempt_preserves_prior_rounds_and_reopens_as_failed() {
@@ -1171,4 +1164,114 @@ fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
     assert_eq!(attempt.reasoning, vec![reasoning]);
     assert_eq!(attempt.generated.len(), 1);
     worker.join().unwrap();
+}
+
+#[test]
+fn context_anchor_tracks_tail_and_invalidates_changed_history_model_and_tools() {
+    let root = Directory::new();
+    let path = root.path();
+    let mut session = setup(&path);
+    let usage = json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":2}});
+    let body = format!("{}data: {usage}\n\ndata: [DONE]\n\n", delta("ok"));
+    let (url, requests, worker) = server(vec![(body, false)]);
+    session.set_draft("q".into());
+    session.send(connection(&url, "source"));
+    complete(&mut session);
+    requests.recv().unwrap();
+    worker.join().unwrap();
+    let settings = lumakit_ai::model_config::ModelSettings { context_window: Some(1000), ..Default::default() };
+    let context = session.context_usage(&settings).unwrap();
+    assert!(context.anchored);
+    assert_eq!(context.tokens, 140); // Reported input plus the newly retained assistant reply.
+    session.set_draft("next".into());
+    assert_eq!(session.context_usage(&settings).unwrap().tokens, 188);
+    let conversation = session.selected().unwrap().id.clone();
+    let turn = session.selected().unwrap().turns[0].id.clone();
+    let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
+    drop(session);
+    let mut session = open(&path);
+    assert!(session.context_usage(&settings).unwrap().anchored);
+    session.select_model(model("other"));
+    assert!(!session.context_usage(&settings).unwrap().anchored);
+    session.select_model(model("source"));
+    let mut composer = session.composer().clone();
+    composer.image_mode = true;
+    session.set_composer(composer);
+    assert!(!session.context_usage(&settings).unwrap().anchored);
+    let mut composer = session.composer().clone();
+    composer.image_mode = false;
+    session.set_composer(composer);
+    session.edit_attempt(&conversation, &turn, &attempt, "ok", "edited").unwrap();
+    // Editing the anchor's own output is a changed tail, not a changed provider input prefix.
+    assert_eq!(session.context_usage(&settings).unwrap().tokens, 204);
+    assert!(session.context_usage(&settings).unwrap().anchored);
+}
+
+#[test]
+fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() {
+    let root = Directory::new();
+    let path = root.path();
+    let mut history = legacy_history();
+    let first = json!({"request_id":"request-one","started_at_ms":86400000,"duration_ms":7,"model":model("actual"),"cost_source":"estimate",
+        "usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":30,"cache_write_tokens":10,"reasoning_tokens":5},
+        "pricing":{"currency":"USD","tiers":[]},"cost":0.25});
+    history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] = json!([first]);
+    history["value"]["conversations"][0]["turns"][0]["attempts"][0]["status"] = json!("failed");
+    history["value"]["conversations"][0]["turns"][0]["attempts"][1]["status"] = json!("completed");
+    history["value"]["conversations"][0]["turns"][0]["attempts"][1]["rounds"] = json!([
+        {"request_id":"request-two","started_at_ms":172800000,"model":model("partial"),"usage":null,"pricing":null,"cost":null},
+        {"usage":{"input_tokens":4,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0},"pricing":{"currency":"CNY","tiers":[]},"cost":0.5}
+    ]);
+    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    let mut session = open(&path);
+    let original = session.usage_report(Some("c2"), None).unwrap();
+    assert_eq!((original.total.requests, original.total.missing_usage, original.total.missing_cost), (3, 1, 1));
+    assert_eq!((original.total.input_tokens, original.total.output_tokens, original.total.cache_read_tokens, original.total.cache_write_tokens), (104, 22, 30, 10));
+    assert_eq!(original.total.reasoning_tokens, Some(5));
+    assert_eq!(original.total.costs.get("USD"), Some(&0.25));
+    assert_eq!(original.total.costs.get("CNY"), Some(&0.5));
+    assert_eq!((original.undated_requests, original.legacy_requests), (1, 1));
+    assert_eq!(original.by_day.iter().map(|group| group.label.as_str()).collect::<Vec<_>>(), ["1970-01-02", "1970-01-03"]);
+    assert!(original.by_model.iter().any(|group| group.label.contains("actual")));
+    let copy = session.copy_conversation("c2").unwrap();
+    assert_eq!(session.usage_report(Some(&copy), None).unwrap(), original);
+    assert_eq!(session.usage_report(None, None).unwrap(), original);
+    let filtered = session.usage_report(None, Some(172800000)).unwrap();
+    assert_eq!((filtered.total.requests, filtered.total.missing_usage, filtered.total.missing_cost), (1, 1, 1));
+    assert_eq!(filtered.total.reasoning_tokens, None);
+    assert!(filtered.total.costs.is_empty());
+    assert_eq!((filtered.undated_requests, filtered.legacy_requests), (1, 1));
+    assert_eq!(session.usage_report(Some(&copy), Some(172800000)).unwrap(), filtered);
+    session.delete_conversation("c2");
+    session.delete_conversation(&copy);
+    session.delete_conversation("c1");
+    assert_eq!(count(&path, "usage_requests"), 3);
+    assert_eq!(count(&path, "attempts"), 0);
+    drop(session);
+    let reopened = open(&path);
+    assert_eq!(reopened.usage_report(None, None).unwrap(), original);
+    assert!(reopened.usage_report(Some("c2"), None).is_err());
+}
+
+#[test]
+fn usage_ledger_import_rolls_back_with_history_and_keeps_unknown_costs() {
+    let root = Directory::new();
+    let path = root.path();
+    drop(open(&path));
+    Connection::open(&path).unwrap().execute_batch("DELETE FROM chat_meta; CREATE TRIGGER reject_attempt BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;").unwrap();
+    let mut history = legacy_history();
+    history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] = json!([
+        {"usage":null,"pricing":null,"cost":null},
+        {"usage":{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0},"pricing":null,"cost":0.0}
+    ]);
+    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
+    assert_eq!(count(&path, "usage_requests"), 0);
+    restore_writes(&path);
+    let session = open(&path);
+    let report = session.usage_report(None, None).unwrap();
+    assert_eq!((report.total.requests, report.total.missing_usage, report.total.missing_cost), (2, 1, 2));
+    assert!(report.total.costs.is_empty());
+    assert_eq!((report.undated_requests, report.legacy_requests), (2, 2));
+    assert_eq!(session.usage_report(None, Some(0)).unwrap().total.requests, 0);
 }

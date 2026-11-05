@@ -16,6 +16,23 @@ pub struct ModelEntry {
     #[serde(default)]
     pub settings: crate::model_config::ModelSettings,
 }
+impl ModelEntry {
+    /// Runtime/display metadata; explicit settings win over legacy true flags and exact references.
+    /// Keep persisting `settings`, not this derived copy.
+    pub fn effective_settings(&self, protocol: Protocol) -> crate::model_config::ModelSettings {
+        let mut settings = crate::model_reference::effective_settings(&self.id, protocol, &self.settings);
+        settings.supports_streaming = self.capabilities.streaming;
+        if self.settings.vision_override.is_none() {
+            settings.supports_vision |= self.capabilities.vision;
+        }
+        if settings.model_type == crate::model_config::ModelType::Chat
+            && self.settings.supports_tools.is_none() && self.capabilities.tools
+        {
+            settings.supports_tools = Some(true);
+        }
+        settings
+    }
+}
 /// 已保存线路的地址、协议、模型和凭据选择。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EndpointEntry {
@@ -66,9 +83,7 @@ impl ModelCatalog {
         entry.settings.validate(endpoint.protocol)?;
         if entry.settings.model_type != crate::model_config::ModelType::Chat { return Err("所选模型不是聊天类型，请使用对应业务接口".into()); }
         let key = endpoint.selected_key.as_ref().and_then(|id| endpoint.keys.iter().find(|k| &k.id == id)).or_else(|| endpoint.keys.first());
-        let mut settings = entry.settings.clone();
-        settings.supports_streaming = entry.capabilities.streaming;
-        settings.supports_tools = settings.supports_tools.or(entry.capabilities.tools.then_some(true));
+        let settings = entry.effective_settings(endpoint.protocol);
         Ok(AiConnection { base_url: validate_url(&endpoint.base_url)?, protocol: endpoint.protocol, model: model.model.clone(), api_key: key.map(SavedKey::open).transpose()?, settings })
     }
     /// Resolves a saved model while requiring a specific non-chat consumer type.
@@ -79,7 +94,7 @@ impl ModelCatalog {
         entry.settings.validate(endpoint.protocol)?;
         if entry.settings.model_type != expected { return Err("所选模型类型与当前业务不匹配".into()); }
         let key = endpoint.selected_key.as_ref().and_then(|id| endpoint.keys.iter().find(|k| &k.id == id)).or_else(|| endpoint.keys.first());
-        let mut settings = entry.settings.clone(); settings.supports_streaming = entry.capabilities.streaming; settings.supports_tools = settings.supports_tools.or(entry.capabilities.tools.then_some(true));
+        let settings = entry.effective_settings(endpoint.protocol);
         Ok(AiConnection { base_url: validate_url(&endpoint.base_url)?, protocol: endpoint.protocol, model: model.model.clone(), api_key: key.map(SavedKey::open).transpose()?, settings })
     }
 }
@@ -107,11 +122,46 @@ mod model_settings_tests {
         let mut providers = vec![ProviderEntry { id:"p".into(),name:"p".into(),enabled:true,endpoints:vec![EndpointEntry { id:"e".into(),name:"e".into(),base_url:"https://example.com/v1".into(),protocol:Protocol::OpenAiChat,keys:Vec::new(),models:vec![entry],selected_key:None,selected_model:None }] }];
         assert_eq!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_tools,None);
         providers[0].endpoints[0].models[0].capabilities.tools = true;
+        providers[0].endpoints[0].models[0].capabilities.vision = true;
+        assert!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_vision);
         assert_eq!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_tools,Some(true));
         providers[0].endpoints[0].models[0].settings.supports_tools = Some(false);
         assert_eq!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_tools,Some(false));
+        providers[0].endpoints[0].models[0].settings.vision_override = Some(false);
+        assert!(!ModelCatalog::new(providers.clone()).resolve(&model).unwrap().settings.supports_vision);
         providers[0].endpoints[0].models[0].settings.supports_tools = None;
         providers[0].endpoints[0].models[0].settings.model_type = crate::model_config::ModelType::Embedding;
-        assert!(ModelCatalog::new(providers).resolve(&model).unwrap_err().contains("不是聊天类型"));
+        assert!(ModelCatalog::new(providers.clone()).resolve(&model).unwrap_err().contains("不是聊天类型"));
+        let non_chat = ModelCatalog::new(providers).resolve_for(&model, crate::model_config::ModelType::Embedding).unwrap();
+        assert!(non_chat.settings.supports_tools.is_none());
+    }
+
+    #[test]
+    fn resolution_inherits_reference_without_saving_overrides() {
+        let model = ModelRef { provider: "p".into(), endpoint: "e".into(), model: "gpt-5.4".into(), protocol: Protocol::OpenAiChat };
+        let entry = ModelEntry { id: model.model.clone(), capabilities: ModelCapabilities::default(), manual: true, settings: Default::default() };
+        let catalog = ModelCatalog::new(vec![ProviderEntry { id: "p".into(), name: "p".into(), enabled: true, endpoints: vec![EndpointEntry { id: "e".into(), name: "e".into(), base_url: "https://example.com/v1".into(), protocol: Protocol::OpenAiChat, keys: Vec::new(), models: vec![entry], selected_key: None, selected_model: None }] }]);
+        let settings = catalog.resolve(&model).unwrap().settings;
+        assert_eq!(settings.context_window, Some(1_000_000));
+        assert!(settings.supports_vision);
+        assert_eq!(settings.supports_tools, Some(true));
+        assert_eq!(settings.max_output, None);
+        assert!(settings.pricing_reference);
+        assert_eq!(catalog.providers()[0].endpoints[0].models[0].settings, crate::model_config::ModelSettings::default());
+        assert_eq!(catalog.resolve_for(&model, crate::model_config::ModelType::Chat).unwrap().settings, settings);
+    }
+
+    #[test]
+    fn exact_reference_and_legacy_capabilities_respect_explicit_false_at_runtime() {
+        let model = ModelRef { provider: "p".into(), endpoint: "e".into(), model: "gpt-6.1-sol".into(), protocol: Protocol::OpenAiResponses };
+        let entry = ModelEntry {
+            id: model.model.clone(), capabilities: ModelCapabilities { streaming: true, tools: true, vision: true }, manual: true,
+            settings: crate::model_config::ModelSettings { supports_tools: Some(false), vision_override: Some(false), ..Default::default() },
+        };
+        let catalog = ModelCatalog::new(vec![ProviderEntry { id: "p".into(), name: "p".into(), enabled: true, endpoints: vec![EndpointEntry { id: "e".into(), name: "e".into(), base_url: "https://example.com/v1".into(), protocol: model.protocol, keys: Vec::new(), models: vec![entry], selected_key: None, selected_model: None }] }]);
+        let connection = catalog.resolve(&model).unwrap();
+        assert!(!connection.settings.supports_vision);
+        assert_eq!(connection.settings.supports_tools, Some(false));
+        assert_eq!(connection.settings, catalog.providers()[0].endpoints[0].models[0].effective_settings(model.protocol));
     }
 }

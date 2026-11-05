@@ -14,6 +14,10 @@ pub mod catalog_store;
 /// 模型元数据、请求限制、推理方言与计费。
 pub mod model_config;
 pub use model_config::{RoundUsage, TokenUsage};
+/// 持久化请求用量账本与按范围统计。
+pub mod usage;
+/// 自动补全的模型目录参考元数据；显式设置优先。
+pub mod model_reference;
 /// 聊天历史记录与持久化存储。
 pub mod history;
 /// 内嵌图片的大小、数量和编码校验。
@@ -58,14 +62,15 @@ pub struct AiConnection {
     pub settings: model_config::ModelSettings,
 }
 impl AiConnection {
-    /// 为此连接的请求选择已声明的推理强度，不静默替换为其他值。
+    /// 为此连接的请求选择已声明的推理强度，不改变已保存的能力元数据。
     ///
     /// # Errors
     /// 未配置推理能力、所选强度不在允许列表或模型设置无效时返回错误说明。
     pub fn with_reasoning_effort(mut self, effort: model_config::ReasoningEffort) -> Result<Self, String> {
-        let config = self.settings.reasoning.as_mut().ok_or("模型未配置推理能力")?;
-        let index = config.efforts.iter().position(|e| *e == effort).ok_or("模型未声明该推理强度")?;
-        config.efforts.swap(0, index);
+        self.settings = model_reference::effective_settings(&self.model, self.protocol, &self.settings);
+        let config = self.settings.reasoning.as_ref().ok_or("模型未配置推理能力")?;
+        if !config.efforts.contains(&effort) { return Err("模型未声明该推理强度".into()); }
+        self.settings.reasoning_effort = Some(effort);
         self.settings.validate(self.protocol)?;
         Ok(self)
     }
@@ -83,7 +88,7 @@ impl std::fmt::Debug for AiConnection {
 }
 
 /// 指向服务商、线路及模型的已保存选择。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelRef {
     /// 服务商标识。
     pub provider: String,
@@ -114,7 +119,7 @@ pub enum ChatMessage {
 ///
 /// 返回完整回复和逐请求usage/价格快照；取消、上游错误、未完成的流或意外工具调用均返回错误。
 pub async fn stream_chat_with_usage<F>(
-    connection: AiConnection,
+    mut connection: AiConnection,
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
     mut on_text: F,
@@ -122,6 +127,7 @@ pub async fn stream_chat_with_usage<F>(
 where
     F: FnMut(String) + Send,
 {
+    connection.settings = model_reference::effective_settings(&connection.model, connection.protocol, &connection.settings);
     let messages = validated_messages(&connection, messages, &cancel)?;
     let result = round(&http_client()?, &connection, None, &messages, &[], &cancel, &mut on_text).await?;
     if !result.tool_calls.is_empty() { return Err(AiError::Provider("unexpected tool calls in text chat".into())); }
@@ -344,7 +350,8 @@ impl<H: AiHost> AiRuntime<H> {
     pub async fn run_with_history<F, E>(&self, request: RunRequest, messages: Vec<ChatMessage>, cancel: CancellationToken, mut on_text: F, mut on_event: E) -> Result<AiRun, AiError>
     where F: FnMut(String) + Send, E: FnMut(RunEvent) + Send {
         let model = self.host.select_model(&request)?;
-        let connection = self.host.connection(&model)?;
+        let mut connection = self.host.connection(&model)?;
+        connection.settings = model_reference::effective_settings(&connection.model, connection.protocol, &connection.settings);
         let mut messages = validated_messages(&connection, messages, &cancel)?;
         let system = self.host.system_prompt(&request)?;
         let tools = self.host.tools(&request);
@@ -354,7 +361,8 @@ impl<H: AiHost> AiRuntime<H> {
         let mut reasoning = Vec::new();
         let mut completed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for _ in 0..5 {
-            let round = round(&self.http, &connection, system.as_deref(), &messages, &tools, &cancel, &mut on_text).await?;
+            let mut round = round(&self.http, &connection, system.as_deref(), &messages, &tools, &cancel, &mut on_text).await?;
+            for usage in &mut round.rounds { usage.model = Some(model.clone()); }
             if round.text.len() > (1024 * 1024usize).saturating_sub(text.len()) { return Err(AiError::Provider("回答超过 1 MiB，已停止。".into())); }
             text.push_str(&round.text);
             on_event(RunEvent::Round { usage: round.rounds.clone(), reasoning: round.reasoning_blocks.clone() });
@@ -455,6 +463,7 @@ where
             builder = builder.header("x-api-key", key.as_str());
         }
     }
+    let (round_usage, started) = RoundUsage::start(None).map_err(AiError::Provider)?;
     let response = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err(AiError::Cancelled),
@@ -476,10 +485,10 @@ where
             let text = decoder.complete(connection.protocol, &value).map_err(|e| provider_error(e, connection.api_key.as_ref()))?;
             let usage = decoder.usage.clone();
             let pricing = connection.settings.pricing.clone();
-            let cost = pricing.as_ref().zip(usage.as_ref()).and_then(|(p,u)| p.cost(u));
+            let round_usage = round_usage.finish(usage, pricing, connection.settings.pricing_reference, started);
             let reasoning_blocks = std::mem::take(&mut decoder.reasoning_blocks);
             let tool_calls = decoder.finish().map_err(AiError::Provider)?;
-            Ok(AiRun { text, tool_calls, reasoning_blocks, rounds: vec![RoundUsage { usage, pricing, cost }] })
+            Ok(AiRun { text, tool_calls, reasoning_blocks, rounds: vec![round_usage] })
         };
         let result = tokio::select! {
             biased;
@@ -529,10 +538,10 @@ where
     }
     let usage = decoder.usage.clone();
     let pricing = connection.settings.pricing.clone();
-    let cost = pricing.as_ref().zip(usage.as_ref()).and_then(|(p,u)| p.cost(u));
+    let round_usage = round_usage.finish(usage, pricing, connection.settings.pricing_reference, started);
     let reasoning_blocks = std::mem::take(&mut decoder.reasoning_blocks);
     let tool_calls = decoder.finish().map_err(AiError::Provider)?;
-    Ok(AiRun { text, tool_calls, reasoning_blocks, rounds: vec![RoundUsage { usage, pricing, cost }] })
+    Ok(AiRun { text, tool_calls, reasoning_blocks, rounds: vec![round_usage] })
 }
 
 #[derive(Debug, Clone)]
@@ -561,6 +570,7 @@ fn check_context(connection: &AiConnection, system: Option<&str>, messages: &[Me
     }
     for tool in tools { estimate = estimate.saturating_add((tool.name.chars().count() + tool.description.chars().count() + tool.parameters.to_string().chars().count()) as u64 * 4 + 32); }
     if connection.settings.native_web_search { estimate = estimate.saturating_add(256); }
+    if connection.settings.max_input.is_some_and(|limit| estimate > u64::from(limit)) { return Err(AiError::Provider("输入预算不足：当前提示词的保守 token 估算超过最大输入上限；请缩短历史或调整输入上限".into())); }
     if estimate.saturating_add(u64::from(connection.settings.output_limit())) > capacity { return Err(AiError::Provider("上下文预算不足：按每个Unicode字符最多4 token及消息开销保守估算（非精确token计数），并预留完整输出上限；请缩短历史或增加窗口".into())); }
     Ok(())
 }
@@ -669,6 +679,14 @@ mod model_runtime_tests {
         let error = round(&http_client().unwrap(),&c,None,&[Message::User { text:"hello".into(), images:Vec::new() }],&tools,&CancellationToken::new(),&mut ignore).await.unwrap_err();
         assert!(error.to_string().contains("不支持工具"));
         c.settings.pricing = Some(model_config::ModelPricing { currency:"USD".into(), tiers:vec![model_config::PriceTier { min_input_tokens:0,input:f64::NAN,output:0.0,cache_read:None,cache_write:None }] });
+        assert!(c.settings.validate(c.protocol).is_err());
+        c.settings.pricing = None;
+        c.settings.supports_tools = None;
+        c.settings.context_window = Some(1000);
+        c.settings.max_input = Some(40);
+        assert!(check_context(&c,None,&[Message::User { text:"你好".into(), images:Vec::new() }],&[]).is_ok());
+        assert!(check_context(&c,None,&[Message::User { text:"你好🙂".into(), images:Vec::new() }],&[]).is_err());
+        c.settings.max_input = Some(1001);
         assert!(c.settings.validate(c.protocol).is_err());
     }
 }

@@ -13,6 +13,10 @@ pub struct ModelOption {
     pub provider: String,
     /// 端点显示名称。
     pub endpoint: String,
+    /// 已保存的模型能力、分组和推理配置；不含凭据。
+    pub settings: crate::model_config::ModelSettings,
+    /// 仅在已存储凭据存在时为 true，不代表订阅或认证声明。
+    pub has_key: bool,
 }
 
 /// 绘制后交给宿主执行；渲染器不直接修改会话。
@@ -28,6 +32,14 @@ pub enum ChatAction {
     Delete(String),
     /// 选择后续请求使用的模型。
     SelectModel(ModelRef),
+    /// 原子选择模型与推理强度；None 不发送推理参数，使用服务商默认行为。
+    SelectModelPair { model: ModelRef, effort: Option<crate::model_config::ReasoningEffort> },
+    /// 按完整模型身份切换收藏。
+    ToggleFavorite(ModelRef),
+    /// 保存仅供新对话使用的默认模型与推理强度。
+    SetDefaultModelPair { model: ModelRef, effort: Option<crate::model_config::ReasoningEffort> },
+    /// false 重读本地目录，true 由宿主从端点刷新目录。
+    RefreshModels { force: bool },
     /// 将当前草稿替换为给定文本。
     Draft(String),
     /// 保存输入区的搜索、推理和图片模式设置。

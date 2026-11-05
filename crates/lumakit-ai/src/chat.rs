@@ -18,6 +18,11 @@ mod composer;
 mod generation;
 #[path = "chat_action.rs"]
 mod action;
+#[path = "chat_model_picker.rs"]
+mod model_picker;
+#[path = "chat_usage.rs"]
+mod usage;
+pub use model_picker::{ModelPair, ModelPickerPreferences};
 pub use action::{ChatAction, ModelOption};
 pub use composer::{Attachment, ComposerSettings, ToolbarTool};
 const MAX_TEXT: usize = 1024 * 1024;
@@ -202,6 +207,7 @@ struct Job {
     rx: mpsc::Receiver<Event>,
     thread: JoinHandle<()>,
     draft: Option<String>,
+    context: Option<crate::model_config::ContextAnchor>,
 }
 
 /// 历史的唯一可变持有者；宿主只通过动作修改，不向渲染器暴露连接和密钥。
@@ -228,7 +234,7 @@ impl ChatSession {
             .map_err(|error| format!("无法读取或迁移聊天记录：{error}；请检查权限或恢复备份，旧文件未修改。"))?;
         let composer_data = store::load_composer(&connection).map_err(|error| format!("无法读取输入附件和控制：{error}"))?;
         let mut session = Self {
-            connection, _lock: lock, history, composer_data, default_composer: ComposerSettings::default(), media_root: path.with_file_name("chat-media"), job: None,
+            default_composer: composer_data.default_composer.clone(), connection, _lock: lock, history, composer_data, media_root: path.with_file_name("chat-media"), job: None,
             save_error: false, notice: String::new(), wake,
         };
         for conversation in &mut session.history.conversations {
@@ -267,6 +273,7 @@ impl ChatSession {
     }
     fn mutable(&self) -> bool { !self.busy() && !self.save_error }
     fn save(&mut self) -> bool {
+        self.composer_data.default_composer = self.default_composer.clone();
         self.save_error = store::save_composer(&mut self.connection, &self.history, &self.composer_data).is_err();
         if self.save_error {
             self.notice = "聊天记录保存失败。内存中的问题、部分回答和草稿仍保留；请检查目录权限或磁盘空间后重试保存。保存成功前禁止更改和发送。".into();
@@ -283,25 +290,49 @@ impl ChatSession {
     pub fn report(&mut self, message: String) {
         if self.mutable() { self.notice = message; }
     }
-    /// 空闲且无保存错误时新建并选中对话，然后保存历史。
+    /// 显式新建对话；已保存默认模型对存在时优先应用，不沿用待用模型选择。
+    /// 保存失败时撤销新对话和模型、输入控制的全部修改。
     pub fn new_conversation(&mut self) {
+        self.create_conversation(true);
+    }
+
+    /// 首次输入隐式建立对话，保留待用模型与推理控制；未选模型时应用默认模型对。
+    fn ensure_conversation(&mut self) {
+        if self.selected().is_none() { self.create_conversation(self.history.model.is_none()); }
+    }
+
+    fn create_conversation(&mut self, use_default_pair: bool) {
         if !self.mutable() { return; }
         let id = match new_id() {
             Ok(id) => id,
             Err(_) => { self.notice = "无法生成对话标识，请重试。".into(); return; }
         };
-        self.history.selected = Some(id.clone());
-        self.history.conversations.push(Conversation {
-            id, title: "新对话".into(), draft: String::new(), turns: Vec::new(),
+        let _ = self.update_model_picker(|session| {
+            session.remember_conversation_model();
+            let mut settings = session.default_composer.clone();
+            if let Some(pair) = session.composer_data.model_picker.default_pair.as_ref().filter(|_| use_default_pair) {
+                session.history.model = Some(pair.model.clone());
+                settings.reasoning = pair.effort;
+            }
+            session.history.selected = Some(id.clone());
+            session.composer_data.drafts.insert(id.clone(), composer::InputSnapshot { settings, attachments: Vec::new() });
+            session.history.conversations.push(Conversation {
+                id, title: "新对话".into(), draft: String::new(), turns: Vec::new(),
+            });
+            session.remember_conversation_model();
         });
-        self.save();
     }
     /// 空闲且无保存错误时切换到存在的对话，并保存选择。
     pub fn select_conversation(&mut self, id: &str) {
         if !self.mutable() || !self.history.conversations.iter().any(|c| c.id == id)
             || self.history.selected.as_deref() == Some(id) { return; }
-        self.history.selected = Some(id.into());
-        self.save();
+        let _ = self.update_model_picker(|session| {
+            session.remember_conversation_model();
+            session.history.selected = Some(id.into());
+            if let Some(model) = session.composer_data.conversation_models.get(id) {
+                session.history.model = Some(model.clone());
+            }
+        });
     }
     /// 空闲且无保存错误时删除指定对话并保存；删除当前项后选择最后一项。
     pub fn delete_conversation(&mut self, id: &str) {
@@ -310,10 +341,14 @@ impl ChatSession {
         let before_history = self.history.clone();
         let before_composer = self.composer_data.clone();
         self.composer_data.drafts.remove(id);
+        self.composer_data.conversation_models.remove(id);
         for turn in &self.history.conversations[index].turns { self.composer_data.turns.remove(&turn.id); }
         self.history.conversations.remove(index);
         if self.history.selected.as_deref() == Some(id) {
             self.history.selected = self.history.conversations.last().map(|c| c.id.clone());
+            if let Some(model) = self.history.selected.as_ref().and_then(|id| self.composer_data.conversation_models.get(id)) {
+                self.history.model = Some(model.clone());
+            }
         }
         if !self.save() { self.history = before_history; self.composer_data = before_composer; }
     }
@@ -380,6 +415,11 @@ impl ChatSession {
         let id = conversation.id.clone();
         self.composer_data.turns.extend(snapshots);
         if let Some(draft) = self.composer_data.drafts.get(conversation_id).cloned() { self.composer_data.drafts.insert(id.clone(), composer::InputSnapshot { attachments: Vec::new(), ..draft }); }
+        self.remember_conversation_model();
+        if let Some(model) = self.composer_data.conversation_models.get(conversation_id).cloned() {
+            self.history.model = Some(model.clone());
+            self.composer_data.conversation_models.insert(id.clone(), model);
+        }
         self.history.selected = Some(id.clone());
         self.history.conversations.push(conversation);
         if self.save() { Ok(id) } else { self.history = before_history; self.composer_data = before_composer; Err(self.notice.clone()) }
@@ -401,6 +441,11 @@ impl ChatSession {
         }
         let id = copy.id.clone();
         if let Some(draft) = self.composer_data.drafts.get(conversation_id).cloned() { self.composer_data.drafts.insert(id.clone(), draft); }
+        self.remember_conversation_model();
+        if let Some(model) = self.composer_data.conversation_models.get(conversation_id).cloned() {
+            self.history.model = Some(model.clone());
+            self.composer_data.conversation_models.insert(id.clone(), model);
+        }
         self.history.selected = Some(id.clone());
         self.history.conversations.push(copy);
         if self.save() { Ok(id) } else { self.history = before_history; self.composer_data = before_composer; Err(self.notice.clone()) }
@@ -422,14 +467,13 @@ impl ChatSession {
         if !self.save() { self.history.conversations[ci].turns[ti].attempts.pop(); return Err(self.notice.clone()); }
         let cancel = CancellationToken::new(); let worker_cancel = cancel.clone(); let wake = self.wake.clone(); let (tx, rx) = mpsc::sync_channel(64);
         let worker = thread::Builder::new().name("lumakit-translate".into()).spawn(move || { let result = run_worker(connection, messages, worker_cancel, &tx, &wake); let _ = tx.send(Event::End(result)); wake(); }).map_err(|_| "无法启动翻译线程。".to_owned())?;
-        self.job = Some(Job { conversation: ci, turn: ti, attempt: ai, identity: EventIdentity { conversation_id: conversation_id.into(), turn_id: turn_id.into(), attempt_id: self.history.conversations[ci].turns[ti].attempts[ai].id.clone() }, terminal: false, cancel, rx, thread: worker, draft: None });
+        self.job = Some(Job { conversation: ci, turn: ti, attempt: ai, identity: EventIdentity { conversation_id: conversation_id.into(), turn_id: turn_id.into(), attempt_id: self.history.conversations[ci].turns[ti].attempts[ai].id.clone() }, terminal: false, cancel, rx, thread: worker, draft: None, context: None });
         Ok(())
     }
-    /// 空闲且无保存错误时更新并保存模型选择。
+    /// 只选择模型，不指定请求推理强度；与最近记录一并原子保存。
+    /// 需要显式强度和能力校验的调用方应使用 `select_model_pair`。
     pub fn select_model(&mut self, model: ModelRef) {
-        if !self.mutable() { return; }
-        self.history.model = Some(model);
-        self.save();
+        let _ = self.update_model_picker(|session| session.apply_model_pair(model, None));
     }
     /// 标记指定回答开始联网搜索。
     pub fn search_start(&mut self, conversation_id: &str, turn_id: &str, attempt_id: &str, query: &str, provider: &str) -> Result<(), String> {
@@ -501,8 +545,10 @@ impl ChatSession {
         update(event);
         if self.save() { Ok(()) } else { self.history = before; Err(self.notice.clone()) }
     }
-    /// 空闲且无保存错误时更新当前对话草稿并保存。
+    /// 空闲且无保存错误时保存草稿；首次输入建立对话并保留待用模型与推理控制。
     pub fn set_draft(&mut self, text: String) {
+        if !self.mutable() { return; }
+        self.ensure_conversation();
         if !self.mutable() { return; }
         if let Some(index) = self.selected_index() {
             self.history.conversations[index].draft = text;
@@ -552,6 +598,10 @@ impl ChatSession {
 
     fn start(&mut self, connection: AiConnection, painting: Option<AiConnection>, retry: bool, override_model: bool) {
         if !self.mutable() { return; }
+        if !retry {
+            self.ensure_conversation();
+            if !self.mutable() { return; }
+        }
         let prepared = (|| {
             let model = self.request_model(retry && !override_model)?;
             if connection.model != model.model || connection.protocol != model.protocol {
@@ -576,9 +626,11 @@ impl ChatSession {
                 snapshot.settings.image_model = Some(painting_model);
             } else if painting.is_some() { return Err("本问题未启用绘图工具，请使用普通聊天入口。".into()); }
             let mut connection = connection;
+            connection.settings = crate::model_reference::effective_settings(&connection.model, connection.protocol, &connection.settings);
             if connection.settings.model_type != crate::model_config::ModelType::Chat { return Err("所选模型不是聊天模型。".into()); }
             if snapshot.settings.web_search && connection.protocol == crate::Protocol::OpenAiChat { return Err("Chat Completions 不支持原生联网搜索，请选择 Responses 或 Anthropic 线路。".into()); }
             connection.settings.native_web_search = snapshot.settings.web_search;
+            connection.settings.reasoning_effort = None;
             if let Some(effort) = snapshot.settings.reasoning { connection = connection.with_reasoning_effort(effort)?; }
             connection.settings.validate(connection.protocol)?;
             let messages = composer::context(&conversation.turns[..ti], &input, &snapshot.attachments, &self.composer_data, connection.settings.supports_vision, &self.media_root)?;
@@ -599,6 +651,7 @@ impl ChatSession {
         };
         let previous_composer = self.composer_data.clone();
         let image_mode = snapshot.settings.image_mode;
+        let painting_model = snapshot.settings.image_model.clone();
         let conversation = &mut self.history.conversations[ci];
         let previous_title = if !retry && conversation.turns.is_empty() {
             Some(std::mem::replace(&mut conversation.title,
@@ -634,11 +687,12 @@ impl ChatSession {
         };
         let (tx, rx) = mpsc::sync_channel(64);
         let media_root = self.media_root.clone();
+        let context = (!image_mode).then(|| usage::context_anchor(&messages, &self.history.conversations[ci].turns[ti].attempts[ai].model, connection.settings.native_web_search));
         let span = tracing::info_span!("ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, model = %connection.model, protocol = ?connection.protocol, image_mode);
         let worker = thread::Builder::new().name("lumakit-chat".into()).spawn(move || {
             // worker 独占同步运行时；span 仅在线程入口进入，不跨异步任务持有 guard。
             let _entered = span.enter();
-            let result = run_session_worker(connection, painting, messages, worker_cancel, &tx, &wake, media_root);
+            let result = run_session_worker(connection, painting, painting_model, messages, worker_cancel, &tx, &wake, media_root);
             match &result {
                 Ok(_) => tracing::info!(event = "ai.request.completed", "AI request completed"),
                 Err((TurnStatus::Cancelled, _)) => tracing::info!(event = "ai.request.cancelled", "AI request cancelled"),
@@ -648,7 +702,7 @@ impl ChatSession {
             wake();
         });
         match worker {
-            Ok(thread) => self.job = Some(Job { conversation: ci, turn: ti, attempt: ai, identity, terminal: false, cancel, rx, thread, draft }),
+            Ok(thread) => self.job = Some(Job { conversation: ci, turn: ti, attempt: ai, identity, terminal: false, cancel, rx, thread, draft, context }),
             Err(_) => {
                 let attempt = &mut self.history.conversations[ci].turns[ti].attempts[ai];
                 attempt.status = TurnStatus::Failed;
@@ -696,6 +750,7 @@ impl ChatSession {
             let terminal = self.job.as_ref().is_some_and(|job| job.terminal);
             if terminal { continue; }
             let persist = !matches!(&event, Event::Delta(_) | Event::End(_));
+            let context = self.job.as_ref().and_then(|job| job.context.clone());
             if let Some(attempt) = self.active_attempt() {
                 match event {
                     Event::Delta(text) => { if text.len() <= MAX_TEXT.saturating_sub(attempt.text.len()) { attempt.text.push_str(&text); } }
@@ -704,12 +759,18 @@ impl ChatSession {
                         if let Some(previous) = attempt.tool_events.iter_mut().find(|previous| previous.id == event.id) { *previous = event; }
                         else { attempt.tool_events.push(event); }
                     }
-                    Event::Runtime(crate::RunEvent::Round { usage, reasoning }) => { attempt.rounds.extend(usage); attempt.reasoning.extend(reasoning); }
+                    Event::Runtime(crate::RunEvent::Round { mut usage, reasoning }) => {
+                        for round in &mut usage { round.model = Some(attempt.model.clone()); }
+                        attempt.rounds.extend(usage); attempt.reasoning.extend(reasoning);
+                    }
                     Event::End(result) => {
                         let attempt_id = self.job.as_ref().map(|job| job.attempt).and_then(|attempt| self.history.conversations.get(self.job.as_ref()?.conversation)?.turns.get(self.job.as_ref()?.turn)?.attempts.get(attempt)).map(|attempt| attempt.id.clone());
                         if let Some(attempt) = self.active_attempt() {
                             match result {
-                                Ok(result) => { attempt.text = result.text; attempt.status = TurnStatus::Completed; attempt.error = None; }
+                                Ok(result) => {
+                                    if attempt.rounds.len() == 1 && attempt.tool_events.is_empty() { attempt.rounds[0].context = context; }
+                                    attempt.text = result.text; attempt.status = TurnStatus::Completed; attempt.error = None;
+                                }
                                 Err((status, error)) => { attempt.status = status; attempt.error = Some(error); }
                             }
                         }
@@ -769,12 +830,13 @@ fn run_worker(
     tx: &mpsc::SyncSender<Event>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) -> Result<crate::AiRun, (TurnStatus, String)> {
-    run_session_worker(connection, None, messages, cancel, tx, wake, PathBuf::new())
+    run_session_worker(connection, None, None, messages, cancel, tx, wake, PathBuf::new())
 }
 
 fn run_session_worker(
     connection: AiConnection,
     painting: Option<AiConnection>,
+    painting_model: Option<ModelRef>,
     messages: Vec<ChatMessage>,
     cancel: CancellationToken,
     tx: &mpsc::SyncSender<Event>,
@@ -787,7 +849,7 @@ fn run_session_worker(
     let mut overflow = false;
     let host = generation::PaintingHost {
         model: ModelRef { provider: "snapshot".into(), endpoint: "snapshot".into(), model: connection.model.clone(), protocol: connection.protocol },
-        chat: connection, painting, root: media_root, tx: tx.clone(), wake: wake.clone(), executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        chat: connection, painting, painting_model, root: media_root, tx: tx.clone(), wake: wake.clone(), executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     let engine = crate::AiRuntime::new(Arc::new(host)).map_err(|error| (TurnStatus::Failed, error.to_string()))?;
     let result = runtime.block_on(engine.run_with_history(crate::RunRequest { input: String::new(), model: None, purpose: "chat".into() }, messages, cancel.clone(), |text| {

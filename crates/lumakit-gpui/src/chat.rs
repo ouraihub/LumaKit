@@ -8,12 +8,15 @@ use gpui_kit::component::{Disableable, Selectable, Sizable, FocusTrapElement,
 use lumakit_ai::{ModelRef, chat::{Attempt, ChatSession, ComposerSettings, SearchStatus, ToolbarTool},
     history::TurnStatus, model_config::{ModelSettings, ReasoningEffort}};
 use lumakit_ai::chat::{ChatAction, ModelOption};
-use lumakit_design::{LumaTheme, components::TextStyled as _, metrics::{radius, size, space, text}};
+use lumakit_design::{LumaTheme, components::{label, TextStyled as _}, metrics::{radius, size, space, text}};
 use crate::{markdown::{MarkdownCache, web_link}, media::MediaPreview};
 
 mod overlays;
 mod toolbar;
-use overlays::usage_details;
+mod model_picker;
+mod usage;
+use usage::{context_summary, usage_details};
+pub use usage::usage_totals;
 
 /// Composer height when collapsed, and the bounds of the expanded height.
 const COMPOSER_HEIGHT: f32 = 72.;
@@ -34,15 +37,13 @@ const LAYER_MIN_HEIGHT: f32 = 80.;
 /// Distance between a menu and its trigger, and the margin a menu keeps from the window edge.
 const MENU_GAP: Pixels = px(4.);
 const MENU_MARGIN: f32 = 8.;
-/// Model button width in the toolbar.
-const MODEL_BUTTON_MAX: Pixels = px(160.);
 /// Answer editor height.
 const EDITOR_HEIGHT: Pixels = px(220.);
 /// Pixel distance of one wheel line when converting line-based scroll deltas.
 const SCROLL_LINE: Pixels = px(20.);
 
 #[derive(Clone)]
-enum Overlay { History, Tools, Quick, Models(bool), Reasoning, Usage, More(String, String, String), RetryModels, Edit }
+enum Overlay { History, Tools, Quick, ImageModels, ModelPicker, Usage, More(String, String, String), RetryModels, Edit }
 struct Edit { conversation: String, turn: String, attempt: String, expected: SharedString }
 /// Last laid-out bounds of each menu trigger, written during prepaint so a menu opens beside its button.
 type Anchors = Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>;
@@ -53,10 +54,12 @@ pub struct ChatPanel {
     _subscriptions: Vec<Subscription>,
     conversation: Option<String>, draft: SharedString, external_busy: bool,
     unlocked: bool, valid_model: bool, expanded: bool, overlay: Option<Overlay>,
+    image_notice: &'static str,
     delete: Option<String>, edit: Option<Edit>, details: HashSet<String>,
     focus: FocusHandle, scroll: ScrollHandle, follow: bool,
     markdown: MarkdownCache, media: MediaPreview,
     anchors: Anchors, anchor: Option<SharedString>,
+    picker: model_picker::PickerState,
 }
 impl EventEmitter<ChatAction> for ChatPanel {}
 impl ChatPanel {
@@ -70,26 +73,29 @@ impl ChatPanel {
                     let value = state.read(cx).value();
                     if value != this.draft && this.unlocked && !this.external_busy {
                         this.draft = value.clone();
-                        if this.conversation.is_none() { cx.emit(ChatAction::New); }
                         cx.emit(ChatAction::Draft(value.to_string()));
                         cx.notify();
                     }
                 }
             }),
-            cx.subscribe(&search, |_, _, event, cx| { if matches!(event, InputEvent::Change) { cx.notify(); } }),
+            cx.subscribe(&search, |this, _, event, cx| { if matches!(event, InputEvent::Change) { this.picker.highlighted = 0; this.picker.search_folded.clear(); cx.notify(); } }),
         ];
         Self { input, search, editor, _subscriptions: subscriptions,
             conversation: None, draft: "".into(), external_busy: false, unlocked: true, valid_model: false,
             expanded: false, overlay: None, delete: None, edit: None, details: HashSet::new(),
             focus: cx.focus_handle(), scroll: ScrollHandle::new(), follow: true,
-            markdown: MarkdownCache::default(), media: MediaPreview::default(), anchors: Anchors::default(), anchor: None }
+            markdown: MarkdownCache::default(), media: MediaPreview::default(), anchors: Anchors::default(), anchor: None, image_notice: "请先选择生图模型", picker: model_picker::PickerState::default() }
     }
     /// Disable writes while the host owns an asynchronous file picker.
     pub fn set_external_busy(&mut self, busy: bool) { self.external_busy = busy; }
     /// `trigger` names the button that opened the layer; a layer opened from inside a menu keeps that menu's anchor.
     fn open(&mut self, overlay: Overlay, trigger: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         if self.anchors.borrow().contains_key(&trigger) { self.anchor = Some(trigger); }
-        if matches!(overlay, Overlay::History | Overlay::Models(_) | Overlay::RetryModels) {
+        if matches!(overlay, Overlay::ModelPicker) {
+            self.picker.initialized = false; self.picker.expanded.clear(); self.picker.search_folded.clear(); self.picker.show_all = false; self.picker.highlighted = 0;
+            cx.emit(ChatAction::RefreshModels { force: false });
+        }
+        if matches!(overlay, Overlay::History | Overlay::ImageModels | Overlay::RetryModels | Overlay::ModelPicker) {
             self.search.update(cx, |state, cx| { state.set_value("", window, cx); state.focus(window, cx); });
         } else { self.focus.focus(window, cx); }
         self.overlay = Some(overlay); cx.notify();
@@ -143,6 +149,7 @@ impl ChatPanel {
     fn disclosure(&self, key: String, label: impl Into<SharedString>, cx: &Context<Self>) -> Div {
         let open = self.details.contains(&key);
         row().child(Button::new(SharedString::from(key.clone())).small().ghost().label(label)
+            .toggled(open)
             .icon(if open { IconName::ChevronDown } else { IconName::ChevronRight })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.details.remove(&key) { this.details.insert(key.clone()); } cx.notify();
@@ -169,6 +176,9 @@ impl ChatPanel {
         let tools_supported = model_settings.is_none_or(|s| s.supports_tools != Some(false));
         let composer = session.composer();
         let valid_image = composer.image_model.as_ref().is_some_and(|m| image_options.iter().any(|o| same_model(m, &o.model)));
+        self.image_notice = if !valid_chat { "请先选择有效聊天模型；点击配置生图模型" }
+            else if !tools_supported { "当前聊天模型不支持工具调用；请更换聊天模型" }
+            else if !valid_image { "请先选择生图模型；点击打开选择器" } else { "生成图片" };
         self.valid_model = valid_chat && (!composer.image_mode || (valid_image && tools_supported));
         let model_error = if options.is_empty() { "尚未配置聊天模型，请打开模型设置。" }
             else if !valid_chat { "请选择有效聊天模型。" }
@@ -244,18 +254,15 @@ impl ChatPanel {
             .disabled(!self.unlocked).appearance(false).h(px(height)));
         let mut toolbar = row().gap(space::S4);
         for &tool in session.toolbar() {
-            toolbar = toolbar.child(self.tool_button(tool, composer, valid_chat && tools_supported && valid_image, cx));
+            toolbar = toolbar.child(self.tracked(format!("tool-{tool:?}"), self.tool_button(tool, composer, valid_chat && tools_supported && valid_image, cx)));
         }
         toolbar = toolbar.child(self.tracked("tools", self.icon_layer("tools", IconName::Plus, "添加附件与输入工具", self.unlocked, Overlay::Tools, cx)));
-        if composer.image_mode {
+        if composer.image_mode && !session.toolbar().contains(&ToolbarTool::GenerateImage) {
             let mut next = composer.clone(); next.image_mode = false;
             toolbar = toolbar.child(self.action("remove-image-mode", "生成图片", self.unlocked, ChatAction::SetComposer(next), cx)
                 .icon(IconName::X).accessibility_label("关闭生成图片"));
         }
-        let model_label = picked.and_then(|m| options.iter().find(|o| same_model(m, &o.model))).map_or("选择模型", |o| o.name.as_str());
-        toolbar = toolbar.child(self.tracked("model", self.layer_button("model", model_label.to_owned(), self.unlocked, Overlay::Models(false), cx)
-            .max_w(MODEL_BUTTON_MAX).tooltip("选择聊天模型")))
-            .child(self.tracked("reasoning", self.layer_button("reasoning", reasoning_label(composer.reasoning), self.unlocked, Overlay::Reasoning, cx).tooltip("推理强度")))
+        toolbar = toolbar.child(self.tracked("model", self.model_pill(session, options, cx)))
             .child(self.tracked("usage", self.layer_button("usage", "用量", true, Overlay::Usage, cx)));
         if !self.follow { toolbar = toolbar.child(icon_button("bottom", IconName::ArrowDown, "回到底部")
             .on_click(cx.listener(|this, _, _, cx| { this.follow = true; this.scroll.scroll_to_bottom(); cx.notify(); }))); }
@@ -290,13 +297,18 @@ impl ChatPanel {
             ToolbarTool::WebSearch => { let mut next = composer.clone(); next.web_search = !next.web_search;
                 ("联网", ChatAction::SetComposer(next), self.unlocked, composer.web_search) },
             ToolbarTool::GenerateImage => { let mut next = composer.clone(); next.image_mode = !next.image_mode;
-                ("生图", ChatAction::SetComposer(next), self.unlocked && (composer.image_mode || can_image), composer.image_mode) },
+                ("生图", ChatAction::SetComposer(next), self.unlocked, composer.image_mode) },
         };
         let icon = match tool { ToolbarTool::NewConversation => IconName::MessageSquarePlus,
             ToolbarTool::Attachment => IconName::Paperclip, ToolbarTool::WebSearch => IconName::Globe,
             ToolbarTool::GenerateImage => IconName::Image };
         icon_button(label, icon, label).disabled(!enabled).selected(selected)
-            .on_click(cx.listener(move |this, _, window, cx| { this.emit(action.clone(), cx); this.close(window, cx); }))
+            .when(tool == ToolbarTool::GenerateImage, |button| button.tooltip(if composer.image_mode { "关闭生成图片" } else { self.image_notice }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if tool == ToolbarTool::GenerateImage && !selected && !can_image {
+                    this.open(Overlay::ImageModels, "tool-GenerateImage".into(), window, cx);
+                } else { this.emit(action.clone(), cx); this.close(window, cx); }
+            }))
     }
 
     fn answer(&mut self, session: &ChatSession, conversation: &str, turn: &str, attempt: &Attempt,
@@ -354,10 +366,10 @@ impl ChatPanel {
             images = images.child(match self.media.get(session, image) {
                 Ok(preview) => {
                     let id = image.id.clone();
-                    div().id(SharedString::from(format!("image:{}", id))).w(IMAGE_W).max_w_full().h(IMAGE_H)
-                        .cursor_pointer().aria_label("生成图片，点击打开")
+                    Button::new(SharedString::from(format!("image:{}", id))).ghost().p_0().w(IMAGE_W).max_w_full().h(IMAGE_H).flex_none().overflow_hidden()
+                        .accessibility_label("生成图片，点击打开").tooltip("打开生成图片")
                         .on_click(cx.listener(move |this, _, _, cx| this.emit(ChatAction::OpenMedia(id.clone()), cx)))
-                        .child(img(preview).size_full().object_fit(ObjectFit::Contain)).into_any_element()
+                        .child(img(preview).w(IMAGE_W).max_w_full().h(IMAGE_H).object_fit(ObjectFit::Contain)).into_any_element()
                 }
                 Err(error) => div().text_style(text::METADATA).text_color(r.feedback_error).child(error).into_any_element(),
             });
@@ -405,8 +417,8 @@ fn same_model(a: &ModelRef, b: &ModelRef) -> bool { a.provider == b.provider && 
 fn model_label(option: &ModelOption) -> String { format!("{} · {} / {}", option.name, option.provider, option.endpoint) }
 fn reasoning_label(effort: Option<ReasoningEffort>) -> &'static str {
     match effort { None => "默认", Some(ReasoningEffort::None) => "关闭", Some(ReasoningEffort::Auto) => "自动",
-        Some(ReasoningEffort::Minimal) => "最小", Some(ReasoningEffort::Low) => "低", Some(ReasoningEffort::Medium) => "中",
-        Some(ReasoningEffort::High) => "高", Some(ReasoningEffort::Xhigh) => "超高", Some(ReasoningEffort::Max) => "最大" }
+        Some(ReasoningEffort::Minimal) => "最低", Some(ReasoningEffort::Low) => "低", Some(ReasoningEffort::Medium) => "中",
+        Some(ReasoningEffort::High) => "高", Some(ReasoningEffort::Xhigh) => "极高", Some(ReasoningEffort::Max) => "最高" }
 }
 
 /// Call on the host's file-picker worker, never during render.

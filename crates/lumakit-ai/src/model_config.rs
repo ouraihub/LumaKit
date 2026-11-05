@@ -76,12 +76,12 @@ pub enum ReasoningEffort {
     /// 最大深度。
     Max,
 }
-/// 按偏好排列的可用强度；第一项为默认请求强度。
+/// 模型支持的推理方言、强度与预算；不定义请求默认强度。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ReasoningConfig {
     /// 实际协议编码方言。
     pub dialect: ReasoningDialect,
-    /// 可用强度；未在连接中显式选择时使用第一项。
+    /// 可用强度；顺序不代表请求默认值，未显式选择时交由服务商决定。
     pub efforts: Vec<ReasoningEffort>,
     /// 推理预算上限，发送时按强度缩放。
     pub budget_tokens: Option<u32>,
@@ -120,27 +120,50 @@ pub struct ModelSettings {
     pub model_type: ModelType,
     /// 上下文 token 容量；运行时使用保守估算，而非精确分词。
     pub context_window: Option<u32>,
+    /// 独立输入 token 预算；未设置时仅受上下文窗口及输出预留约束。
+    pub max_input: Option<u32>,
     /// 输出 token 上限；未设置时保留原有的4096上限。
     pub max_output: Option<u32>,
     /// 推理方言、可用强度与预算。
     pub reasoning: Option<ReasoningConfig>,
+    /// 本次请求显式选择的推理强度；None 不发送推理参数，不写入模型元数据。
+    #[serde(skip)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// 显式关闭目录推理补全；已有显式推理配置仍优先。
+    pub reasoning_disabled: bool,
+    /// 用户对推理能力的声明；与本次请求的推理强度独立。
+    pub reasoning_override: Option<bool>,
+    /// 用户声明的音频输入能力；不表示宿主已接入音频上传。
+    pub supports_audio: bool,
+    /// 用户声明的视频输入能力；不表示宿主已接入视频上传。
+    pub supports_video: bool,
     /// 启用服务商执行的原生搜索，仅限 Responses 或 Anthropic。
     pub native_web_search: bool,
     /// 每百万 token 价格；每个完成的请求均保留快照。
     pub pricing: Option<ModelPricing>,
+    /// 当前有效价格的来源；运行时目录补全不会写回用户设置。
+    #[serde(skip)]
+    pub pricing_reference: bool,
     /// 显式 false 禁用宿主工具；未设置时沿用目录能力声明。
     pub supports_tools: Option<bool>,
     /// 是否请求 SSE；false 使用同一协议的非流式 JSON 响应。
     pub supports_streaming: bool,
     /// 模型是否接受视觉输入。
     pub supports_vision: bool,
+    /// 显式视觉开关；None 保留旧 true 声明并允许精确目录补全。
+    #[serde(default)]
+    pub vision_override: Option<bool>,
     /// 图片模型是否接受参考图进行编辑。
     pub image_edit: bool,
 }
 impl Default for ModelSettings {
-    fn default() -> Self { Self { name: None, group_name: None, model_type: ModelType::Chat, context_window: None, max_output: None, reasoning: None, native_web_search: false, pricing: None, supports_tools: None, supports_streaming: true, supports_vision: false, image_edit: false } }
+    fn default() -> Self { Self { name: None, group_name: None, model_type: ModelType::Chat, context_window: None, max_input: None, max_output: None, reasoning: None, reasoning_effort: None, reasoning_disabled: false, reasoning_override: None, supports_audio: false, supports_video: false, native_web_search: false, pricing: None, pricing_reference: false, supports_tools: None, supports_streaming: true, supports_vision: false, vision_override: None, image_edit: false } }
 }
 impl ModelSettings {
+    /// 能力声明优先；声明支持不代表已经知道可发送的推理协议或档位。
+    pub fn supports_reasoning(&self) -> bool {
+        self.reasoning_override.unwrap_or(!self.reasoning_disabled && self.reasoning.is_some())
+    }
     /// 返回显示名，未设置或空白时返回模型标识。
     pub fn display_name<'a>(&'a self, id: &'a str) -> &'a str { self.name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id) }
     /// 返回分组，未设置时取模型标识中 '-'、'/' 或 ':' 之前的前缀。
@@ -150,7 +173,8 @@ impl ModelSettings {
     /// 保存或构造请求前校验所有模型设置。
     pub fn validate(&self, protocol: Protocol) -> Result<(), String> {
         for name in [&self.name, &self.group_name].into_iter().flatten() { if name.trim().chars().count() > 80 { return Err("模型名称和分组最多80个字符".into()); } }
-        if self.context_window == Some(0) || self.max_output == Some(0) { return Err("上下文和输出上限必须大于零".into()); }
+        if self.context_window == Some(0) || self.max_input == Some(0) || self.max_output == Some(0) { return Err("上下文、输入和输出上限必须大于零".into()); }
+        if self.max_input.zip(self.context_window).is_some_and(|(input, context)| input > context) { return Err("最大输入不能超过上下文窗口".into()); }
         let chat = self.model_type == ModelType::Chat;
         if chat && self.context_window.is_some_and(|n| self.output_limit() >= n) { return Err("输出上限（默认4096）必须小于上下文窗口".into()); }
         if !chat && (self.reasoning.is_some() || self.native_web_search || self.pricing.is_some() || self.supports_tools.is_some()) { return Err("推理、搜索、工具和聊天计费只适用于聊天模型".into()); }
@@ -167,6 +191,7 @@ impl ModelSettings {
                 _ => {}
             }
         }
+        if self.reasoning_effort.is_some_and(|effort| !self.reasoning.as_ref().is_some_and(|config| config.efforts.contains(&effort))) { return Err("模型未声明该推理强度".into()); }
         if let Some(p) = &self.pricing {
             let valid = |n:f64| n.is_finite() && (0.0..=1_000_000.0).contains(&n);
             if !matches!(p.currency.as_str(), "USD" | "CNY") || p.tiers.is_empty() || p.tiers.len() > 8 || p.tiers[0].min_input_tokens != 0 || p.tiers.iter().enumerate().any(|(i,t)| (i > 0 && t.min_input_tokens <= p.tiers[i-1].min_input_tokens) || !valid(t.input) || !valid(t.output) || t.cache_read.is_some_and(|n| !valid(n)) || t.cache_write.is_some_and(|n| !valid(n))) { return Err("价格须为USD/CNY、0起始升序的1至8档，单价须为0至1000000的有限数值".into()); }
@@ -186,9 +211,12 @@ pub struct TokenUsage {
     pub cache_read_tokens: u64,
     /// 写入缓存的输入 token 数。
     pub cache_write_tokens: u64,
+    /// 已包含于输出中的推理 token；未报告不等于零。
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 /// 一个已完成上游请求的用量、原始价格与货币金额。
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RoundUsage {
     /// 服务商未返回用量时为 None，不伪造零费用。
     pub usage: Option<TokenUsage>,
@@ -196,6 +224,58 @@ pub struct RoundUsage {
     pub pricing: Option<ModelPricing>,
     /// pricing.currency 币种下的 token 费用，不包含搜索等额外服务费。
     pub cost: Option<f64>,
+    /// 上游请求的稳定标识；复制对话时保持不变。
+    #[serde(default)]
+    pub request_id: String,
+    /// 请求开始的 Unix 毫秒；旧记录无法推知时为空。
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    /// 完整请求耗时；旧记录为空。
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// 实际请求模型，旧记录可从回答候选补全。
+    #[serde(default)]
+    pub model: Option<crate::ModelRef>,
+    /// 金额的来源；所有估算均不代表服务商账单。
+    #[serde(default)]
+    pub cost_source: CostSource,
+    /// 缺少原始请求标识的历史导入；历史副本无法可靠去重。
+    #[serde(default)]
+    pub legacy: bool,
+    /// 仅在实际请求前缀和开销一致时可复用的上下文锚点。
+    #[serde(default)]
+    pub context: Option<ContextAnchor>,
+}
+/// 上下文前缀和请求开销的指纹；不持久化提示词内容。
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextAnchor { pub prefix: String, pub overhead: String }
+/// 保存的 token 金额来源，不将未知费用表示为零。
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CostSource {
+    /// 已配置单价计算的 token 费用估算。
+    Estimate,
+    /// 模型目录参考单价计算的 token 费用估算。
+    Reference,
+    /// 没有已知来源或金额。
+    #[default]
+    Unknown,
+}
+impl RoundUsage {
+    pub(crate) fn start(model: Option<crate::ModelRef>) -> Result<(Self, std::time::Instant), String> {
+        let started_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?.as_millis().try_into().map_err(|_| "请求时间超出范围")?;
+        Ok((Self { request_id: lumakit_support::new_id().map_err(|error| error.to_string())?, started_at_ms: Some(started_at_ms), duration_ms: None, model, cost_source: CostSource::Unknown, legacy: false, context: None, usage: None, pricing: None, cost: None }, std::time::Instant::now()))
+    }
+    pub(crate) fn finish(mut self, usage: Option<TokenUsage>, pricing: Option<ModelPricing>, reference: bool, started: std::time::Instant) -> Self {
+        self.cost = pricing.as_ref().zip(usage.as_ref()).and_then(|(price, usage)| price.cost(usage));
+        self.cost_source = if self.cost.is_none() { CostSource::Unknown } else if reference { CostSource::Reference } else { CostSource::Estimate };
+        self.usage = usage;
+        self.pricing = pricing;
+        self.duration_ms = Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+        self
+    }
 }
 impl ModelPricing {
     /// 计算 token 费用，缓存输入不会重复计费。

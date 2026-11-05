@@ -105,8 +105,8 @@ impl ChatPanel {
                 .child(self.menu_layer(
                     "image-model",
                     "选择生图模型",
-                    self.unlocked && can_image && !image_options.is_empty(),
-                    Overlay::Models(true),
+                    self.unlocked,
+                    Overlay::ImageModels,
                     cx,
                 ))
                 .child(

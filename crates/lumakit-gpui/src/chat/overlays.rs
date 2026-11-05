@@ -8,6 +8,7 @@ impl ChatPanel {
         let mut content = col().gap(space::S8);
         let menu = !matches!(layer, Overlay::Edit);
         let compact = matches!(layer, Overlay::Tools | Overlay::Quick);
+        let combined = matches!(layer, Overlay::ModelPicker);
         match layer {
             Overlay::History => {
                 content = content.child("历史对话").child(Input::new(&self.search).aria_label("搜索对话"));
@@ -35,21 +36,23 @@ impl ChatPanel {
             }
             Overlay::Tools => { content = self.tools_menu(session, image_options, can_image, cx); }
             Overlay::Quick => { content = self.customize_toolbar(session, cx); }
-            Overlay::Models(image) => {
-                content = content.child(if image { "选择生图模型" } else { "选择聊天模型" })
-                    .child(Input::new(&self.search).aria_label("搜索模型、服务商、端点"));
+            Overlay::ModelPicker => { content = self.model_picker(session, options, window, cx); }
+            Overlay::ImageModels => {
+                content = content.child("选择生图模型")
+                    .child(Input::new(&self.search).aria_label("搜索模型、服务商、端点"))
+                    .child(div().text_style(text::METADATA).text_color(r.text_muted).child(self.image_notice));
                 let query = self.search.read(cx).value().to_lowercase();
                 let mut found = false;
-                for option in (if image { image_options } else { options }).iter().filter(|o| model_label(o).to_lowercase().contains(&query)) {
+                for option in image_options.iter().filter(|o| model_label(o).to_lowercase().contains(&query)) {
                     found = true;
-                    let action = if image { let mut next = session.composer().clone(); next.image_mode = true; next.image_model = Some(option.model.clone()); ChatAction::SetComposer(next) }
-                        else { ChatAction::SelectModel(option.model.clone()) };
-                    let picked = if image { session.composer().image_model.as_ref() } else { session.history().model.as_ref() };
+                    let mut next = session.composer().clone(); next.image_mode = true; next.image_model = Some(option.model.clone());
+                    let action = ChatAction::SetComposer(next);
+                    let picked = session.composer().image_model.as_ref();
                     content = content.child(item(Button::new(SharedString::from(model_label(option))), model_label(option))
-                        .selected(picked.is_some_and(|m| same_model(m, &option.model))).disabled(!self.unlocked)
+                        .selected(picked.is_some_and(|m| same_model(m, &option.model))).disabled(!self.unlocked || !can_image)
                         .on_click(cx.listener(move |this, _, window, cx| { this.emit(action.clone(), cx); this.close(window, cx); })));
                 }
-                if !found { content = content.child("没有匹配的模型"); }
+                if !found { content = content.child("尚未配置可用图片模型。请在模型设置中添加图片类型模型，并启用对应服务商。"); }
                 content = content.child(self.menu_action("configure-models", "模型设置", true, ChatAction::OpenSettings, cx));
             }
             Overlay::RetryModels => {
@@ -61,19 +64,32 @@ impl ChatPanel {
                         .on_click(cx.listener(move |this, _, window, cx| { this.emit(ChatAction::RetryWith(model.clone()), cx); this.close(window, cx); })));
                 }
             }
-            Overlay::Reasoning => {
-                content = content.child("推理强度：默认沿用模型配置");
-                let efforts = std::iter::once(None).chain(settings.and_then(|s| s.reasoning.as_ref()).into_iter().flat_map(|r| r.efforts.iter().copied().map(Some)));
-                for effort in efforts {
-                    let mut next = session.composer().clone(); next.reasoning = effort;
-                    content = content.child(self.menu_action(reasoning_label(effort), reasoning_label(effort), self.unlocked,
-                        ChatAction::SetComposer(next), cx).selected(session.composer().reasoning == effort));
-                }
-            }
             Overlay::Usage => {
-                content = content.child("上一回答的实际用量；不是草稿估算");
-                if let Some(attempt) = session.selected().and_then(|c| c.turns.last()).and_then(|t| t.attempts.last()) { content = content.child(usage_details(attempt)); }
-                else { content = content.child("用量未知"); }
+                content = content.child("用量与上下文");
+                if let Some(settings) = settings {
+                    match session.context_usage(settings) {
+                        Ok(context) => { content = content.child(context_summary(&context, r)); }
+                        Err(_) => { content = content.child(label(text::METADATA, "上下文未知").text_color(r.text_muted)); }
+                    }
+                } else {
+                    content = content.child(label(text::METADATA, "上下文未知").text_color(r.text_muted));
+                }
+                content = content.child(label(text::TITLE_COMPACT, "当前对话累计（含重试与工具请求）"));
+                if let Some(conversation) = session.selected() {
+                    match session.usage_report(Some(&conversation.id), None) {
+                        Ok(report) => { content = content.child(usage_totals(&report.total, r)); }
+                        Err(_) => { content = content.child(label(text::METADATA, "当前对话用量读取失败，请关闭后重试").text_color(r.feedback_error)); }
+                    }
+                    if let Some(attempt) = conversation.turns.last().and_then(|turn| turn.attempts.last()) {
+                        let key = format!("latest-usage:{}", attempt.id);
+                        content = content.child(self.disclosure(key.clone(), "最新回答用量详情", cx));
+                        if self.details.contains(&key) { content = content.child(usage_details(attempt)); }
+                    }
+                } else {
+                    content = content.child(usage_totals(&lumakit_ai::usage::UsageTotals::default(), r));
+                }
+                content = content.child(label(text::METADATA, "费用仅显示可验证的 token 估算；不同币种不换算。最新回答的明细默认折叠。")
+                    .text_color(r.text_muted));
             }
             Overlay::More(conversation, turn, attempt_id) => {
                 content = content.child("更多操作");
@@ -115,14 +131,14 @@ impl ChatPanel {
         // Menus open below a trigger in the upper half of the window and above one in the lower half,
         // aligned to the trigger edge nearer the window centre. Dialogs, and menus whose trigger is gone, stay centered.
         let below = trigger.is_some_and(|t| f32::from(t.center().y) < height / 2.);
-        let layer_width = if compact { toolbar::TOOL_MENU_WIDTH } else { LAYER_W };
+        let layer_width = if combined { model_picker::WIDTH } else if compact { toolbar::TOOL_MENU_WIDTH } else { LAYER_W };
         let (surface_w, surface_h) = match trigger {
             Some(t) => (f32::from(layer_width).min(width - 2. * MENU_MARGIN),
                 if below { height - f32::from(t.bottom()) } else { f32::from(t.top()) } - MENU_MARGIN - f32::from(MENU_GAP)),
             None => (f32::from(layer_width).min(width - 2. * MENU_MARGIN), height - LAYER_MARGIN),
         };
         let surface = col().id("chat-layer").occlude().w(px(surface_w)).when(trigger.is_none(), |s| s.max_w_full())
-            .max_h(px(surface_h.max(LAYER_MIN_HEIGHT))).p(if compact { space::S4 } else { space::S12 }).gap(space::S4).rounded(radius::LG)
+            .max_h(px(surface_h.max(LAYER_MIN_HEIGHT))).p(if combined { space::S0 } else if compact { space::S4 } else { space::S12 }).gap(space::S4).rounded(radius::LG)
             .bg(r.container_elevated_bg).border_1().border_color(r.border_default).shadow_lg()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -132,8 +148,8 @@ impl ChatPanel {
                     if !search_ime && !edit_ime { this.close(window, cx); cx.stop_propagation(); }
                 }
             }))
-            .child(div().id("chat-layer-scroll").flex_1().min_h_0().overflow_y_scroll().child(content))
-            .when(!compact, |s| s.child(row().justify_end().child(Button::new("close-layer").small().ghost().label(if self.edit.is_some() { "取消" } else { "关闭" })
+            .child(if combined { content.into_any_element() } else { div().id("chat-layer-scroll").flex_1().min_h_0().overflow_y_scroll().child(content).into_any_element() })
+            .when(!compact && !combined, |s| s.child(row().justify_end().child(Button::new("close-layer").small().ghost().label(if self.edit.is_some() { "取消" } else { "关闭" })
                 .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))))))
             .focus_trap("chat-layer-trap", &self.focus);
         let Some(trigger) = trigger else {
@@ -163,17 +179,4 @@ impl ChatPanel {
 fn item(button: Button, label: impl Into<SharedString>) -> Button {
     let label = label.into();
     button.small().ghost().w_full().accessibility_label(label.clone()).child(div().w_full().min_w_0().truncate().child(label))
-}
-pub(super) fn usage_details(attempt: &Attempt) -> Div {
-    let mut body = col().gap(space::S4).text_style(text::METADATA);
-    if attempt.rounds.is_empty() { body = body.child("用量未提供 · 费用未知"); }
-    for (index, round) in attempt.rounds.iter().enumerate() {
-        let label = if let Some(usage) = &round.usage {
-            let tokens = format!("输入 {} · 输出 {} · 缓存读取 {} · 缓存写入 {} token", usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens);
-            match (&round.pricing, round.cost) { (Some(p), Some(c)) if c.is_finite() && c >= 0. && !p.currency.is_empty() => format!("{tokens} · 费用 {} {c}", p.currency),
-                _ => format!("{tokens} · 费用未知") }
-        } else { "用量未提供 · 费用未知".into() };
-        body = body.child(format!("第 {} 轮 · {label}", index + 1));
-    }
-    body.child("按请求保存的用量与价格快照；不同币种不换算，费用不含搜索等额外服务费。缓存读写已包含在输入 token 中。")
 }

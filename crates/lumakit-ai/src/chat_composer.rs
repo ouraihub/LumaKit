@@ -36,12 +36,12 @@ fn deserialize_toolbar<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Res
     Ok(canonical_toolbar(&tools))
 }
 
-/// 每个对话保存的输入控制；None 使用模型已保存的默认推理强度。
+/// 每个对话保存的输入控制；None 不指定推理强度，使用服务商默认行为。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ComposerSettings {
     /// 使用服务商原生联网搜索。
     pub web_search: bool,
-    /// 显式推理强度。
+    /// 显式推理强度；None 不发送推理参数，Some(ReasoningEffort::None) 仅在模型支持时关闭推理。
     pub reasoning: Option<ReasoningEffort>,
     /// 向聊天模型公开绘图工具；保留原字段名以兼容已保存控制。
     pub image_mode: bool,
@@ -75,11 +75,17 @@ pub(super) struct ComposerData {
     pub turns: BTreeMap<String, InputSnapshot>,
     #[serde(default = "default_toolbar", deserialize_with = "deserialize_toolbar")]
     pub toolbar: Vec<ToolbarTool>,
+    #[serde(default)]
+    pub model_picker: super::ModelPickerPreferences,
+    #[serde(default)]
+    pub default_composer: ComposerSettings,
+    #[serde(default)]
+    pub conversation_models: BTreeMap<String, ModelRef>,
 }
 
 impl Default for ComposerData {
     fn default() -> Self {
-        Self { drafts: BTreeMap::new(), turns: BTreeMap::new(), toolbar: default_toolbar() }
+        Self { drafts: BTreeMap::new(), turns: BTreeMap::new(), toolbar: default_toolbar(), model_picker: Default::default(), default_composer: Default::default(), conversation_models: BTreeMap::new() }
     }
 }
 
@@ -101,7 +107,7 @@ impl ChatSession {
     /// 更新当前对话控制；保存失败时撤销修改。
     pub fn set_composer(&mut self, settings: ComposerSettings) {
         if !self.mutable() { return; }
-        if self.selected().is_none() { self.new_conversation(); }
+        self.ensure_conversation();
         if !self.mutable() { return; }
         let Some(id) = self.history.selected.clone() else { return; };
         let before = self.composer_data.clone();
@@ -119,7 +125,7 @@ impl ChatSession {
     /// 有界读取 UTF-8 文本或 PNG/JPEG/WebP/GIF；不截断超限文件。
     pub fn add_attachment(&mut self, path: &Path) -> Result<(), String> {
         if !self.mutable() { return Err("当前聊天不可修改。".into()); }
-        if self.selected().is_none() { self.new_conversation(); }
+        self.ensure_conversation();
         if !self.mutable() { return Err(self.notice.clone()); }
         let id = self.history.selected.clone().ok_or("请先新建对话。")?;
         if self.draft_attachments().len() >= images::MAX_IMAGES { return Err("每个问题最多 4 个附件。".into()); }

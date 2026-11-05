@@ -91,6 +91,19 @@ gpui_kit::assets::icon_assets!(
         Image,
         MessageSquarePlus,
         GripVertical,
+        Activity,
+        Type,
+        Boxes,
+        ArrowUpDown,
+        Ear,
+        Video,
+        Volume2,
+        Mic,
+        Moon,
+        Leaf,
+        Zap,
+        Sparkle,
+        Flame,
         Paperclip
     ]
 );

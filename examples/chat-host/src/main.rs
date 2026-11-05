@@ -8,8 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 struct Host { session: ChatSession, panel: ChatPanel, options: Vec<ModelOption>, image_options: Vec<ModelOption>, settings: lumakit_ai::model_config::ModelSettings, base: String, picker: Option<std::sync::mpsc::Receiver<Result<Option<PathBuf>, String>>> }
 impl Host {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
-        let base = std::env::var("LUMAKIT_AI_URL").map_err(|_| "请设置 LUMAKIT_AI_URL 为真实服务或回环地址".to_owned())?;
-        lumakit_ai::catalog::validate_url(&base)?;
+        let (base, options, image_options, settings) = Self::configured_models()?;
         let root = std::env::var_os("LUMAKIT_CHAT_DATA").map(PathBuf::from).ok_or("请设置独立 LUMAKIT_CHAT_DATA 目录")?;
         let ctx = cc.egui_ctx.clone();
         let mut fonts = egui::FontDefinitions::default();
@@ -19,13 +18,43 @@ impl Host {
             fonts.families.entry(egui::FontFamily::Proportional).or_default().push("chinese".into());
         }
         ctx.set_fonts(fonts);
-        let model = ModelRef { provider: "host".into(), endpoint: "main".into(), model: std::env::var("LUMAKIT_AI_MODEL").unwrap_or_else(|_| "local-model".into()), protocol: match std::env::var("LUMAKIT_AI_PROTOCOL").as_deref() { Ok("responses") => Protocol::OpenAiResponses, Ok("messages") => Protocol::AnthropicMessages, _ => Protocol::OpenAiChat } };
         let mut session = ChatSession::open(&root.join("chat.db"), Arc::new(move || ctx.request_repaint()))?;
-        if session.history().model.is_none() { session.select_model(model.clone()); }
+        if session.history().model.is_none() { session.select_model_pair(&options[0], None)?; }
+        session.reconcile_model_catalog(&options)?;
+        Ok(Self { session, panel: ChatPanel::new("independent-host"), options, image_options, settings, base, picker: None })
+    }
+    fn configured_models() -> Result<(String, Vec<ModelOption>, Vec<ModelOption>, lumakit_ai::model_config::ModelSettings), String> {
+        let base = std::env::var("LUMAKIT_AI_URL").map_err(|_| "请设置 LUMAKIT_AI_URL 为真实服务或回环地址".to_owned())?;
+        lumakit_ai::catalog::validate_url(&base)?;
+        let model = ModelRef { provider: "host".into(), endpoint: "main".into(), model: std::env::var("LUMAKIT_AI_MODEL").unwrap_or_else(|_| "local-model".into()), protocol: match std::env::var("LUMAKIT_AI_PROTOCOL").as_deref() { Ok("responses") => Protocol::OpenAiResponses, Ok("messages") => Protocol::AnthropicMessages, _ => Protocol::OpenAiChat } };
         let settings: lumakit_ai::model_config::ModelSettings = std::env::var("LUMAKIT_AI_SETTINGS").ok().map(|json| serde_json::from_str(&json).map_err(|e| format!("LUMAKIT_AI_SETTINGS 无效：{e}"))).transpose()?.unwrap_or_default();
+        let settings = lumakit_ai::model_reference::effective_settings(&model.model, model.protocol, &settings);
         settings.validate(model.protocol)?;
-        let image_options = std::env::var("LUMAKIT_AI_IMAGE_MODEL").ok().filter(|m| !m.trim().is_empty()).map(|name| vec![ModelOption { model: ModelRef { model: name.clone(), protocol: Protocol::OpenAiChat, ..model.clone() }, name, provider: "独立宿主".into(), endpoint: "主线路".into() }]).unwrap_or_default();
-        Ok(Self { session, panel: ChatPanel::new("independent-host"), options: vec![ModelOption { name: model.model.clone(), provider: "独立宿主".into(), endpoint: "主线路".into(), model }], image_options, settings, base, picker: None })
+        // Environment credentials are not stored credentials; never imply a subscription or saved key.
+        let image_options = std::env::var("LUMAKIT_AI_IMAGE_MODEL").ok().filter(|m| !m.trim().is_empty()).map(|name| vec![ModelOption {
+            model: ModelRef { model: name.clone(), protocol: Protocol::OpenAiChat, ..model.clone() }, name, provider: "独立宿主".into(), endpoint: "主线路".into(),
+            settings: lumakit_ai::model_config::ModelSettings { model_type: lumakit_ai::model_config::ModelType::Image, ..Default::default() }, has_key: false,
+        }]).unwrap_or_default();
+        let options = vec![ModelOption { name: settings.display_name(&model.model).to_owned(), provider: "独立宿主".into(), endpoint: "主线路".into(), model, settings: settings.clone(), has_key: false }];
+        Ok((base, options, image_options, settings))
+    }
+
+    fn refresh_models(&mut self, force: bool) {
+        match Self::configured_models() {
+            Ok((base, options, image_options, settings)) => {
+                self.base = base; self.options = options; self.image_options = image_options; self.settings = settings;
+                if let Err(error) = self.session.reconcile_model_catalog(&self.options) { self.session.report(error); return; }
+                self.session.report(if force { "已重新载入本地环境配置；独立宿主未接入 HTTP 目录发现，未请求网络。" } else { "已重新载入本地环境模型配置。" }.into());
+            }
+            Err(error) => self.session.report(error),
+        }
+    }
+
+    fn select_model_pair(&mut self, model: ModelRef, effort: Option<lumakit_ai::model_config::ReasoningEffort>, default: bool) {
+        let result = self.options.iter().find(|option| option.model == model).ok_or_else(|| "聊天模型已失效".to_owned()).and_then(|option| {
+            if default { self.session.set_default_model_pair(option, effort) } else { self.session.select_model_pair(option, effort) }
+        });
+        if let Err(error) = result { self.session.report(error); }
     }
     fn resolve(&self, model: &ModelRef, image: bool) -> Result<AiConnection, String> {
         let options = if image { &self.image_options } else { &self.options };
@@ -91,7 +120,14 @@ impl eframe::App for Host {
         egui::CentralPanel::default().show(ui, |ui| {
             for action in self.panel.show(ui, &self.session, &self.options, &self.image_options, Some(&self.settings)) {
                 match action {
-                    ChatAction::New => self.session.new_conversation(), ChatAction::Select(id) => self.session.select_conversation(&id), ChatAction::Delete(id) => self.session.delete_conversation(&id), ChatAction::Draft(text) => self.session.set_draft(text), ChatAction::SelectModel(model) => self.session.select_model(model), ChatAction::Stop => self.session.cancel(), ChatAction::Save => self.session.retry_save(),
+                    ChatAction::New => self.session.new_conversation(), ChatAction::Select(id) => self.session.select_conversation(&id), ChatAction::Delete(id) => self.session.delete_conversation(&id), ChatAction::Draft(text) => self.session.set_draft(text), ChatAction::SelectModel(model) => self.select_model_pair(model, None, false), ChatAction::Stop => self.session.cancel(), ChatAction::Save => self.session.retry_save(),
+                    ChatAction::SelectModelPair { model, effort } => self.select_model_pair(model, effort, false),
+                    ChatAction::SetDefaultModelPair { model, effort } => self.select_model_pair(model, effort, true),
+                    ChatAction::ToggleFavorite(model) => {
+                        if self.options.iter().any(|option| option.model == model) { self.session.toggle_model_favorite(model); }
+                        else { self.session.report("聊天模型已失效，无法收藏".into()); }
+                    }
+                    ChatAction::RefreshModels { force } => self.refresh_models(force),
                     ChatAction::SetComposer(settings) => self.session.set_composer(settings),
                     ChatAction::SetToolbar(tools) => self.session.set_toolbar(tools),
                     ChatAction::RemoveAttachment(id) => self.session.remove_attachment(&id),

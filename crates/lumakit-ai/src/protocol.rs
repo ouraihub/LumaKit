@@ -144,7 +144,7 @@ pub(crate) fn encode(
         }
     };
     if let Some(config) = &connection.settings.reasoning {
-        if let Some(&effort) = config.efforts.first() {
+        if let Some(effort) = connection.settings.reasoning_effort {
             use crate::model_config::{ReasoningDialect::*, ReasoningEffort};
             let on = effort != ReasoningEffort::None;
             match config.dialect {
@@ -339,7 +339,19 @@ impl Decoder {
         } else {
             if let Some(n) = read(input_key)? { parsed.input_tokens = n; }
             let details = if protocol == Protocol::OpenAiChat { &usage["prompt_tokens_details"] } else { &usage["input_tokens_details"] };
-            if let Some(n) = details.get("cached_tokens") { parsed.cache_read_tokens = n.as_u64().ok_or("invalid cached token usage")?; }
+            let detail = |value: &Value, key: &str| -> Result<Option<u64>, String> {
+                match value.get(key) { None | Some(Value::Null) => Ok(None), Some(n) => n.as_u64().map(Some).ok_or_else(|| format!("invalid token usage: {key}")) }
+            };
+            let cached = [read("cached_tokens")?, read("prompt_cache_hit_tokens")?, detail(details, "cached_tokens")?, read("cachedContentTokenCount")?];
+            if let Some(n) = cached.iter().flatten().copied().find(|n| *n > 0).or_else(|| cached.into_iter().flatten().next()) { parsed.cache_read_tokens = n; }
+            if let Some(n) = detail(details, "cache_write_tokens")? {
+                parsed.cache_write_tokens = n;
+            } else if read("prompt_cache_hit_tokens")?.is_none() {
+                // DeepSeek hit/miss splits inclusive prompt tokens; misses are not cache writes.
+                if let Some(n) = read("prompt_cache_miss_tokens")? { parsed.cache_write_tokens = n; }
+            }
+            let output_details = if protocol == Protocol::OpenAiChat { &usage["completion_tokens_details"] } else { &usage["output_tokens_details"] };
+            if let Some(n) = detail(output_details, "reasoning_tokens")? { parsed.reasoning_tokens = Some(n); }
         }
         if parsed.cache_read_tokens.checked_add(parsed.cache_write_tokens).is_none_or(|n| n > parsed.input_tokens) { return Err("cached token usage exceeds total input".into()); }
         self.usage = Some(parsed);
@@ -498,9 +510,52 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_capabilities_do_not_choose_a_request_effort() {
+        use crate::model_config::*;
+        for (protocol, dialect, budget_tokens) in [
+            (Protocol::OpenAiChat, ReasoningDialect::OpenAi, None),
+            (Protocol::OpenAiResponses, ReasoningDialect::OpenAi, None),
+            (Protocol::AnthropicMessages, ReasoningDialect::AnthropicAdaptive, None),
+            (Protocol::AnthropicMessages, ReasoningDialect::AnthropicBudget, Some(2048)),
+            (Protocol::OpenAiChat, ReasoningDialect::ThinkingType, None),
+            (Protocol::OpenAiChat, ReasoningDialect::Qwen, Some(2048)),
+        ] {
+            let c = AiConnection {
+                base_url: "https://api.openai.com/v1".into(), protocol, api_key: None, model: "custom".into(),
+                settings: ModelSettings {
+                    reasoning: Some(ReasoningConfig { dialect, efforts: vec![ReasoningEffort::Low, ReasoningEffort::High], budget_tokens }),
+                    ..Default::default()
+                },
+            };
+            c.settings.validate(protocol).unwrap();
+            let body = encode(&c, None, &[], &[]);
+            for field in ["reasoning", "reasoning_effort", "thinking", "output_config", "enable_thinking", "thinking_budget"] {
+                assert!(body.get(field).is_none(), "unexpected {field}: {body}");
+            }
+            let saved = serde_json::to_value(&c.settings).unwrap();
+            let selected = c.clone().with_reasoning_effort(ReasoningEffort::High).unwrap();
+            assert_eq!(selected.settings.reasoning, c.settings.reasoning);
+            assert_eq!(selected.settings.reasoning_effort, Some(ReasoningEffort::High));
+            assert_eq!(serde_json::to_value(&selected.settings).unwrap(), saved);
+            let restored: ModelSettings = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored, c.settings);
+            assert!(c.clone().with_reasoning_effort(ReasoningEffort::None).is_err());
+            let mut invalid = c;
+            invalid.settings.reasoning_effort = Some(ReasoningEffort::None);
+            assert!(invalid.settings.validate(protocol).is_err());
+        }
+        let disabled = AiConnection {
+            base_url: "http://127.0.0.1:1".into(), protocol: Protocol::OpenAiChat, api_key: None, model: "gpt-6.1-sol".into(),
+            settings: ModelSettings { reasoning_disabled: true, ..Default::default() },
+        };
+        assert!(disabled.with_reasoning_effort(ReasoningEffort::High).is_err());
+    }
+
+    #[test]
     fn configured_requests_usage_and_token_prices() {
         use crate::model_config::*;
         let mut c = AiConnection { base_url: "https://api.openai.com/v1".into(), protocol: Protocol::OpenAiResponses, api_key: None, model: "model".into(), settings: ModelSettings { max_output: Some(8192), native_web_search: true, reasoning: Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::High], budget_tokens: None }), ..Default::default() } };
+        c = c.with_reasoning_effort(ReasoningEffort::High).unwrap();
         let body = encode(&c, None, &[], &[]);
         assert_eq!(body["max_output_tokens"], 8192);
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -526,6 +581,7 @@ mod tests {
         c.protocol = Protocol::OpenAiChat;
         assert!(c.settings.validate(c.protocol).is_err());
         c.settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::Qwen, efforts: vec![ReasoningEffort::Low], budget_tokens: Some(2000) });
+        c = c.with_reasoning_effort(ReasoningEffort::Low).unwrap();
         let body = encode(&c, None, &[], &[]);
         assert_eq!(body["max_tokens"], 8192);
         assert_eq!(body["enable_thinking"], true);
@@ -547,6 +603,26 @@ mod tests {
         assert_eq!(decoder.complete(Protocol::AnthropicMessages, &json!({"stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":2}})).unwrap(), "done");
         c.settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::AnthropicAdaptive, efforts:vec![ReasoningEffort::High],budget_tokens:None });
         c.protocol = Protocol::AnthropicMessages;
+        c = c.with_reasoning_effort(ReasoningEffort::High).unwrap();
         assert_eq!(encode(&c,None,&[],&[])["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn openai_cache_fields_preserve_inclusive_input_and_reasoning_subset() {
+        for (protocol, usage, expected) in [
+            (Protocol::OpenAiChat, json!({"prompt_tokens":100,"completion_tokens":20,"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40,"completion_tokens_details":{"reasoning_tokens":7}}), (100, 20, 60, 0, Some(7))),
+            (Protocol::OpenAiChat, json!({"prompt_tokens":100,"completion_tokens":20,"cached_tokens":0,"prompt_tokens_details":{"cached_tokens":30,"cache_write_tokens":10},"completion_tokens_details":{"reasoning_tokens":0}}), (100, 20, 30, 10, Some(0))),
+            (Protocol::OpenAiResponses, json!({"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":30,"cache_write_tokens":10},"output_tokens_details":{"reasoning_tokens":7}}), (100, 20, 30, 10, Some(7))),
+            (Protocol::OpenAiResponses, json!({"input_tokens":100,"output_tokens":20,"prompt_cache_hit_tokens":60,"prompt_cache_miss_tokens":40}), (100, 20, 60, 0, None)),
+        ] {
+            let mut decoder = Decoder::default();
+            decoder.read_usage(protocol, &json!({"usage":usage})).unwrap();
+            let usage = decoder.usage.unwrap();
+            assert_eq!((usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens), expected);
+        }
+        let mut decoder = Decoder::default();
+        decoder.read_usage(Protocol::OpenAiChat, &json!({"usage":{"prompt_tokens":100}})).unwrap();
+        assert!(decoder.usage.is_none());
+        assert!(decoder.read_usage(Protocol::OpenAiChat, &json!({"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":101}}})).is_err());
     }
 }

@@ -36,6 +36,7 @@ pub(super) struct PaintingHost {
     pub model: ModelRef,
     pub chat: AiConnection,
     pub painting: Option<AiConnection>,
+    pub painting_model: Option<ModelRef>,
     pub root: PathBuf,
     pub tx: mpsc::SyncSender<Event>,
     pub wake: Arc<dyn Fn() + Send + Sync>,
@@ -46,16 +47,12 @@ impl AiHost for PaintingHost {
     fn connection(&self, _: &ModelRef) -> Result<AiConnection, AiError> { Ok(self.chat.clone()) }
     fn system_prompt(&self, _: &RunRequest) -> Result<Option<String>, AiError> { Ok(None) }
     fn tools(&self, _: &RunRequest) -> Vec<ToolSpec> {
-        if self.painting.is_none() { return Vec::new(); }
-        vec![ToolSpec {
-            name: "generate_image".into(), description: "仅当用户要求图片、绘画、插图或照片时生成一张图片；描述完整画面、构图与氛围，每次回复最多调用两次。失败时如实报告，不得声称已生成，不要重试同一失败请求。".into(),
-            parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":4000},"size":{"type":"string","enum":["1024x1024","1024x1536","1536x1024"]}},"required":["prompt"],"additionalProperties":false}),
-            read_only: false, requires_approval: false,
-        }]
+        painting_tools(self.painting.is_some())
     }
     fn authorize(&self, _: &ToolCall, default: Approval) -> Approval { default }
     fn call_tool(&self, call: ToolCall, cancel: CancellationToken) -> ToolFuture {
         let painting = self.painting.clone();
+        let painting_model = self.painting_model.clone();
         let root = self.root.clone();
         let tx = self.tx.clone();
         let wake = self.wake.clone();
@@ -66,13 +63,22 @@ impl AiHost for PaintingHost {
             if executions.fetch_add(1, Ordering::Relaxed) >= 2 { return Err(error("每次回复最多执行两次图片生成（失败也计入）；未再次请求图片接口。")); }
             let request = ImageRequest::parse(call.arguments)?;
             tracing::info!(event = "ai.image.tool", call_id = %call.id, prompt_chars = request.prompt.chars().count(), size = ?request.size, "执行绘图工具");
-            let (run, images) = generate(painting.ok_or_else(|| error("尚未配置绘图连接。"))?, request, &root, &cancel).await?;
+            let (mut run, images) = generate(painting.ok_or_else(|| error("尚未配置绘图连接。"))?, request, &root, &cancel).await?;
+            for round in &mut run.rounds { round.model = painting_model.clone(); }
             let text = serde_json::json!({"message":format!("Generated {} image(s).", images.len()),"images":images}).to_string();
             tx.send(Event::Generated { images, rounds: run.rounds }).map_err(|_| error("绘图会话已关闭。"))?;
             wake();
             Ok(ToolOutput { text, is_error: false })
         })
     }
+}
+pub(super) fn painting_tools(enabled: bool) -> Vec<ToolSpec> {
+    if !enabled { return Vec::new(); }
+    vec![ToolSpec {
+        name: "generate_image".into(), description: "仅当用户要求图片、绘画、插图或照片时生成一张图片；描述完整画面、构图与氛围，每次回复最多调用两次。失败时如实报告，不得声称已生成，不要重试同一失败请求。".into(),
+        parameters: serde_json::json!({"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":4000},"size":{"type":"string","enum":["1024x1024","1024x1536","1536x1024"]}},"required":["prompt"],"additionalProperties":false}),
+        read_only: false, requires_approval: false,
+    }]
 }
 pub(super) fn validate(connection: &AiConnection) -> Result<(), String> {
     if connection.protocol == crate::Protocol::AnthropicMessages { return Err("图片生成仅支持 OpenAI 兼容 images/generations 接口。".into()); }
@@ -94,6 +100,7 @@ async fn generate(connection: AiConnection, request: ImageRequest, root: &Path, 
     body["n"] = serde_json::json!(1);
     let mut request = http.post(url).timeout(std::time::Duration::from_secs(120)).json(&body);
     if let Some(key) = &connection.api_key { request = request.bearer_auth(key.as_str()); }
+    let (round_usage, started) = RoundUsage::start(None).map_err(AiError::Provider)?;
     let response = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = request.send() => result.map_err(crate::network)? };
     tracing::info!(event = "ai.image.response", status = response.status().as_u16(), "Image generation response received");
     if !response.status().is_success() { return Err(crate::provider_response(response, connection.api_key.as_ref(), cancel).await); }
@@ -138,9 +145,9 @@ async fn generate(connection: AiConnection, request: ImageRequest, root: &Path, 
         Ok::<_, AiError>(())
     })();
     if let Err(error) = save { for image in &stored { let _ = std::fs::remove_file(root.join(&image.storage_key)); } return Err(error); }
-    let usage = value.get("usage").and_then(|usage| Some(TokenUsage { input_tokens: usage.get("input_tokens")?.as_u64()?, output_tokens: usage.get("output_tokens")?.as_u64()?, cache_read_tokens: 0, cache_write_tokens: 0 }));
+    let usage = value.get("usage").and_then(|usage| Some(TokenUsage { input_tokens: usage.get("input_tokens")?.as_u64()?, output_tokens: usage.get("output_tokens")?.as_u64()?, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: None }));
     tracing::info!(event = "ai.image.stored", count = stored.len(), "Generated images stored");
-    Ok((AiRun { text: String::new(), tool_calls: Vec::new(), rounds: vec![RoundUsage { usage, pricing: None, cost: None }], reasoning_blocks: Vec::new() }, stored))
+    Ok((AiRun { text: String::new(), tool_calls: Vec::new(), rounds: vec![round_usage.finish(usage, None, false, started)], reasoning_blocks: Vec::new() }, stored))
 }
 
 fn error(message: &str) -> AiError { AiError::Provider(message.into()) }

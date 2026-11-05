@@ -255,6 +255,7 @@ impl ProviderStore {
             settings: crate::model_config::ModelSettings {
                 supports_streaming: capabilities.streaming,
                 supports_tools: capabilities.tools.then_some(true),
+                supports_vision: capabilities.vision,
                 ..Default::default()
             },
         })
@@ -351,6 +352,7 @@ mod tests {
         let connection = s.resolve("p", "m").unwrap();
         assert!(!connection.settings.supports_streaming);
         assert_eq!(connection.settings.supports_tools, None);
+        assert!(connection.settings.supports_vision);
     }
     #[test]
     fn key_never_outputs_full_secret() {

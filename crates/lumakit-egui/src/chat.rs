@@ -6,6 +6,9 @@ use lumakit_ai::chat::{ChatAction, ModelOption};
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::{collections::HashMap, fmt::Debug, hash::Hash};
 
+#[path = "chat_usage.rs"]
+mod usage;
+
 const CONTROL: f32 = 30.0;
 const CACHE_ENTRIES: usize = 64;
 const CACHE_BYTES: usize = 4 * 1024 * 1024;
@@ -101,6 +104,7 @@ pub struct ChatPanel {
     frame: u64,
     markdown: HashMap<String, MarkdownEntry>,
     media: crate::chat_media::MediaPreview,
+    usage: usage::UsageMenu,
     geometry: ChatGeometry,
 }
 impl ChatPanel {
@@ -109,7 +113,7 @@ impl ChatPanel {
         Self { id: Id::unique(instance_id), conversation: None, draft: String::new(), expanded: false,
             composing: false, history_open: false, quick_open: false, history_search: String::new(), delete: None, edit: None,
             model_search: String::new(), follow: true, to_bottom: true,
-            last_offset: 0.0, frame: 0, markdown: HashMap::new(), media: Default::default(), geometry: ChatGeometry::default() }
+            last_offset: 0.0, frame: 0, markdown: HashMap::new(), media: Default::default(), usage: Default::default(), geometry: ChatGeometry::default() }
     }
     /// 上次 show 捕获的实际布局，不重新计算坐标。
     pub fn geometry(&self) -> &ChatGeometry { &self.geometry }
@@ -128,6 +132,7 @@ impl ChatPanel {
             self.to_bottom = true;
             self.last_offset = 0.0;
             self.markdown.clear();
+            self.usage.close();
         } else if let Some(conversation) = selected {
             // 宿主执行 Send 后清空草稿、或保存失败恢复草稿时同步；不是每帧复制全文。
             if self.draft != conversation.draft { self.draft.clone_from(&conversation.draft); }
@@ -352,14 +357,13 @@ impl ChatPanel {
             };
             self.geometry.send_stop = send.rect;
             if session.save_failed() {
+                self.usage.close();
                 if crate::icons::action(ui, true, "\u{E038}", "重试保存").clicked() { actions.push(ChatAction::Save); }
             } else if !self.follow {
+                self.usage.close();
                 if crate::icons::action(ui, true, "\u{E03E}", "回到底部").clicked() { self.follow = true; self.to_bottom = true; }
             } else {
-                ui.menu_button("用量", |ui| {
-                    ui.label(composer_usage(session));
-                    ui.label(RichText::new("上一回答的服务商实际 token 用量；不是草稿估算").weak().small());
-                }).response.on_hover_text(composer_usage(session)).accessible_name("用量详情");
+                self.usage.show(ui, session, model_settings);
             }
             ui.add_enabled_ui(unlocked, |ui| {
                 ui.menu_button(reasoning_label(*reasoning), |ui| {
@@ -368,7 +372,7 @@ impl ChatPanel {
                     if let Some(config) = model_settings.and_then(|s| s.reasoning.as_ref()) {
                         for &effort in &config.efforts { ui.selectable_value(reasoning, Some(effort), reasoning_label(Some(effort))); }
                     }
-                }).response.on_hover_text("推理强度：默认沿用模型配置").accessible_name("推理强度");
+                }).response.on_hover_text("推理强度：默认交由服务商处理，不发送指定档位").accessible_name("推理强度");
             });
         });
     }
@@ -460,12 +464,9 @@ impl ChatPanel {
                         });
                     }
                     if attempt.status != TurnStatus::Running || !attempt.rounds.is_empty() {
-                        egui::CollapsingHeader::new(RichText::new("用量详情").weak().small()).id_salt("usage").show(ui, |ui| {
-                            if attempt.rounds.is_empty() { ui.label(RichText::new("用量未提供 · 费用未知").weak().small()); }
-                            for (index, round) in attempt.rounds.iter().enumerate() {
-                                ui.label(RichText::new(format!("第 {} 轮 · {}", index + 1, usage_label(round))).weak().small());
-                            }
-                            ui.label(RichText::new("按请求保存的用量与价格快照；不同币种不换算，费用不含搜索等额外服务费。缓存读写已包含在输入 token 中。").weak().small());
+                        egui::CollapsingHeader::new(RichText::new("用量详情").weak().small()).id_salt("usage").default_open(false).show(ui, |ui| {
+                            usage::show_rounds(ui, &attempt.rounds);
+                            ui.label(RichText::new("按请求保存的用量与价格快照；费用是 token 估算，不是账单。输入已含缓存，推理属于输出子集，均不重复相加。").weak().small());
                         });
                     }
                     ui.add_space(4.0);
@@ -639,12 +640,6 @@ fn reasoning_label(effort: Option<ReasoningEffort>) -> &'static str {
     }
 }
 
-fn composer_usage(session: &ChatSession) -> String {
-    let Some(attempt) = session.selected().and_then(|c| c.turns.last()).and_then(|t| t.attempts.last()) else { return "用量未知".into(); };
-    if attempt.rounds.is_empty() || attempt.rounds.iter().any(|r| r.usage.is_none()) { return "用量未知".into(); }
-    let total = attempt.rounds.iter().filter_map(|r| r.usage.as_ref()).fold(0u64, |n, u| n.saturating_add(u.input_tokens).saturating_add(u.output_tokens));
-    format!("{total} token")
-}
 
 /// 使用系统文件对话框；取消不会生成错误或附件。
 pub fn pick_attachment() -> Result<Option<std::path::PathBuf>, String> {
@@ -709,16 +704,6 @@ fn tool_summary(event: &lumakit_ai::ToolEvent) -> String {
     format!("{name}{status}")
 }
 
-fn usage_label(round: &lumakit_ai::RoundUsage) -> String {
-    let Some(usage) = &round.usage else { return "用量未提供 · 费用未知".into(); };
-    let tokens = format!("输入 {} · 输出 {} · 缓存读取 {} · 缓存写入 {} token",
-        usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens);
-    match (&round.pricing, round.cost) {
-        (Some(pricing), Some(cost)) if cost.is_finite() && cost >= 0.0 && !pricing.currency.is_empty() =>
-            format!("{tokens} · 费用 {} {cost}", pricing.currency),
-        _ => format!("{tokens} · 费用未知"),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -726,28 +711,6 @@ mod tests {
     use lumakit_ai::{Protocol, chat::{Conversation, History, Turn}};
     use std::sync::Arc;
 
-    #[test]
-    fn usage_display_preserves_actual_counts_snapshot_currency_and_unknown_cost() {
-        use lumakit_ai::{RoundUsage, TokenUsage, model_config::{ModelPricing, PriceTier}};
-        let pricing = |currency: &str| ModelPricing { currency: currency.into(), tiers: vec![PriceTier {
-            min_input_tokens: 0, input: 1.0, output: 2.0, cache_read: None, cache_write: None,
-        }] };
-        let mut round = RoundUsage { usage: Some(TokenUsage { input_tokens: 123, output_tokens: 45,
-            cache_read_tokens: 67, cache_write_tokens: 8 }), pricing: Some(pricing("USD")), cost: Some(0.000000001) };
-        assert_eq!(usage_label(&round), "输入 123 · 输出 45 · 缓存读取 67 · 缓存写入 8 token · 费用 USD 0.000000001");
-        round.pricing = Some(pricing("CNY"));
-        round.cost = Some(0.25);
-        assert!(usage_label(&round).ends_with("费用 CNY 0.25"));
-        round.cost = Some(0.0);
-        assert!(usage_label(&round).ends_with("费用 CNY 0"));
-        round.cost = None;
-        assert!(usage_label(&round).ends_with("费用未知"));
-        round.pricing = None;
-        round.cost = Some(5.0);
-        assert!(usage_label(&round).ends_with("费用未知"));
-        round.usage = None;
-        assert_eq!(usage_label(&round), "用量未提供 · 费用未知");
-    }
 
     fn fixture() -> (tempfile::TempDir, ChatSession, Vec<ModelOption>) {
         let root = tempfile::tempdir().unwrap();
@@ -760,8 +723,8 @@ mod tests {
                     id: "attempt".into(), model: model.clone(), text: markdown, status: TurnStatus::Failed,
                     error: Some("很长的错误信息\n".repeat(300)),
                     rounds: vec![lumakit_ai::RoundUsage { usage: Some(lumakit_ai::TokenUsage {
-                        input_tokens: 123, output_tokens: 45, cache_read_tokens: 67, cache_write_tokens: 8,
-                    }), pricing: None, cost: None }], kind: lumakit_ai::chat::AttemptKind::Reply,
+                        input_tokens: 123, output_tokens: 45, cache_read_tokens: 67, cache_write_tokens: 8, ..Default::default()
+                    }), pricing: None, cost: None, ..Default::default() }], kind: lumakit_ai::chat::AttemptKind::Reply,
                     source_attempt_id: None, parent_attempt_id: None, search: Default::default(), tool_events: Vec::new(), reasoning: Vec::new(), generated: Vec::new(),
                 }], selected_attempt: None }],
             }],
@@ -769,7 +732,7 @@ mod tests {
         let path = root.path().join("chat-history.json");
         lumakit_support::save_versioned(&path, 1, &history).unwrap();
         let session = ChatSession::open(&root.path().join("chat.db"), Arc::new(|| {})).unwrap();
-        let options = vec![ModelOption { model, name: "模型".into(), provider: "来源A".into(), endpoint: "端点A".into() }];
+        let options = vec![ModelOption { model, name: "模型".into(), provider: "来源A".into(), endpoint: "端点A".into(), settings: Default::default(), has_key: false }];
         (root, session, options)
     }
 
@@ -815,7 +778,7 @@ mod tests {
         for diagnostic in ["RAW_ATTEMPT_DIAGNOSTIC", "RAW_GENERATOR_JSON", "RAW_UPSTREAM_ERROR", "private-request-id"] {
             assert!(!text.contains(diagnostic), "{text}");
         }
-        assert!(!text.contains(&usage_label(&attempt.rounds[0])));
+        assert!(!text.contains(&usage::round_label(&attempt.rounds[0])));
         output.drop_without_applying_deltas();
     }
 
@@ -858,7 +821,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut panel = ChatPanel::new("painting");
         let focus = panel.id.with("draft");
-        let painting = ModelOption { model: ModelRef { model: "painting".into(), ..options[0].model.clone() }, name: "绘图".into(), provider: "来源A".into(), endpoint: "端点A".into() };
+        let painting = ModelOption { model: ModelRef { model: "painting".into(), ..options[0].model.clone() }, name: "绘图".into(), provider: "来源A".into(), endpoint: "端点A".into(), settings: ModelSettings { model_type: lumakit_ai::model_config::ModelType::Image, ..Default::default() }, has_key: false };
         session.set_composer(lumakit_ai::chat::ComposerSettings { web_search: true, reasoning: Some(ReasoningEffort::High), image_mode: true, image_model: Some(painting.model.clone()) });
         let mut frame = |session: &ChatSession, options: &[ModelOption], images: &[ModelOption], settings: Option<&ModelSettings>, events| {
             let mut actions = Vec::new();

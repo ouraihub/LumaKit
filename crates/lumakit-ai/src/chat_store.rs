@@ -32,6 +32,10 @@ ALTER TABLE attempts ADD COLUMN tool_events TEXT NOT NULL DEFAULT '[]';
     Migration { version: 4, sql: "
 ALTER TABLE attempts ADD COLUMN reasoning TEXT NOT NULL DEFAULT '[]';
 " },
+    Migration { version: 5, sql: "
+CREATE TABLE usage_requests (request_id TEXT PRIMARY KEY, started_at_ms INTEGER, legacy INTEGER NOT NULL CHECK(legacy IN (0,1)), round TEXT NOT NULL);
+CREATE INDEX usage_requests_time ON usage_requests(started_at_ms);
+" },
 ];
 
 /// 打开共用结构并拒绝未来版本。
@@ -61,8 +65,20 @@ pub(crate) fn open(path: &Path) -> Result<(Connection, History), HistoryError> {
         transaction.execute("INSERT INTO chat_meta(key,value) VALUES('imported','1')", [])?;
         transaction.commit()?;
     }
-    let history = read(&connection)?;
+    let mut history = read(&connection)?;
+    for conversation in &mut history.conversations {
+        for turn in &mut conversation.turns {
+            for attempt in &mut turn.attempts {
+                for (index, round) in attempt.rounds.iter_mut().enumerate() {
+                    if let std::borrow::Cow::Owned(normalized) = crate::usage::normalized(round, &attempt.model, &attempt.id, index) { *round = normalized; }
+                }
+            }
+        }
+    }
     validate(&history)?;
+    let transaction = connection.transaction()?;
+    crate::usage::record(&transaction, &history)?;
+    transaction.commit()?;
     Ok((connection, history))
 }
 
@@ -110,6 +126,7 @@ fn validate_model(model: &crate::ModelRef) -> Result<(), HistoryError> {
 }
 
 fn write(connection: &Connection, history: &History) -> Result<(), HistoryError> {
+    crate::usage::record(connection, history)?;
     connection.execute_batch("CREATE TEMP TABLE IF NOT EXISTS chat_live (kind INTEGER NOT NULL, id TEXT NOT NULL, PRIMARY KEY(kind,id)); DELETE FROM chat_live;")?;
     for (ci, conversation) in history.conversations.iter().enumerate() {
         connection.execute("INSERT INTO chat_live VALUES(0,?1)", [&conversation.id])?;
