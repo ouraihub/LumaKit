@@ -14,6 +14,7 @@ use lumakit_design::{
 /// Renders only declared support; missing/false capability metadata never lights an icon.
 /// Badges are read-only and do not change model selection or request settings.
 pub fn model_capability_badges(settings: &ModelSettings, r: Roles) -> Div {
+    let model = settings.effective_model();
     let mut badges = div().flex().flex_none().items_center().gap(space::S2);
     for (visible, icon, title, foreground, background) in [
         (
@@ -38,7 +39,7 @@ pub fn model_capability_badges(settings: &ModelSettings, r: Roles) -> Div {
             r.feedback_success_subtle,
         ),
         (
-            settings.supports_reasoning(),
+            model.supports_reasoning(),
             IconName::Brain,
             "推理",
             r.feedback_info,

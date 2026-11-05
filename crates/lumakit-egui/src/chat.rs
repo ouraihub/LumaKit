@@ -145,7 +145,7 @@ impl ChatPanel {
             ui.style_mut().interaction.multi_widget_text_select = true;
             ui.spacing_mut().interact_size.y = CONTROL;
             ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
-            let unlocked = !session.busy() && !session.save_failed();
+            let unlocked = session.phase() == lumakit_ai::chat::ChatPhase::Idle && !session.save_failed();
             self.geometry.header = egui::Panel::top(self.id.with("header"))
                 .exact_size(46.0).frame(Frame::new().inner_margin(Margin::symmetric(12, 8)))
                 .show(ui, |ui| {
@@ -369,8 +369,8 @@ impl ChatPanel {
                 ui.menu_button(reasoning_label(*reasoning), |ui| {
                     ui.label(RichText::new("推理强度").weak().small());
                     ui.selectable_value(reasoning, None, "默认");
-                    if let Some(config) = model_settings.and_then(|s| s.reasoning.as_ref()) {
-                        for &effort in &config.efforts { ui.selectable_value(reasoning, Some(effort), reasoning_label(Some(effort))); }
+                    if let Some(settings) = model_settings {
+                        for &effort in settings.effective_model().supported_efforts() { ui.selectable_value(reasoning, Some(effort), reasoning_label(Some(effort))); }
                     }
                 }).response.on_hover_text("推理强度：默认交由服务商处理，不发送指定档位").accessible_name("推理强度");
             });
@@ -556,7 +556,7 @@ impl ChatPanel {
             ui.set_width(420.0_f32.min(ui.ctx().content_rect().width() - 48.0));
             ui.heading("历史对话");
             ui.add(TextEdit::singleline(&mut self.history_search).hint_text("搜索对话"));
-            let unlocked = !session.busy() && !session.save_failed();
+            let unlocked = session.phase() == lumakit_ai::chat::ChatPhase::Idle && !session.save_failed();
             if let Some(id) = self.delete.clone() {
                 ui.label("确定删除这段对话？删除后无法恢复。");
                 ui.horizontal(|ui| {

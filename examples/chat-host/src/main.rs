@@ -111,7 +111,7 @@ impl eframe::App for Host {
                 Err(error) => self.session.report(error),
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.session.can_close() {
+        if ctx.input(|i| i.viewport().close_requested()) && (!self.session.can_close() || self.session.close().is_err()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }

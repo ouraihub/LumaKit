@@ -170,7 +170,7 @@ impl ChatPanel {
             self.draft = source_draft.to_owned().into();
             self.input.update(cx, |state, cx| state.set_value(source_draft, window, cx));
         }
-        self.unlocked = !session.busy() && !session.save_failed() && !self.external_busy;
+        self.unlocked = session.phase() == lumakit_ai::chat::ChatPhase::Idle && !session.save_failed() && !self.external_busy;
         let picked = session.history().model.as_ref();
         let valid_chat = picked.is_some_and(|m| options.iter().any(|o| same_model(m, &o.model)));
         let tools_supported = model_settings.is_none_or(|s| s.supports_tools != Some(false));

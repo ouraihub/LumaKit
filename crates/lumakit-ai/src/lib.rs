@@ -68,8 +68,9 @@ impl AiConnection {
     /// 未配置推理能力、所选强度不在允许列表或模型设置无效时返回错误说明。
     pub fn with_reasoning_effort(mut self, effort: model_config::ReasoningEffort) -> Result<Self, String> {
         self.settings = model_reference::effective_settings(&self.model, self.protocol, &self.settings);
-        let config = self.settings.reasoning.as_ref().ok_or("模型未配置推理能力")?;
-        if !config.efforts.contains(&effort) { return Err("模型未声明该推理强度".into()); }
+        if !self.settings.effective_model().supports_effort(effort) {
+            return Err("模型未声明该推理强度".into());
+        }
         self.settings.reasoning_effort = Some(effort);
         self.settings.validate(self.protocol)?;
         Ok(self)
@@ -245,7 +246,12 @@ pub struct ToolEvent {
 /// 运行中的工具状态及已完成模型轮次；失败前已产生的内容也可即时保存。
 #[derive(Debug, Clone)]
 pub enum RunEvent {
-    /// 同一调用标识的最新状态。
+    /// Tool approval is awaiting a host decision.
+    Waiting {
+        /// True while awaiting approval; false after resolution or cancellation.
+        waiting: bool,
+    },
+    /// Same-call tool state updates.
     Tool(ToolEvent),
     /// 已完成的模型轮次及独立推理块。
     Round {
@@ -382,16 +388,20 @@ impl<H: AiHost> AiRuntime<H> {
                 let output = if let Some(spec) = spec {
                     let approval = self.host.authorize(&call, if spec.requires_approval { Approval::Ask } else { Approval::Allow });
                     let approval = if approval == Approval::Ask {
-                        tokio::select! {
+                        on_event(RunEvent::Waiting { waiting: true });
+                        let approval = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => {
+                                on_event(RunEvent::Waiting { waiting: false });
                                 event.is_error = true;
                                 event.error = Some("工具审批已取消。".into());
                                 on_event(RunEvent::Tool(event));
                                 return Err(AiError::Cancelled);
                             },
                             approval = self.host.approve(call.clone(), cancel.clone()) => approval,
-                        }
+                        };
+                        on_event(RunEvent::Waiting { waiting: false });
+                        approval
                     } else { approval };
                     event.approval = Some(approval);
                     on_event(RunEvent::Tool(event.clone()));

@@ -354,8 +354,8 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
 async fn catalog_reasoning_is_explicit_in_real_http_requests() {
     use lumakit_ai::model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort};
     for (protocol, model) in [
-        (Protocol::OpenAiChat, "gpt-6.1-sol"),
-        (Protocol::OpenAiResponses, "gpt-6.1-sol"),
+        (Protocol::OpenAiChat, "openai/gpt-6.1-sol"),
+        (Protocol::OpenAiResponses, "openai/gpt-6.1-sol"),
         (Protocol::AnthropicMessages, "claude-opus-5-5"),
     ] {
         for (selected, disabled, expected) in [(None, false, None), (Some(ReasoningEffort::Max), false, Some("max")), (None, true, None)] {

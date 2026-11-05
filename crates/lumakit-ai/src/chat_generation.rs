@@ -1,9 +1,9 @@
 //! 绘图工具宿主与有界 OpenAI 兼容图片客户端；不向外部图片 URL 发送密钥。
-use super::{Event, ImageRef};
+use super::{Event, EventSender, ImageRef};
 use crate::{AiConnection, AiError, AiHost, AiRun, Approval, ModelRef, RunRequest, ToolCall, ToolFuture, ToolOutput, ToolSpec, images, model_config::{ModelType, RoundUsage, TokenUsage}};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use std::{io::Write, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc}};
+use std::{io::Write, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -38,7 +38,7 @@ pub(super) struct PaintingHost {
     pub painting: Option<AiConnection>,
     pub painting_model: Option<ModelRef>,
     pub root: PathBuf,
-    pub tx: mpsc::SyncSender<Event>,
+    pub tx: EventSender,
     pub wake: Arc<dyn Fn() + Send + Sync>,
     pub executions: Arc<AtomicUsize>,
 }

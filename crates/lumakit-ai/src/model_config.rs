@@ -156,13 +156,51 @@ pub struct ModelSettings {
     /// 图片模型是否接受参考图进行编辑。
     pub image_edit: bool,
 }
+/// Borrowed view over already-effective model settings.
+///
+/// This keeps capability discovery and request selection on the same settings
+/// without copying or merging persisted metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectiveModel<'a> {
+    settings: &'a ModelSettings,
+}
+impl<'a> EffectiveModel<'a> {
+    /// The settings this view borrows.
+    pub fn settings(self) -> &'a ModelSettings {
+        self.settings
+    }
+    /// Whether the effective settings declare reasoning capability.
+    pub fn supports_reasoning(self) -> bool {
+        self.settings.supports_reasoning()
+    }
+    /// Reasoning efforts declared by the effective settings.
+    pub fn supported_efforts(self) -> &'a [ReasoningEffort] {
+        if self.settings.reasoning_override == Some(false) {
+            &[]
+        } else {
+            self.settings.reasoning.as_ref().map_or(&[], |config| config.efforts.as_slice())
+        }
+    }
+    /// Whether a request effort is supported.
+    pub fn supports_effort(self, requested: ReasoningEffort) -> bool {
+        self.supported_efforts().contains(&requested)
+    }
+    /// Preserve supported efforts and reject unsupported ones; never choose a nearest effort.
+    pub fn clamp_effort(self, requested: Option<ReasoningEffort>) -> Option<ReasoningEffort> {
+        requested.filter(|effort| self.supports_effort(*effort))
+    }
+}
 impl Default for ModelSettings {
     fn default() -> Self { Self { name: None, group_name: None, model_type: ModelType::Chat, context_window: None, max_input: None, max_output: None, reasoning: None, reasoning_effort: None, reasoning_disabled: false, reasoning_override: None, supports_audio: false, supports_video: false, native_web_search: false, pricing: None, pricing_reference: false, supports_tools: None, supports_streaming: true, supports_vision: false, vision_override: None, image_edit: false } }
 }
 impl ModelSettings {
+    /// Borrow this already-effective settings projection.
+    pub fn effective_model(&self) -> EffectiveModel<'_> {
+        EffectiveModel { settings: self }
+    }
     /// 能力声明优先；声明支持不代表已经知道可发送的推理协议或档位。
     pub fn supports_reasoning(&self) -> bool {
-        self.reasoning_override.unwrap_or(!self.reasoning_disabled && self.reasoning.is_some())
+        self.reasoning_override.unwrap_or(self.reasoning.is_some())
     }
     /// 返回显示名，未设置或空白时返回模型标识。
     pub fn display_name<'a>(&'a self, id: &'a str) -> &'a str { self.name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id) }
@@ -291,6 +329,24 @@ impl ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::ModelType;
+    #[test]
+    fn effective_effort_selection_preserves_default_and_rejects_unknown() {
+        let settings = ModelSettings { reasoning: Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::Low, ReasoningEffort::High], budget_tokens: None }), ..Default::default() };
+        let model = settings.effective_model();
+        assert_eq!(model.clamp_effort(None), None);
+        assert_eq!(model.clamp_effort(Some(ReasoningEffort::High)), Some(ReasoningEffort::High));
+        assert_eq!(model.clamp_effort(Some(ReasoningEffort::Medium)), None);
+        assert_eq!(model.supported_efforts(), &[ReasoningEffort::Low, ReasoningEffort::High]);
+    }
+
+    #[test]
+    fn effective_efforts_are_empty_without_reasoning_or_when_overridden_off() {
+        let mut settings = ModelSettings::default();
+        assert!(settings.effective_model().supported_efforts().is_empty());
+        settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::High], budget_tokens: None });
+        settings.reasoning_override = Some(false);
+        assert!(settings.effective_model().supported_efforts().is_empty());
+    }
     #[test]
     fn infer_classifies_catalog_ids_by_name() {
         for (id, kind) in [

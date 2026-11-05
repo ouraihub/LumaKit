@@ -25,10 +25,12 @@ pub struct ModelPickerPreferences {
 }
 
 fn supports_effort(option: &ModelOption, effort: Option<ReasoningEffort>) -> bool {
-    effort.is_none_or(|effort| {
-        crate::model_reference::effective_settings(&option.model.model, option.model.protocol, &option.settings)
-            .reasoning.as_ref().is_some_and(|config| config.efforts.contains(&effort))
-    })
+    let effective = crate::model_reference::effective_settings(
+        &option.model.model,
+        option.model.protocol,
+        &option.settings,
+    );
+    effective.effective_model().clamp_effort(effort) == effort
 }
 
 fn validate_pair(option: &ModelOption, effort: Option<ReasoningEffort>) -> Result<(), String> {

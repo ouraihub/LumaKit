@@ -82,7 +82,7 @@ fn restore(db: &Connection, session: &mut ChatSession) {
 fn catalog_reasoning_validates_and_reconciles_without_saved_capability_override() {
     let root = Directory::new();
     let mut session = open(&root.db());
-    let mut selected = option("gpt-6.1-sol");
+    let mut selected = option("openai/gpt-6.1-sol");
     selected.settings = ModelSettings::default();
     session.select_model_pair(&selected, Some(ReasoningEffort::Max)).unwrap();
     session.set_default_model_pair(&selected, Some(ReasoningEffort::Max)).unwrap();

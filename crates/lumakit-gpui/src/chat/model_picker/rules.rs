@@ -3,20 +3,17 @@ use super::*;
 
 pub(super) fn levels(option: &ModelOption) -> Vec<ReasoningEffort> {
     use ReasoningEffort::*;
-    let Some(config) = &option.settings.reasoning else {
-        return Vec::new();
-    };
+    let model = option.settings.effective_model();
     [None, Minimal, Low, Medium, High, Xhigh, Max]
         .into_iter()
-        .filter(|level| config.efforts.contains(level))
+        .filter(|level| model.supports_effort(*level))
         .collect()
 }
 pub(super) fn effective(
     option: &ModelOption,
     explicit: Option<ReasoningEffort>,
 ) -> Option<ReasoningEffort> {
-    let config = option.settings.reasoning.as_ref()?;
-    explicit.filter(|level| config.efforts.contains(level))
+    option.settings.effective_model().clamp_effort(explicit)
 }
 pub(super) fn word(level: ReasoningEffort) -> &'static str {
     use ReasoningEffort::*;

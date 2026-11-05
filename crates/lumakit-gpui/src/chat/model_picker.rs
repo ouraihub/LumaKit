@@ -113,15 +113,7 @@ impl ChatPanel {
             self.close(window, cx);
             return;
         }
-        let effort = typed.or_else(|| {
-            explicit.filter(|level| {
-                option
-                    .settings
-                    .reasoning
-                    .as_ref()
-                    .is_some_and(|r| r.efforts.contains(level))
-            })
-        });
+        let effort = typed.or_else(|| option.settings.effective_model().clamp_effort(explicit));
         self.emit(
             ChatAction::SelectModelPair {
                 model: option.model.clone(),
