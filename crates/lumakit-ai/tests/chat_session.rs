@@ -1,18 +1,18 @@
 //! 聊天会话状态、流式交互与历史持久化的集成测试。
-use lumakit_ai::{
-    AiConnection, ModelRef, Protocol,
-    chat::ChatSession,
-    history::TurnStatus,
-};
+use lumakit_ai::{AiConnection, ModelRef, Protocol, chat::ChatSession, history::TurnStatus};
 use lumakit_support::new_id;
-use serde_json::{Value, json};
 use rusqlite::Connection;
+use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicUsize, Ordering}, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -24,17 +24,34 @@ impl Directory {
         fs::create_dir_all(&root).unwrap();
         Self(root)
     }
-    fn path(&self) -> PathBuf { self.0.join("chat.db") }
+    fn path(&self) -> PathBuf {
+        self.0.join("chat.db")
+    }
 }
 impl Drop for Directory {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
-fn open(path: &Path) -> ChatSession { ChatSession::open(path, Arc::new(|| {})).unwrap() }
+fn open(path: &Path) -> ChatSession {
+    ChatSession::open(path, Arc::new(|| {})).unwrap()
+}
 fn model(name: &str) -> ModelRef {
-    ModelRef { provider: "provider-id".into(), endpoint: "endpoint-id-not-url".into(), model: name.into(), protocol: Protocol::OpenAiChat }
+    ModelRef {
+        provider: "provider-id".into(),
+        endpoint: "endpoint-id-not-url".into(),
+        model: name.into(),
+        protocol: Protocol::OpenAiChat,
+    }
 }
 fn connection(url: &str, name: &str) -> AiConnection {
-    AiConnection { base_url: url.into(), model: name.into(), protocol: Protocol::OpenAiChat, api_key: None, settings: Default::default() }
+    AiConnection {
+        base_url: url.into(),
+        model: name.into(),
+        protocol: Protocol::OpenAiChat,
+        api_key: None,
+        settings: Default::default(),
+    }
 }
 fn setup(path: &Path) -> ChatSession {
     let mut session = open(path);
@@ -46,25 +63,46 @@ fn wait_until(session: &mut ChatSession, condition: impl Fn(&ChatSession) -> boo
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         session.poll();
-        if condition(session) { return; }
-        assert!(Instant::now() < deadline, "聊天 worker 未及时完成：{}", session.notice());
+        if condition(session) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "聊天 worker 未及时完成：{}",
+            session.notice()
+        );
         thread::sleep(Duration::from_millis(2));
     }
 }
-fn complete(session: &mut ChatSession) { wait_until(session, |session| !session.busy()); }
-fn delta(text: &str) -> String {
-    format!("data: {}\n\n", json!({"choices":[{"delta":{"content":text}}]}))
+fn complete(session: &mut ChatSession) {
+    wait_until(session, |session| !session.busy());
 }
-fn response(text: &str) -> String { format!("{}data: [DONE]\n\n", delta(text)) }
+fn delta(text: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"choices":[{"delta":{"content":text}}]})
+    )
+}
+fn response(text: &str) -> String {
+    format!("{}data: [DONE]\n\n", delta(text))
+}
 
 fn block_writes(path: &Path) {
     Connection::open(path).unwrap().execute_batch("CREATE TRIGGER reject_attempt BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;").unwrap();
 }
 fn restore_writes(path: &Path) {
-    Connection::open(path).unwrap().execute_batch("DROP TRIGGER reject_attempt;").unwrap();
+    Connection::open(path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_attempt;")
+        .unwrap();
 }
 fn count(path: &Path, table: &str) -> i64 {
-    Connection::open(path).unwrap().query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap()
+    Connection::open(path)
+        .unwrap()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
 }
 
 #[test]
@@ -96,15 +134,31 @@ fn toolbar_preferences_are_global_compatible_and_atomic() {
     db.execute_batch("DROP TRIGGER reject_toolbar;").unwrap();
     session.retry_save();
     drop(session);
-    let mut composer: Value = serde_json::from_str(&db.query_row::<String, _, _>("SELECT value FROM chat_meta WHERE key='composer'", [], |row| row.get(0)).unwrap()).unwrap();
+    let mut composer: Value = serde_json::from_str(
+        &db.query_row::<String, _, _>(
+            "SELECT value FROM chat_meta WHERE key='composer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     composer.as_object_mut().unwrap().remove("toolbar");
-    db.execute("UPDATE chat_meta SET value=?1 WHERE key='composer'", [composer.to_string()]).unwrap();
+    db.execute(
+        "UPDATE chat_meta SET value=?1 WHERE key='composer'",
+        [composer.to_string()],
+    )
+    .unwrap();
     let session = open(&path);
     assert_eq!(session.toolbar(), &[NewConversation, WebSearch]);
     assert_eq!(session.selected().unwrap().draft, "保留草稿");
     drop(session);
     composer["toolbar"] = json!(["FutureTool", "GenerateImage", "Attachment", "GenerateImage"]);
-    db.execute("UPDATE chat_meta SET value=?1 WHERE key='composer'", [composer.to_string()]).unwrap();
+    db.execute(
+        "UPDATE chat_meta SET value=?1 WHERE key='composer'",
+        [composer.to_string()],
+    )
+    .unwrap();
     let mut session = open(&path);
     assert_eq!(session.toolbar(), &[GenerateImage, Attachment]);
     assert_eq!(session.selected().unwrap().draft, "保留草稿");
@@ -114,15 +168,27 @@ fn toolbar_preferences_are_global_compatible_and_atomic() {
 }
 
 // 真 HTTP 回环：读取宿主实际发送的正文，保持响应可覆盖停止和缺失结束帧。
-fn server(responses: Vec<(String, bool)>) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+fn server(
+    responses: Vec<(String, bool)>,
+) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
     server_path(responses, "/v1/chat/completions")
 }
 
-fn server_path(responses: Vec<(String, bool)>, path: &'static str) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
-    server_steps(responses.into_iter().map(|(body, hold)| (path, 200, body, hold)).collect())
+fn server_path(
+    responses: Vec<(String, bool)>,
+    path: &'static str,
+) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+    server_steps(
+        responses
+            .into_iter()
+            .map(|(body, hold)| (path, 200, body, hold))
+            .collect(),
+    )
 }
 
-fn server_steps(responses: Vec<(&'static str, u16, String, bool)>) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+fn server_steps(
+    responses: Vec<(&'static str, u16, String, bool)>,
+) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -141,8 +207,12 @@ fn server_steps(responses: Vec<(&'static str, u16, String, bool)>) -> (String, m
                 }
             };
             socket.set_nonblocking(false).unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let (start, length) = loop {
                 let mut bytes = [0; 4096];
@@ -152,11 +222,19 @@ fn server_steps(responses: Vec<(&'static str, u16, String, bool)>) -> (String, m
                 if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request[..end]);
                     assert!(headers.starts_with(&format!("POST {path} HTTP/1.1")));
-                    assert!(headers.to_ascii_lowercase().contains("user-agent: lumakit/"));
-                    let length = headers.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
-                    }).unwrap();
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("user-agent: lumakit/")
+                    );
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
                     break (end + 4, length);
                 }
             };
@@ -166,9 +244,16 @@ fn server_steps(responses: Vec<(&'static str, u16, String, bool)>) -> (String, m
                 assert_ne!(count, 0);
                 request.extend_from_slice(&bytes[..count]);
             }
-            tx.send(serde_json::from_slice(&request[start..start + length]).unwrap()).unwrap();
-            let header = format!("HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + if hold { 100 } else { 0 });
-            if socket.write_all(header.as_bytes()).is_ok() && socket.write_all(body.as_bytes()).is_ok() && hold {
+            tx.send(serde_json::from_slice(&request[start..start + length]).unwrap())
+                .unwrap();
+            let header = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len() + if hold { 100 } else { 0 }
+            );
+            if socket.write_all(header.as_bytes()).is_ok()
+                && socket.write_all(body.as_bytes()).is_ok()
+                && hold
+            {
                 let mut byte = [0];
                 let _ = socket.read(&mut byte);
             }
@@ -179,7 +264,10 @@ fn server_steps(responses: Vec<(&'static str, u16, String, bool)>) -> (String, m
 
 #[test]
 fn composer_attachments_restart_retry_and_wire_controls() {
-    use lumakit_ai::{chat::ComposerSettings, model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort}};
+    use lumakit_ai::{
+        chat::ComposerSettings,
+        model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort},
+    };
     let root = Directory::new();
     let path = root.path();
     let text = root.0.join("source.rs");
@@ -191,11 +279,24 @@ fn composer_attachments_restart_retry_and_wire_controls() {
     session.add_attachment(&text).unwrap();
     session.add_attachment(&image).unwrap();
     let attachment_id = session.draft_attachments()[1].id.clone();
-    assert_eq!(fs::read(session.media_path(&attachment_id).unwrap()).unwrap(), b"\x89PNG\r\n\x1a\n");
-    let metadata: String = Connection::open(&path).unwrap().query_row("SELECT value FROM chat_meta WHERE key='composer'", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        fs::read(session.media_path(&attachment_id).unwrap()).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
+    let metadata: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM chat_meta WHERE key='composer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(!metadata.contains("iVBORw0KGgo="));
     assert!(metadata.contains("storage_key"));
-    session.set_composer(ComposerSettings { reasoning: Some(ReasoningEffort::High), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        reasoning: Some(ReasoningEffort::High),
+        ..Default::default()
+    });
     drop(session);
     fs::remove_file(text).unwrap();
     fs::remove_file(image).unwrap();
@@ -206,8 +307,20 @@ fn composer_attachments_restart_retry_and_wire_controls() {
     fs::write(&media, b"invalid!").unwrap();
     assert!(session.media_path(&attachment_id).is_err());
     fs::write(&media, b"\x89PNG\r\n\x1a\n").unwrap();
-    let (url, requests, worker) = server(vec![(response("回答"), false), (response("重试回答"), false)]);
-    let connect = || { let mut c = connection(&url, "source"); c.settings.supports_vision = true; c.settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::Low, ReasoningEffort::High], budget_tokens: None }); c };
+    let (url, requests, worker) = server(vec![
+        (response("回答"), false),
+        (response("重试回答"), false),
+    ]);
+    let connect = || {
+        let mut c = connection(&url, "source");
+        c.settings.supports_vision = true;
+        c.settings.reasoning = Some(ReasoningConfig {
+            dialect: ReasoningDialect::OpenAi,
+            efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+            budget_tokens: None,
+        });
+        c
+    };
     session.send(connection(&url, "source"));
     assert!(!session.busy());
     assert_eq!(session.draft_attachments().len(), 2);
@@ -215,13 +328,30 @@ fn composer_attachments_restart_retry_and_wire_controls() {
     complete(&mut session);
     let first = requests.recv().unwrap();
     assert_eq!(first["reasoning_effort"], "high");
-    assert!(first["messages"][0]["content"][0]["text"].as_str().unwrap().contains("实际附件内容"));
-    assert!(first["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert!(
+        first["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("实际附件内容")
+    );
+    assert!(
+        first["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
     let turn_id = session.selected().unwrap().turns[0].id.clone();
     assert_eq!(session.turn_attachments(&turn_id).len(), 2);
     assert!(session.media_path(&attachment_id).unwrap().is_file());
-    let copy = session.copy_conversation(&session.selected().unwrap().id.clone()).unwrap();
-    assert_eq!(session.turn_attachments(&session.selected().unwrap().turns[0].id).len(), 2);
+    let copy = session
+        .copy_conversation(&session.selected().unwrap().id.clone())
+        .unwrap();
+    assert_eq!(
+        session
+            .turn_attachments(&session.selected().unwrap().turns[0].id)
+            .len(),
+        2
+    );
     session.delete_conversation(&copy);
     drop(session);
     let mut session = open(&path);
@@ -235,10 +365,17 @@ fn composer_attachments_restart_retry_and_wire_controls() {
 
     let (url, requests, worker) = server_path(vec![("data: {\"type\":\"response.output_text.delta\",\"delta\":\"联网回答\"}\n\ndata: {\"type\":\"response.completed\"}\n\n".into(), false)], "/v1/responses");
     session.new_conversation();
-    session.select_model(ModelRef { protocol: Protocol::OpenAiResponses, ..model("search") });
+    session.select_model(ModelRef {
+        protocol: Protocol::OpenAiResponses,
+        ..model("search")
+    });
     session.set_draft("搜索问题".into());
-    session.set_composer(ComposerSettings { web_search: true, ..Default::default() });
-    let mut c = connection(&url, "search"); c.protocol = Protocol::OpenAiResponses;
+    session.set_composer(ComposerSettings {
+        web_search: true,
+        ..Default::default()
+    });
+    let mut c = connection(&url, "search");
+    c.protocol = Protocol::OpenAiResponses;
     session.send(c);
     complete(&mut session);
     assert_eq!(requests.recv().unwrap()["tools"][0]["type"], "web_search");
@@ -252,22 +389,44 @@ fn painting_connection(url: &str, name: &str) -> AiConnection {
 }
 fn tool_calls(calls: &[(&str, Value)]) -> String {
     let calls: Vec<_> = calls.iter().enumerate().map(|(index, (id, args))| json!({"index":index,"id":id,"function":{"name":"generate_image","arguments":args.to_string()}})).collect();
-    format!("data: {}\n\ndata: [DONE]\n\n", json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]}))
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})
+    )
 }
-fn image_response() -> String { json!({"data":[{"b64_json":"iVBORw0KGgo="}],"usage":{"input_tokens":12,"output_tokens":24}}).to_string() }
+fn image_response() -> String {
+    json!({"data":[{"b64_json":"iVBORw0KGgo="}],"usage":{"input_tokens":12,"output_tokens":24}})
+        .to_string()
+}
 
 #[test]
 fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
-    use lumakit_ai::{chat::ComposerSettings, model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort}};
+    use lumakit_ai::{
+        chat::ComposerSettings,
+        model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort},
+    };
     let root = Directory::new();
     let path = root.path();
     let mut session = setup(&path);
     let (url, requests, worker) = server_steps(vec![
         ("/v1/chat/completions", 200, response("之前的回答"), false),
-        ("/v1/chat/completions", 200, tool_calls(&[("paint-1", json!({"prompt":"模型整理的完整画面🙂","size":"1536x1024"}))]), false),
+        (
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[(
+                "paint-1",
+                json!({"prompt":"模型整理的完整画面🙂","size":"1536x1024"}),
+            )]),
+            false,
+        ),
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/chat/completions", 200, response("已生成图片"), false),
-        ("/v1/chat/completions", 200, tool_calls(&[("retry-1", json!({"prompt":"重试画面"}))]), false),
+        (
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[("retry-1", json!({"prompt":"重试画面"}))]),
+            false,
+        ),
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/chat/completions", 200, response("重新生成完成"), false),
         ("/v1/chat/completions", 200, response("继续对话"), false),
@@ -276,40 +435,76 @@ fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
     session.send(connection(&url, "source"));
     complete(&mut session);
     requests.recv().unwrap();
-    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("painting-original")), reasoning: Some(ReasoningEffort::High), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        image_mode: true,
+        image_model: Some(model("painting-original")),
+        reasoning: Some(ReasoningEffort::High),
+        ..Default::default()
+    });
     session.set_draft("画一张图".into());
     assert_eq!(session.request_model(false).unwrap().model, "source");
     session.send(connection(&url, "source"));
     assert!(!session.busy());
     assert!(session.notice().contains("send_with_painting"));
-    let chat = || { let mut c = connection(&url, "source"); c.settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::Low, ReasoningEffort::High], budget_tokens: None }); c };
+    let chat = || {
+        let mut c = connection(&url, "source");
+        c.settings.reasoning = Some(ReasoningConfig {
+            dialect: ReasoningDialect::OpenAi,
+            efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+            budget_tokens: None,
+        });
+        c
+    };
     session.send_with_painting(chat(), painting_connection(&url, "painting-original"));
     complete(&mut session);
     let first = requests.recv().unwrap();
     let painted = requests.recv().unwrap();
     let continuation = requests.recv().unwrap();
-    assert_eq!(first["messages"], json!([{"role":"user","content":"之前的问题"},{"role":"assistant","content":"之前的回答"},{"role":"user","content":"画一张图"}]));
+    assert_eq!(
+        first["messages"],
+        json!([{"role":"user","content":"之前的问题"},{"role":"assistant","content":"之前的回答"},{"role":"user","content":"画一张图"}])
+    );
     assert_eq!(first["tools"][0]["function"]["name"], "generate_image");
     assert_eq!(first["reasoning_effort"], "high");
-    assert_eq!(painted, json!({"model":"painting-original","prompt":"模型整理的完整画面🙂","size":"1536x1024","n":1}));
+    assert_eq!(
+        painted,
+        json!({"model":"painting-original","prompt":"模型整理的完整画面🙂","size":"1536x1024","n":1})
+    );
     assert!(painted.get("response_format").is_none());
     assert_eq!(continuation["messages"][4]["role"], "tool");
-    assert!(continuation["messages"][4]["content"].as_str().unwrap().contains("Generated 1 image(s)."));
+    assert!(
+        continuation["messages"][4]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Generated 1 image(s).")
+    );
     let attempt = &session.selected().unwrap().turns[1].attempts[0];
     assert_eq!(attempt.model.model, "source");
     assert_eq!(attempt.text, "已生成图片");
-    assert_eq!(attempt.tool_events[0].approval, Some(lumakit_ai::Approval::Allow));
+    assert_eq!(
+        attempt.tool_events[0].approval,
+        Some(lumakit_ai::Approval::Allow)
+    );
     assert!(!attempt.tool_events[0].is_error);
     assert_eq!(attempt.rounds.len(), 3);
     let id = attempt.generated[0].id.clone();
-    assert_eq!(fs::read(session.media_path(&id).unwrap()).unwrap(), b"\x89PNG\r\n\x1a\n");
+    assert_eq!(
+        fs::read(session.media_path(&id).unwrap()).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
     drop(session);
     let mut session = open(&path);
     assert!(session.media_path(&id).unwrap().is_file());
     session.select_model(model("different-chat"));
-    session.set_composer(ComposerSettings { image_model: Some(model("different-painting")), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        image_model: Some(model("different-painting")),
+        ..Default::default()
+    });
     assert_eq!(session.request_model(true).unwrap().model, "source");
-    assert_eq!(session.request_painting_model(true).unwrap().unwrap().model, "painting-original");
+    assert_eq!(
+        session.request_painting_model(true).unwrap().unwrap().model,
+        "painting-original"
+    );
     session.retry_with_painting(chat(), painting_connection(&url, "painting-original"));
     complete(&mut session);
     let retry = requests.recv().unwrap();
@@ -347,13 +542,22 @@ fn attachment_limits_and_save_failure_preserve_draft() {
     session.retry_save();
     let original = session.composer().web_search;
     Connection::open(&path).unwrap().execute_batch("CREATE TRIGGER reject_composer BEFORE UPDATE ON chat_meta WHEN NEW.key='composer' BEGIN SELECT RAISE(ABORT, 'injected composer failure'); END;").unwrap();
-    session.set_composer(lumakit_ai::chat::ComposerSettings { web_search: !original, ..Default::default() });
+    session.set_composer(lumakit_ai::chat::ComposerSettings {
+        web_search: !original,
+        ..Default::default()
+    });
     assert!(session.save_failed());
     assert_eq!(session.composer().web_search, original);
     assert_eq!(session.draft_attachments().len(), 1);
-    Connection::open(&path).unwrap().execute_batch("DROP TRIGGER reject_composer;").unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_composer;")
+        .unwrap();
     session.retry_save();
-    session.set_composer(lumakit_ai::chat::ComposerSettings { web_search: true, ..Default::default() });
+    session.set_composer(lumakit_ai::chat::ComposerSettings {
+        web_search: true,
+        ..Default::default()
+    });
     session.send(connection("http://127.0.0.1:1/v1", "source"));
     assert!(!session.busy());
     assert!(session.notice().contains("不支持原生联网搜索"));
@@ -365,29 +569,78 @@ fn painting_invalid_failed_duplicate_and_cap_results_never_fake_success() {
     use lumakit_ai::chat::ComposerSettings;
     let root = Directory::new();
     let mut session = setup(&root.path());
-    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        image_mode: true,
+        image_model: Some(model("image")),
+        ..Default::default()
+    });
     session.set_draft("绘图失败".into());
     let (url, requests, worker) = server_steps(vec![
-        ("/v1/chat/completions", 200, tool_calls(&[("invalid", json!({"prompt":"x","size":"bad"})), ("failed", json!({"prompt":"画面"}))]), false),
-        ("/v1/images/generations", 400, "不支持的绘图参数".into(), false),
-        ("/v1/chat/completions", 200, tool_calls(&[("failed", json!({"prompt":"重复不得执行"})), ("cap", json!({"prompt":"超过上限不得执行"}))]), false),
-        ("/v1/chat/completions", 200, response("生成失败，未产生图片"), false),
+        (
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[
+                ("invalid", json!({"prompt":"x","size":"bad"})),
+                ("failed", json!({"prompt":"画面"})),
+            ]),
+            false,
+        ),
+        (
+            "/v1/images/generations",
+            400,
+            "不支持的绘图参数".into(),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[
+                ("failed", json!({"prompt":"重复不得执行"})),
+                ("cap", json!({"prompt":"超过上限不得执行"})),
+            ]),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            200,
+            response("生成失败，未产生图片"),
+            false,
+        ),
     ]);
-    session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+    session.send_with_painting(
+        connection(&url, "source"),
+        painting_connection(&url, "image"),
+    );
     complete(&mut session);
     let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
     assert_eq!(sent[1]["prompt"], "画面");
     let results = sent[2]["messages"].as_array().unwrap();
     assert!(results[2]["content"].as_str().unwrap().contains("参数无效"));
     assert!(results[3]["content"].as_str().unwrap().contains("HTTP 400"));
-    assert!(results[3]["content"].as_str().unwrap().contains("不要自动重试"));
+    assert!(
+        results[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("不要自动重试")
+    );
     let conversation = session.selected().unwrap();
     let attempt = &conversation.turns[0].attempts[0];
     assert_eq!(attempt.status, TurnStatus::Completed);
     assert!(attempt.generated.is_empty());
     assert_eq!(attempt.tool_events.len(), 3);
-    assert!(attempt.tool_events.iter().all(|event| event.is_error && event.error.is_some() && event.result.is_some()));
-    assert!(attempt.tool_events[2].result.as_ref().unwrap().contains("最多执行两次"));
+    assert!(
+        attempt
+            .tool_events
+            .iter()
+            .all(|event| event.is_error && event.error.is_some() && event.result.is_some())
+    );
+    assert!(
+        attempt.tool_events[2]
+            .result
+            .as_ref()
+            .unwrap()
+            .contains("最多执行两次")
+    );
     worker.join().unwrap();
 }
 
@@ -445,7 +698,10 @@ fn preflight_save_failure_rolls_back_and_never_sends_or_duplicates() {
     block_writes(&path);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    session.send(connection(&format!("http://{}/v1", listener.local_addr().unwrap()), "source"));
+    session.send(connection(
+        &format!("http://{}/v1", listener.local_addr().unwrap()),
+        "source",
+    ));
     assert!(session.save_failed());
     assert!(!session.busy());
     assert!(listener.accept().is_err());
@@ -465,7 +721,10 @@ fn preflight_save_failure_rolls_back_and_never_sends_or_duplicates() {
     let (url, requests, worker) = server(vec![(response("回答"), false)]);
     session.send(connection(&url, "source"));
     complete(&mut session);
-    assert_eq!(requests.recv().unwrap()["messages"][0]["content"], "原始问题");
+    assert_eq!(
+        requests.recv().unwrap()["messages"][0]["content"],
+        "原始问题"
+    );
     assert_eq!(session.selected().unwrap().turns.len(), 1);
     assert_eq!(session.selected().unwrap().turns[0].attempts.len(), 1);
     worker.join().unwrap();
@@ -476,8 +735,10 @@ fn source_retry_override_and_multi_turn_context_use_real_connections() {
     let root = Directory::new();
     let mut session = setup(&root.path());
     let (url, requests, worker) = server(vec![
-        (response("旧回答"), false), (response("源模型重答"), false),
-        (response("换模型重答"), false), (response("下一轮"), false),
+        (response("旧回答"), false),
+        (response("源模型重答"), false),
+        (response("换模型重答"), false),
+        (response("下一轮"), false),
     ]);
     session.set_draft("第一问".into());
     session.send(connection(&url, "source"));
@@ -500,11 +761,14 @@ fn source_retry_override_and_multi_turn_context_use_real_connections() {
     assert_eq!(sent[2]["model"], "override");
     assert_eq!(sent[1]["messages"].as_array().unwrap().len(), 1);
     assert_eq!(sent[2]["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(sent[3]["messages"], json!([
-        {"role":"user","content":"第一问"},
-        {"role":"assistant","content":"换模型重答"},
-        {"role":"user","content":"第二问"},
-    ]));
+    assert_eq!(
+        sent[3]["messages"],
+        json!([
+            {"role":"user","content":"第一问"},
+            {"role":"assistant","content":"换模型重答"},
+            {"role":"user","content":"第二问"},
+        ])
+    );
     assert_eq!(session.selected().unwrap().turns[0].attempts.len(), 3);
     worker.join().unwrap();
 }
@@ -542,7 +806,11 @@ fn terminal_save_failure_preserves_answer_and_guards_all_mutations() {
     session.retry_save();
     assert!(!session.save_failed());
     let database = Connection::open(&path).unwrap();
-    let (text, status): (String, String) = database.query_row("SELECT text,status FROM attempts", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    let (text, status): (String, String) = database
+        .query_row("SELECT text,status FROM attempts", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
     assert_eq!(text, "完整终态内容");
     assert_eq!(status, "completed");
     worker.join().unwrap();
@@ -559,7 +827,9 @@ fn cancelled_and_missing_terminal_attempts_do_not_enter_context() {
     ]);
     session.set_draft("取消的问题".into());
     session.send(connection(&url, "source"));
-    wait_until(&mut session, |s| !s.selected().unwrap().turns[0].attempts[0].text.is_empty());
+    wait_until(&mut session, |s| {
+        !s.selected().unwrap().turns[0].attempts[0].text.is_empty()
+    });
     let snapshot = serde_json::to_value(session.history()).unwrap();
     session.set_draft("busy blocked".into());
     session.select_model(model("blocked"));
@@ -568,12 +838,21 @@ fn cancelled_and_missing_terminal_attempts_do_not_enter_context() {
     assert_eq!(serde_json::to_value(session.history()).unwrap(), snapshot);
     assert!(!session.can_close());
     complete(&mut session);
-    assert_eq!(session.selected().unwrap().turns[0].attempts[0].status, TurnStatus::Cancelled);
-    assert_eq!(session.selected().unwrap().turns[0].attempts[0].text, "取消前的部分内容");
+    assert_eq!(
+        session.selected().unwrap().turns[0].attempts[0].status,
+        TurnStatus::Cancelled
+    );
+    assert_eq!(
+        session.selected().unwrap().turns[0].attempts[0].text,
+        "取消前的部分内容"
+    );
     session.set_draft("失败的问题".into());
     session.send(connection(&url, "source"));
     complete(&mut session);
-    assert_eq!(session.selected().unwrap().turns[1].attempts[0].status, TurnStatus::Failed);
+    assert_eq!(
+        session.selected().unwrap().turns[1].attempts[0].status,
+        TurnStatus::Failed
+    );
     session.set_draft("新的问题".into());
     session.send(connection(&url, "source"));
     complete(&mut session);
@@ -612,7 +891,13 @@ fn drop_drains_a_full_bounded_queue_and_releases_lock() {
     let path = root.path();
     let wakes = Arc::new(AtomicUsize::new(0));
     let wake_counter = wakes.clone();
-    let mut session = ChatSession::open(&path, Arc::new(move || { wake_counter.fetch_add(1, Ordering::Relaxed); })).unwrap();
+    let mut session = ChatSession::open(
+        &path,
+        Arc::new(move || {
+            wake_counter.fetch_add(1, Ordering::Relaxed);
+        }),
+    )
+    .unwrap();
     session.new_conversation();
     session.select_model(model("source"));
     let (url, requests, worker) = server(vec![(response(&"x".repeat(1024 * 1024)), false)]);
@@ -669,7 +954,10 @@ fn mismatched_connection_never_accepts_a_turn() {
 fn empty_terminal_reply_fails_and_does_not_poison_next_context() {
     let root = Directory::new();
     let mut session = setup(&root.path());
-    let (url, requests, worker) = server(vec![(response(" \n"), false), (response("正常回答"), false)]);
+    let (url, requests, worker) = server(vec![
+        (response(" \n"), false),
+        (response("正常回答"), false),
+    ]);
     session.set_draft("空回答的问题".into());
     session.send(connection(&url, "source"));
     complete(&mut session);
@@ -681,8 +969,14 @@ fn empty_terminal_reply_fails_and_does_not_poison_next_context() {
     complete(&mut session);
     requests.recv().unwrap();
     let second = requests.recv().unwrap();
-    assert_eq!(second["messages"], json!([{"role":"user","content":"继续提问"}]));
-    assert_eq!(session.selected().unwrap().turns[1].attempts[0].status, TurnStatus::Completed);
+    assert_eq!(
+        second["messages"],
+        json!([{"role":"user","content":"继续提问"}])
+    );
+    assert_eq!(
+        session.selected().unwrap().turns[1].attempts[0].status,
+        TurnStatus::Completed
+    );
     worker.join().unwrap();
 }
 
@@ -707,18 +1001,50 @@ fn migration_preserves_order_and_empty_database_does_not_revive_backup() {
     let bytes = serde_json::to_vec(&legacy_history()).unwrap();
     fs::write(&legacy, &bytes).unwrap();
     let mut session = open(&path);
-    assert_eq!(session.history().conversations.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["c2", "c1"]);
+    assert_eq!(
+        session
+            .history()
+            .conversations
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["c2", "c1"]
+    );
     assert_eq!(session.history().model.as_ref().unwrap().model, "chosen");
     let conversation = session.selected().unwrap();
-    assert_eq!(conversation.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["t2", "t1"]);
-    assert_eq!(conversation.turns[0].attempts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["a2", "a1"]);
+    assert_eq!(
+        conversation
+            .turns
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>(),
+        ["t2", "t1"]
+    );
+    assert_eq!(
+        conversation.turns[0]
+            .attempts
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a2", "a1"]
+    );
     assert_eq!(conversation.turns[0].attempts[1].model.model, "other");
     let database = Connection::open(&path).unwrap();
-    let rowid: i64 = database.query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| row.get(0)).unwrap();
+    let rowid: i64 = database
+        .query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
     database.execute_batch("CREATE TRIGGER no_reinsert BEFORE INSERT ON attempts WHEN NOT EXISTS(SELECT 1 FROM attempts WHERE id=NEW.id) BEGIN SELECT RAISE(ABORT,'unchanged answer was reinserted'); END;").unwrap();
     session.set_draft("新草稿".into());
     assert!(session.can_close());
-    assert_eq!(database.query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| row.get::<_, i64>(0)).unwrap(), rowid);
+    assert_eq!(
+        database
+            .query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        rowid
+    );
     session.delete_conversation("c2");
     session.delete_conversation("c1");
     assert_eq!(count(&path, "attempts"), 0);
@@ -735,7 +1061,11 @@ fn empty_first_open_records_import_decision() {
     let root = Directory::new();
     let path = root.path();
     drop(open(&path));
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&legacy_history()).unwrap()).unwrap();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&legacy_history()).unwrap(),
+    )
+    .unwrap();
     assert!(open(&path).history().conversations.is_empty());
 }
 
@@ -775,8 +1105,19 @@ fn corrupt_legacy_and_future_database_are_not_silently_replaced() {
     let database = Connection::open(&path).unwrap();
     database.execute_batch("PRAGMA user_version=3; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('保留');").unwrap();
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
-    assert_eq!(database.query_row("SELECT value FROM future_data", [], |row| row.get::<_, String>(0)).unwrap(), "保留");
-    assert_eq!(database.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+    assert_eq!(
+        database
+            .query_row("SELECT value FROM future_data", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "保留"
+    );
+    assert_eq!(
+        database
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -790,14 +1131,27 @@ fn usage_round_snapshots_survive_database_round_trip() {
         {"usage":null,"pricing":null,"cost":null}
     ]);
     history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] = rounds.clone();
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&history).unwrap(),
+    )
+    .unwrap();
     drop(open(&path));
     let session = open(&path);
     let stored = &session.selected().unwrap().turns[0].attempts[0].rounds;
     for (index, round) in stored.iter().enumerate() {
-        assert_eq!(round.usage, serde_json::from_value(rounds[index]["usage"].clone()).unwrap());
-        assert_eq!(serde_json::to_value(&round.pricing).unwrap(), rounds[index]["pricing"]);
-        assert_eq!(serde_json::to_value(&round.cost).unwrap(), rounds[index]["cost"]);
+        assert_eq!(
+            round.usage,
+            serde_json::from_value(rounds[index]["usage"].clone()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&round.pricing).unwrap(),
+            rounds[index]["pricing"]
+        );
+        assert_eq!(
+            serde_json::to_value(&round.cost).unwrap(),
+            rounds[index]["cost"]
+        );
         assert_eq!(round.request_id, format!("legacy:a2:{index}"));
         assert!(round.legacy);
         assert_eq!(round.started_at_ms, None);
@@ -809,8 +1163,13 @@ fn failed_attempt_preserves_prior_rounds_and_reopens_as_failed() {
     let path = root.path();
     let mut history = legacy_history();
     history["value"]["conversations"][0]["turns"][0]["attempts"][0]["status"] = json!("running");
-    history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] = json!([{"usage":null,"pricing":null,"cost":null}]);
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] =
+        json!([{"usage":null,"pricing":null,"cost":null}]);
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&history).unwrap(),
+    )
+    .unwrap();
     let session = open(&path);
     let attempt = &session.selected().unwrap().turns[0].attempts[0];
     assert_eq!(attempt.status, TurnStatus::Failed);
@@ -826,8 +1185,14 @@ fn invalid_import_identifiers_and_model_sources_never_commit() {
         ("/value/conversations/0/turns/1/id", json!("t2")),
         ("/value/conversations/0/turns/0/attempts/0/id", json!("\n")),
         ("/value/conversations/0/turns/0/attempts/1/id", json!("a2")),
-        ("/value/conversations/0/turns/0/attempts/0/model/provider", json!("")),
-        ("/value/conversations/0/turns/0/attempts/0/model/endpoint", json!(" ")),
+        (
+            "/value/conversations/0/turns/0/attempts/0/model/provider",
+            json!(""),
+        ),
+        (
+            "/value/conversations/0/turns/0/attempts/0/model/endpoint",
+            json!(" "),
+        ),
         ("/value/model/model", json!("")),
     ];
     for (pointer, value) in changes {
@@ -838,7 +1203,10 @@ fn invalid_import_identifiers_and_model_sources_never_commit() {
         *history.pointer_mut(pointer).unwrap() = value;
         let bytes = serde_json::to_vec(&history).unwrap();
         fs::write(&legacy, &bytes).unwrap();
-        assert!(ChatSession::open(&path, Arc::new(|| {})).is_err(), "{pointer}");
+        assert!(
+            ChatSession::open(&path, Arc::new(|| {})).is_err(),
+            "{pointer}"
+        );
         assert_eq!(count(&path, "chat_meta"), 0, "{pointer}");
         assert_eq!(count(&path, "conversations"), 0, "{pointer}");
         assert_eq!(count(&path, "turns"), 0, "{pointer}");
@@ -853,7 +1221,11 @@ fn legacy_stale_selection_is_repaired_without_discarding_history() {
     let path = root.path();
     let mut history = legacy_history();
     history["value"]["selected"] = json!("removed");
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&history).unwrap(),
+    )
+    .unwrap();
     let session = open(&path);
     assert_eq!(session.history().conversations.len(), 2);
     assert_eq!(session.selected().unwrap().id, "c2");
@@ -869,9 +1241,16 @@ fn streamed_usage_and_original_price_survive_request_and_reopen() {
     let body = format!("{}data: {usage}\n\ndata: [DONE]\n\n", delta("含用量回答"));
     let (url, requests, worker) = server(vec![(body, false)]);
     let mut connection = connection(&url, "source");
-    let pricing = ModelPricing { currency: "CNY".into(), tiers: vec![PriceTier {
-        min_input_tokens: 0, input: 1.0, output: 2.0, cache_read: Some(0.25), cache_write: Some(1.25),
-    }] };
+    let pricing = ModelPricing {
+        currency: "CNY".into(),
+        tiers: vec![PriceTier {
+            min_input_tokens: 0,
+            input: 1.0,
+            output: 2.0,
+            cache_read: Some(0.25),
+            cache_write: Some(1.25),
+        }],
+    };
     connection.settings.pricing = Some(pricing.clone());
     session.set_draft("用量问题".into());
     session.send(connection);
@@ -883,14 +1262,25 @@ fn streamed_usage_and_original_price_survive_request_and_reopen() {
     assert_eq!(attempt.rounds.len(), 1);
     let round = &attempt.rounds[0];
     let usage = round.usage.as_ref().unwrap();
-    assert_eq!((usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens), (123, 45, 67, 0));
+    assert_eq!(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens
+        ),
+        (123, 45, 67, 0)
+    );
     assert_eq!(round.pricing.as_ref(), Some(&pricing));
     assert_eq!(round.cost, pricing.cost(usage));
     let saved = serde_json::to_value(&attempt.rounds).unwrap();
     assert!(attempt.reasoning.is_empty());
     drop(session);
     let reopened = open(&path);
-    assert_eq!(serde_json::to_value(&reopened.selected().unwrap().turns[0].attempts[0].rounds).unwrap(), saved);
+    assert_eq!(
+        serde_json::to_value(&reopened.selected().unwrap().turns[0].attempts[0].rounds).unwrap(),
+        saved
+    );
 }
 #[test]
 fn selected_attempt_and_candidate_mutations_survive_restart() {
@@ -906,12 +1296,28 @@ fn selected_attempt_and_candidate_mutations_survive_restart() {
     let turn = session.selected().unwrap().turns[0].id.clone();
     let first = session.selected().unwrap().turns[0].attempts[0].id.clone();
     assert!(session.select_attempt(&conversation, &turn, &first).is_ok());
-    assert!(session.edit_attempt(&conversation, &turn, &first, "首答", "编辑后").is_ok());
-    assert!(session.edit_attempt(&conversation, &turn, &first, "首答", "冲突").is_err());
+    assert!(
+        session
+            .edit_attempt(&conversation, &turn, &first, "首答", "编辑后")
+            .is_ok()
+    );
+    assert!(
+        session
+            .edit_attempt(&conversation, &turn, &first, "首答", "冲突")
+            .is_err()
+    );
     drop(session);
     let reopened = open(&path);
-    assert_eq!(reopened.selected().unwrap().turns[0].selected_attempt.as_deref(), Some(first.as_str()));
-    assert_eq!(reopened.selected().unwrap().turns[0].attempts[0].text, "编辑后");
+    assert_eq!(
+        reopened.selected().unwrap().turns[0]
+            .selected_attempt
+            .as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        reopened.selected().unwrap().turns[0].attempts[0].text,
+        "编辑后"
+    );
 }
 #[test]
 fn search_sources_and_terminal_states_survive_restart() {
@@ -926,17 +1332,33 @@ fn search_sources_and_terminal_states_survive_restart() {
     let conversation = session.selected().unwrap().id.clone();
     let turn = session.selected().unwrap().turns[0].id.clone();
     let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
-    session.search_start(&conversation, &turn, &attempt, "查询", "provider").unwrap();
-    session.search_result(&conversation, &turn, &attempt, lumakit_ai::search::SearchResult {
-        query: "查询".into(), provider: "provider".into(), hits: vec![lumakit_ai::search::SearchHit {
-            title: "来源".into(), url: "https://example.com/a".into(), snippet: "摘要".into(),
-        }],
-    }).unwrap();
+    session
+        .search_start(&conversation, &turn, &attempt, "查询", "provider")
+        .unwrap();
+    session
+        .search_result(
+            &conversation,
+            &turn,
+            &attempt,
+            lumakit_ai::search::SearchResult {
+                query: "查询".into(),
+                provider: "provider".into(),
+                hits: vec![lumakit_ai::search::SearchHit {
+                    title: "来源".into(),
+                    url: "https://example.com/a".into(),
+                    snippet: "摘要".into(),
+                }],
+            },
+        )
+        .unwrap();
     drop(session);
     let reopened = open(&path);
     let saved = &reopened.selected().unwrap().turns[0].attempts[0];
     assert_eq!(saved.text, "回答");
-    assert_eq!(saved.search.status, lumakit_ai::chat::SearchStatus::Complete);
+    assert_eq!(
+        saved.search.status,
+        lumakit_ai::chat::SearchStatus::Complete
+    );
     assert_eq!(saved.search.hits[0].url, "https://example.com/a");
 }
 #[test]
@@ -952,9 +1374,30 @@ fn tool_events_and_errors_survive_restart() {
     let conversation = session.selected().unwrap().id.clone();
     let turn = session.selected().unwrap().turns[0].id.clone();
     let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
-    session.tool_start(&conversation, &turn, &attempt, lumakit_ai::ToolCall { id: "call-1".into(), name: "lookup".into(), arguments: json!({"q":"x"}) }).unwrap();
-    session.tool_approval(&conversation, &turn, &attempt, "call-1", lumakit_ai::Approval::Allow).unwrap();
-    session.tool_error(&conversation, &turn, &attempt, "call-1", "上游失败").unwrap();
+    session
+        .tool_start(
+            &conversation,
+            &turn,
+            &attempt,
+            lumakit_ai::ToolCall {
+                id: "call-1".into(),
+                name: "lookup".into(),
+                arguments: json!({"q":"x"}),
+            },
+        )
+        .unwrap();
+    session
+        .tool_approval(
+            &conversation,
+            &turn,
+            &attempt,
+            "call-1",
+            lumakit_ai::Approval::Allow,
+        )
+        .unwrap();
+    session
+        .tool_error(&conversation, &turn, &attempt, "call-1", "上游失败")
+        .unwrap();
     drop(session);
     let reopened = open(&path);
     let event = &reopened.selected().unwrap().turns[0].attempts[0].tool_events[0];
@@ -975,9 +1418,39 @@ fn tool_result_state_is_not_answer_text() {
     let conversation = session.selected().unwrap().id.clone();
     let turn = session.selected().unwrap().turns[0].id.clone();
     let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
-    session.tool_start(&conversation, &turn, &attempt, lumakit_ai::ToolCall { id: "call-2".into(), name: "lookup".into(), arguments: json!({}) }).unwrap();
-    session.tool_approval(&conversation, &turn, &attempt, "call-2", lumakit_ai::Approval::Allow).unwrap();
-    session.tool_result(&conversation, &turn, &attempt, "call-2", lumakit_ai::ToolOutput { text: "结果".into(), is_error: false }).unwrap();
+    session
+        .tool_start(
+            &conversation,
+            &turn,
+            &attempt,
+            lumakit_ai::ToolCall {
+                id: "call-2".into(),
+                name: "lookup".into(),
+                arguments: json!({}),
+            },
+        )
+        .unwrap();
+    session
+        .tool_approval(
+            &conversation,
+            &turn,
+            &attempt,
+            "call-2",
+            lumakit_ai::Approval::Allow,
+        )
+        .unwrap();
+    session
+        .tool_result(
+            &conversation,
+            &turn,
+            &attempt,
+            "call-2",
+            lumakit_ai::ToolOutput {
+                text: "结果".into(),
+                is_error: false,
+            },
+        )
+        .unwrap();
     let saved = &session.selected().unwrap().turns[0].attempts[0];
     assert_eq!(saved.text, "回答");
     assert_eq!(saved.tool_events[0].result.as_deref(), Some("结果"));
@@ -990,16 +1463,27 @@ fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() {
     let root = Directory::new();
     let path = root.path();
     let mut session = setup(&path);
-    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        image_mode: true,
+        image_model: Some(model("image")),
+        ..Default::default()
+    });
     session.set_draft("两张图".into());
-    let calls = tool_calls(&[("one", json!({"prompt":"一"})), ("two", json!({"prompt":"二","size":"1024x1536"})), ("three", json!({"prompt":"三"}))]);
+    let calls = tool_calls(&[
+        ("one", json!({"prompt":"一"})),
+        ("two", json!({"prompt":"二","size":"1024x1536"})),
+        ("three", json!({"prompt":"三"})),
+    ]);
     let (url, requests, worker) = server_steps(vec![
         ("/v1/chat/completions", 200, calls, false),
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/chat/completions", 503, "最终文字失败".into(), false),
     ]);
-    session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+    session.send_with_painting(
+        connection(&url, "source"),
+        painting_connection(&url, "image"),
+    );
     complete(&mut session);
     let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
     assert_eq!(sent[2]["size"], "1024x1536");
@@ -1010,14 +1494,20 @@ fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() {
     assert!(!attempt.tool_events[1].is_error);
     assert!(attempt.tool_events[2].is_error);
     assert!(attempt.error.as_ref().unwrap().contains("503"));
-    let ids: Vec<_> = attempt.generated.iter().map(|image| image.id.clone()).collect();
+    let ids: Vec<_> = attempt
+        .generated
+        .iter()
+        .map(|image| image.id.clone())
+        .collect();
     worker.join().unwrap();
     drop(session);
     let reopened = open(&path);
     let saved = &reopened.selected().unwrap().turns[0].attempts[0];
     assert_eq!(saved.generated.len(), 2);
     assert_eq!(saved.tool_events.len(), 3);
-    for id in ids { assert!(reopened.media_path(&id).unwrap().is_file()); }
+    for id in ids {
+        assert!(reopened.media_path(&id).unwrap().is_file());
+    }
 }
 
 #[test]
@@ -1026,19 +1516,38 @@ fn painting_cancellation_during_image_or_continuation_preserves_completed_work()
     for during_image in [true, false] {
         let root = Directory::new();
         let mut session = setup(&root.path());
-        session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+        session.set_composer(ComposerSettings {
+            image_mode: true,
+            image_model: Some(model("image")),
+            ..Default::default()
+        });
         session.set_draft("可取消绘图".into());
-        let mut steps = vec![("/v1/chat/completions", 200, tool_calls(&[("paint", json!({"prompt":"一张图"}))]), false)];
-        if during_image { steps.push(("/v1/images/generations", 200, "{".into(), true)); }
-        else {
+        let mut steps = vec![(
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[("paint", json!({"prompt":"一张图"}))]),
+            false,
+        )];
+        if during_image {
+            steps.push(("/v1/images/generations", 200, "{".into(), true));
+        } else {
             steps.push(("/v1/images/generations", 200, image_response(), false));
             steps.push(("/v1/chat/completions", 200, delta("生成后的部分说明"), true));
         }
         let (url, requests, worker) = server_steps(steps);
-        session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+        session.send_with_painting(
+            connection(&url, "source"),
+            painting_connection(&url, "image"),
+        );
         requests.recv_timeout(Duration::from_secs(10)).unwrap();
         requests.recv_timeout(Duration::from_secs(10)).unwrap();
-        if !during_image { wait_until(&mut session, |session| !session.selected().unwrap().turns[0].attempts[0].text.is_empty()); }
+        if !during_image {
+            wait_until(&mut session, |session| {
+                !session.selected().unwrap().turns[0].attempts[0]
+                    .text
+                    .is_empty()
+            });
+        }
         session.cancel();
         complete(&mut session);
         let attempt = &session.selected().unwrap().turns[0].attempts[0];
@@ -1055,20 +1564,50 @@ fn painting_insecure_result_is_error_tool_payload_without_retry() {
     use lumakit_ai::chat::ComposerSettings;
     let root = Directory::new();
     let mut session = setup(&root.path());
-    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        image_mode: true,
+        image_model: Some(model("image")),
+        ..Default::default()
+    });
     session.set_draft("不安全图片".into());
     let (url, requests, worker) = server_steps(vec![
-        ("/v1/chat/completions", 200, tool_calls(&[("paint", json!({"prompt":"画面"}))]), false),
-        ("/v1/images/generations", 200, json!({"data":[{"url":"http://127.0.0.1:1/private"}]}).to_string(), false),
-        ("/v1/chat/completions", 200, response("图片地址不安全，生成失败"), false),
+        (
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[("paint", json!({"prompt":"画面"}))]),
+            false,
+        ),
+        (
+            "/v1/images/generations",
+            200,
+            json!({"data":[{"url":"http://127.0.0.1:1/private"}]}).to_string(),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            200,
+            response("图片地址不安全，生成失败"),
+            false,
+        ),
     ]);
-    session.send_with_painting(connection(&url, "source"), painting_connection(&url, "image"));
+    session.send_with_painting(
+        connection(&url, "source"),
+        painting_connection(&url, "image"),
+    );
     complete(&mut session);
-    for _ in 0..3 { requests.recv().unwrap(); }
+    for _ in 0..3 {
+        requests.recv().unwrap();
+    }
     let attempt = &session.selected().unwrap().turns[0].attempts[0];
     assert!(attempt.generated.is_empty());
     assert!(attempt.tool_events[0].is_error);
-    assert!(attempt.tool_events[0].error.as_ref().unwrap().contains("HTTPS"));
+    assert!(
+        attempt.tool_events[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("HTTPS")
+    );
     worker.join().unwrap();
 }
 
@@ -1077,21 +1616,50 @@ fn legacy_failed_direct_image_retry_explicitly_migrates_chat_source() {
     let root = Directory::new();
     let path = root.path();
     let legacy = json!({"schemaVersion":1,"value":{"selected":"legacy-c","model":model("source"),"conversations":[{"id":"legacy-c","title":"旧绘图","draft":"","turns":[{"id":"legacy-t","input":"原问题不能丢失","attempts":[{"id":"legacy-a","model":model("old-image"),"text":"","status":"failed","error":"原图片接口失败"}]}]}]}});
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
     drop(open(&path));
     let composer = json!({"drafts":{},"turns":{"legacy-t":{"settings":{"image_mode":true,"image_model":null,"web_search":false,"reasoning":null},"attachments":[]}}});
-    Connection::open(&path).unwrap().execute("INSERT OR REPLACE INTO chat_meta(key,value) VALUES('composer',?1)", [composer.to_string()]).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO chat_meta(key,value) VALUES('composer',?1)",
+            [composer.to_string()],
+        )
+        .unwrap();
     let mut session = open(&path);
     assert_eq!(session.request_model(true).unwrap().model, "old-image");
-    assert_eq!(session.request_painting_model(true).unwrap().unwrap().model, "old-image");
+    assert_eq!(
+        session.request_painting_model(true).unwrap().unwrap().model,
+        "old-image"
+    );
     let (url, requests, worker) = server_steps(vec![
-        ("/v1/chat/completions", 200, tool_calls(&[("migrated", json!({"prompt":"原问题对应的画面"}))]), false),
+        (
+            "/v1/chat/completions",
+            200,
+            tool_calls(&[("migrated", json!({"prompt":"原问题对应的画面"}))]),
+            false,
+        ),
         ("/v1/images/generations", 200, image_response(), false),
-        ("/v1/chat/completions", 200, response("迁移后生成成功"), false),
+        (
+            "/v1/chat/completions",
+            200,
+            response("迁移后生成成功"),
+            false,
+        ),
     ]);
-    session.retry_with_model_and_painting(connection(&url, "source"), painting_connection(&url, "old-image"));
+    session.retry_with_model_and_painting(
+        connection(&url, "source"),
+        painting_connection(&url, "old-image"),
+    );
     complete(&mut session);
-    assert_eq!(requests.recv().unwrap()["messages"][0]["content"], "原问题不能丢失");
+    assert_eq!(
+        requests.recv().unwrap()["messages"][0]["content"],
+        "原问题不能丢失"
+    );
     assert_eq!(requests.recv().unwrap()["model"], "old-image");
     requests.recv().unwrap();
     let attempts = &session.selected().unwrap().turns[0].attempts;
@@ -1102,7 +1670,10 @@ fn legacy_failed_direct_image_retry_explicitly_migrates_chat_source() {
     drop(session);
     let session = open(&path);
     assert_eq!(session.request_model(true).unwrap().model, "source");
-    assert_eq!(session.request_painting_model(true).unwrap().unwrap().model, "old-image");
+    assert_eq!(
+        session.request_painting_model(true).unwrap().unwrap().model,
+        "old-image"
+    );
 }
 
 #[test]
@@ -1110,7 +1681,11 @@ fn painting_declared_tool_incapability_rejects_before_network() {
     use lumakit_ai::chat::ComposerSettings;
     let root = Directory::new();
     let mut session = setup(&root.path());
-    session.set_composer(ComposerSettings { image_mode: true, image_model: Some(model("image")), ..Default::default() });
+    session.set_composer(ComposerSettings {
+        image_mode: true,
+        image_model: Some(model("image")),
+        ..Default::default()
+    });
     session.set_draft("不支持工具".into());
     let mut chat = connection("http://127.0.0.1:1/v1", "source");
     chat.settings.supports_tools = Some(false);
@@ -1123,14 +1698,25 @@ fn painting_declared_tool_incapability_rejects_before_network() {
 
 #[test]
 fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
-    use lumakit_ai::{chat::ComposerSettings, model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort}};
+    use lumakit_ai::{
+        chat::ComposerSettings,
+        model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort},
+    };
     let root = Directory::new();
     let mut session = setup(&root.path());
     let image = root.0.join("input.png");
     fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
     session.add_attachment(&image).unwrap();
-    session.select_model(ModelRef { protocol: Protocol::OpenAiResponses, ..model("source") });
-    session.set_composer(ComposerSettings { web_search:true, reasoning:Some(ReasoningEffort::High), image_mode:true, image_model:Some(model("image")) });
+    session.select_model(ModelRef {
+        protocol: Protocol::OpenAiResponses,
+        ..model("source")
+    });
+    session.set_composer(ComposerSettings {
+        web_search: true,
+        reasoning: Some(ReasoningEffort::High),
+        image_mode: true,
+        image_model: Some(model("image")),
+    });
     session.set_draft("参考图片后绘图".into());
     let reasoning = json!({"type":"reasoning","id":"rs-original","summary":[{"type":"summary_text","text":"独立推理"}],"encrypted_content":"opaque"});
     let first = json!({"status":"completed","output":[reasoning.clone(),{"type":"function_call","id":"item","call_id":"paint","name":"generate_image","arguments":"{\"prompt\":\"完整构图\"}"}]}).to_string();
@@ -1144,7 +1730,11 @@ fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
     chat.protocol = Protocol::OpenAiResponses;
     chat.settings.supports_streaming = false;
     chat.settings.supports_vision = true;
-    chat.settings.reasoning = Some(ReasoningConfig { dialect:ReasoningDialect::OpenAi, efforts:vec![ReasoningEffort::High], budget_tokens:None });
+    chat.settings.reasoning = Some(ReasoningConfig {
+        dialect: ReasoningDialect::OpenAi,
+        efforts: vec![ReasoningEffort::High],
+        budget_tokens: None,
+    });
     session.send_with_painting(chat, painting_connection(&url, "image"));
     complete(&mut session);
     let initial = requests.recv().unwrap();
@@ -1179,7 +1769,10 @@ fn context_anchor_tracks_tail_and_invalidates_changed_history_model_and_tools() 
     complete(&mut session);
     requests.recv().unwrap();
     worker.join().unwrap();
-    let settings = lumakit_ai::model_config::ModelSettings { context_window: Some(1000), ..Default::default() };
+    let settings = lumakit_ai::model_config::ModelSettings {
+        context_window: Some(1000),
+        ..Default::default()
+    };
     let context = session.context_usage(&settings).unwrap();
     assert!(context.anchored);
     assert_eq!(context.tokens, 140); // Reported input plus the newly retained assistant reply.
@@ -1201,7 +1794,9 @@ fn context_anchor_tracks_tail_and_invalidates_changed_history_model_and_tools() 
     let mut composer = session.composer().clone();
     composer.image_mode = false;
     session.set_composer(composer);
-    session.edit_attempt(&conversation, &turn, &attempt, "ok", "edited").unwrap();
+    session
+        .edit_attempt(&conversation, &turn, &attempt, "ok", "edited")
+        .unwrap();
     // Editing the anchor's own output is a changed tail, not a changed provider input prefix.
     assert_eq!(session.context_usage(&settings).unwrap().tokens, 204);
     assert!(session.context_usage(&settings).unwrap().anchored);
@@ -1220,28 +1815,78 @@ fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() {
     history["value"]["conversations"][0]["turns"][0]["attempts"][1]["status"] = json!("completed");
     history["value"]["conversations"][0]["turns"][0]["attempts"][1]["rounds"] = json!([
         {"request_id":"request-two","started_at_ms":172800000,"model":model("partial"),"usage":null,"pricing":null,"cost":null},
-        {"usage":{"input_tokens":4,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0},"pricing":{"currency":"CNY","tiers":[]},"cost":0.5}
+        {"cost_source":"reference","usage":{"input_tokens":4,"output_tokens":2,"cache_read_tokens":0,"cache_write_tokens":0},"pricing":{"currency":"CNY","tiers":[]},"cost":0.5}
     ]);
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&history).unwrap(),
+    )
+    .unwrap();
     let mut session = open(&path);
     let original = session.usage_report(Some("c2"), None).unwrap();
-    assert_eq!((original.total.requests, original.total.missing_usage, original.total.missing_cost), (3, 1, 1));
-    assert_eq!((original.total.input_tokens, original.total.output_tokens, original.total.cache_read_tokens, original.total.cache_write_tokens), (104, 22, 30, 10));
+    assert_eq!(
+        (
+            original.total.requests,
+            original.total.missing_usage,
+            original.total.missing_cost
+        ),
+        (3, 1, 1)
+    );
+    assert_eq!(
+        (
+            original.total.input_tokens,
+            original.total.output_tokens,
+            original.total.cache_read_tokens,
+            original.total.cache_write_tokens
+        ),
+        (104, 22, 30, 10)
+    );
     assert_eq!(original.total.reasoning_tokens, Some(5));
     assert_eq!(original.total.costs.get("USD"), Some(&0.25));
     assert_eq!(original.total.costs.get("CNY"), Some(&0.5));
-    assert_eq!((original.undated_requests, original.legacy_requests), (1, 1));
-    assert_eq!(original.by_day.iter().map(|group| group.label.as_str()).collect::<Vec<_>>(), ["1970-01-02", "1970-01-03"]);
-    assert!(original.by_model.iter().any(|group| group.label.contains("actual")));
+    assert_eq!(original.total.configured_cost_requests, 1);
+    assert_eq!(original.total.configured_costs.get("USD"), Some(&0.25));
+    assert!(!original.total.configured_costs.contains_key("CNY"));
+    assert_eq!(
+        (original.undated_requests, original.legacy_requests),
+        (1, 1)
+    );
+    assert_eq!(
+        original
+            .by_day
+            .iter()
+            .map(|group| group.label.as_str())
+            .collect::<Vec<_>>(),
+        ["1970-01-02", "1970-01-03"]
+    );
+    assert!(
+        original
+            .by_model
+            .iter()
+            .any(|group| group.label.contains("actual"))
+    );
     let copy = session.copy_conversation("c2").unwrap();
     assert_eq!(session.usage_report(Some(&copy), None).unwrap(), original);
     assert_eq!(session.usage_report(None, None).unwrap(), original);
     let filtered = session.usage_report(None, Some(172800000)).unwrap();
-    assert_eq!((filtered.total.requests, filtered.total.missing_usage, filtered.total.missing_cost), (1, 1, 1));
+    assert_eq!(
+        (
+            filtered.total.requests,
+            filtered.total.missing_usage,
+            filtered.total.missing_cost
+        ),
+        (1, 1, 1)
+    );
     assert_eq!(filtered.total.reasoning_tokens, None);
     assert!(filtered.total.costs.is_empty());
-    assert_eq!((filtered.undated_requests, filtered.legacy_requests), (1, 1));
-    assert_eq!(session.usage_report(Some(&copy), Some(172800000)).unwrap(), filtered);
+    assert_eq!(
+        (filtered.undated_requests, filtered.legacy_requests),
+        (1, 1)
+    );
+    assert_eq!(
+        session.usage_report(Some(&copy), Some(172800000)).unwrap(),
+        filtered
+    );
     session.delete_conversation("c2");
     session.delete_conversation(&copy);
     session.delete_conversation("c1");
@@ -1264,14 +1909,28 @@ fn usage_ledger_import_rolls_back_with_history_and_keeps_unknown_costs() {
         {"usage":null,"pricing":null,"cost":null},
         {"usage":{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0},"pricing":null,"cost":0.0}
     ]);
-    fs::write(path.with_file_name("chat-history.json"), serde_json::to_vec(&history).unwrap()).unwrap();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&history).unwrap(),
+    )
+    .unwrap();
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
     assert_eq!(count(&path, "usage_requests"), 0);
     restore_writes(&path);
     let session = open(&path);
     let report = session.usage_report(None, None).unwrap();
-    assert_eq!((report.total.requests, report.total.missing_usage, report.total.missing_cost), (2, 1, 2));
+    assert_eq!(
+        (
+            report.total.requests,
+            report.total.missing_usage,
+            report.total.missing_cost
+        ),
+        (2, 1, 2)
+    );
     assert!(report.total.costs.is_empty());
     assert_eq!((report.undated_requests, report.legacy_requests), (2, 2));
-    assert_eq!(session.usage_report(None, Some(0)).unwrap().total.requests, 0);
+    assert_eq!(
+        session.usage_report(None, Some(0)).unwrap().total.requests,
+        0
+    );
 }

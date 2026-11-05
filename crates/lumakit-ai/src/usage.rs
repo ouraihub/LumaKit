@@ -20,6 +20,12 @@ pub struct UsageTotals {
     pub cache_write_tokens: u64,
     pub reasoning_tokens: Option<u64>,
     pub costs: BTreeMap<String, f64>,
+    /// Amounts backed only by the user's request-time configured prices, excluding reference tariffs.
+    #[serde(default)]
+    pub configured_costs: BTreeMap<String, f64>,
+    /// Requests covered by a valid user-configured price snapshot.
+    #[serde(default)]
+    pub configured_cost_requests: u64,
 }
 /// A named provider, model or UTC date subtotal.
 #[allow(missing_docs)]
@@ -133,6 +139,13 @@ impl UsageTotals {
                 })
         {
             *self.costs.entry(pricing.currency.clone()).or_default() += cost;
+            if round.cost_source == crate::model_config::CostSource::Estimate {
+                *self
+                    .configured_costs
+                    .entry(pricing.currency.clone())
+                    .or_default() += cost;
+                self.configured_cost_requests = self.configured_cost_requests.saturating_add(1);
+            }
         } else {
             self.missing_cost = self.missing_cost.saturating_add(1);
         }

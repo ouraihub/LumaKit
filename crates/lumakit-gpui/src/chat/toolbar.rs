@@ -2,6 +2,69 @@
 use super::*;
 use gpui_kit::component::{Icon, switch::Switch};
 
+impl ChatPanel {
+    pub(super) fn tool_button(
+        &self,
+        tool: ToolbarTool,
+        composer: &ComposerSettings,
+        can_image: bool,
+        cx: &Context<Self>,
+    ) -> Button {
+        let (label, action, enabled, selected) = match tool {
+            ToolbarTool::NewConversation => ("新对话", ChatAction::New, self.unlocked, false),
+            ToolbarTool::Attachment => ("附件", ChatAction::UploadAttachment, self.unlocked, false),
+            ToolbarTool::WebSearch => {
+                let mut next = composer.clone();
+                next.web_search = !next.web_search;
+                (
+                    "联网",
+                    ChatAction::SetComposer(next),
+                    self.unlocked,
+                    composer.web_search,
+                )
+            }
+            ToolbarTool::GenerateImage => {
+                let mut next = composer.clone();
+                next.image_mode = !next.image_mode;
+                (
+                    "生图",
+                    ChatAction::SetComposer(next),
+                    self.unlocked,
+                    composer.image_mode,
+                )
+            }
+        };
+        let icon = match tool {
+            ToolbarTool::NewConversation => IconName::MessageSquarePlus,
+            ToolbarTool::Attachment => IconName::Paperclip,
+            ToolbarTool::WebSearch => IconName::Globe,
+            ToolbarTool::GenerateImage => IconName::Image,
+        };
+        icon_button(label, icon, label)
+            .disabled(!enabled)
+            .selected(selected)
+            .when(tool == ToolbarTool::GenerateImage, |button| {
+                button.tooltip(if composer.image_mode {
+                    "关闭生成图片"
+                } else {
+                    self.image_notice
+                })
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if tool == ToolbarTool::GenerateImage && !selected && !can_image {
+                    this.open(
+                        Overlay::ImageModels,
+                        "tool-GenerateImage".into(),
+                        window,
+                        cx,
+                    );
+                } else {
+                    this.emit(action.clone(), cx);
+                    this.close(window, cx);
+                }
+            }))
+    }
+}
 pub(super) const TOOLS: &[(ToolbarTool, &str)] = &[
     (ToolbarTool::NewConversation, "新对话"),
     (ToolbarTool::WebSearch, "网络搜索"),

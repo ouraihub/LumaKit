@@ -131,7 +131,7 @@ fn show_report(ui: &mut Ui, report: &Result<UsageReport, String>) {
 
 fn show_totals(ui: &mut Ui, totals: &UsageTotals) {
     ui.label(format!(
-        "请求 {} · 缺失用量 {} · 费用未知 {}",
+        "请求 {} · 缺失用量 {} · 无可用单价 {}",
         totals.requests, totals.missing_usage, totals.missing_cost
     ));
     if totals.requests > 0 && totals.missing_usage == totals.requests {
@@ -154,15 +154,11 @@ fn show_totals(ui: &mut Ui, totals: &UsageTotals) {
                 .map_or_else(|| "未知".into(), |n| n.to_string())
         ));
     }
-    if totals.costs.is_empty() {
-        ui.label(if totals.requests == 0 {
-            "Token 估算费用：无请求"
-        } else {
-            "Token 估算费用：未知"
-        });
+    if totals.configured_costs.is_empty() {
+        ui.label("未配置完整用户单价，显示 token 消耗，不套用目录参考价");
     } else {
-        for (currency, cost) in &totals.costs {
-            ui.label(format!("已知 token 估算费用：{currency} {cost}"));
+        for (currency, cost) in &totals.configured_costs {
+            ui.label(format!("用户单价估算：{currency} {cost}"));
         }
     }
 }
@@ -186,7 +182,7 @@ fn show_groups(ui: &mut Ui, title: &str, groups: &[UsageGroup]) {
 
 pub(super) fn show_rounds(ui: &mut Ui, rounds: &[RoundUsage]) {
     if rounds.is_empty() {
-        ui.label("用量未提供 · Token 估算费用未知");
+        ui.label("用量未提供 · 未配置用户单价");
     }
     for (index, round) in rounds.iter().enumerate() {
         ui.label(
@@ -199,7 +195,7 @@ pub(super) fn show_rounds(ui: &mut Ui, rounds: &[RoundUsage]) {
 
 pub(super) fn round_label(round: &RoundUsage) -> String {
     let Some(usage) = &round.usage else {
-        return "用量未提供 · Token 估算费用未知".into();
+        return "用量未提供 · 未配置用户单价".into();
     };
     let tokens = format!(
         "输入（含缓存）{} · 输出 {} · 缓存读取 {} · 缓存写入 {} · 推理（输出子集）{} token",
@@ -211,20 +207,15 @@ pub(super) fn round_label(round: &RoundUsage) -> String {
             .reasoning_tokens
             .map_or_else(|| "未知".into(), |n| n.to_string())
     );
-    match (&round.pricing, round.cost) {
-        (Some(pricing), Some(cost))
+    match (&round.pricing, round.cost, round.cost_source) {
+        (Some(pricing), Some(cost), CostSource::Estimate)
             if cost.is_finite() && cost >= 0.0 && !pricing.currency.is_empty() =>
         {
             format!(
-                "{tokens} · Token 估算费用（{}）{} {cost}",
-                match round.cost_source {
-                    CostSource::Estimate => "配置单价",
-                    CostSource::Reference => "目录参考单价",
-                    CostSource::Unknown => "历史价格快照",
-                },
+                "{tokens} · 用户单价 token 估算：{} {cost}",
                 pricing.currency
             )
         }
-        _ => format!("{tokens} · Token 估算费用未知"),
+        _ => format!("{tokens} · 未配置用户单价，不估算金额"),
     }
 }

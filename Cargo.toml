@@ -7,6 +7,7 @@ members = [
   "crates/lumakit-gpui",
   "crates/lumakit-design",
   "crates/lumakit-model-picker",
+  "crates/lumakit-usage-status",
   "examples/chat-host",
   "examples/lumakit-cli",
 ]

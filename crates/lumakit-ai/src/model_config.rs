@@ -25,7 +25,18 @@ pub enum ModelType {
 }
 impl ModelType {
     /// 模型选择器使用的分类名称。
-    pub fn label(self) -> &'static str { match self { Self::Chat => "聊天", Self::Image => "图片", Self::Video => "视频", Self::Tts => "语音合成", Self::Stt => "语音识别", Self::Embedding => "向量", Self::Rerank => "重排", Self::Unknown => "未知" } }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "聊天",
+            Self::Image => "图片",
+            Self::Video => "视频",
+            Self::Tts => "语音合成",
+            Self::Stt => "语音识别",
+            Self::Embedding => "向量",
+            Self::Rerank => "重排",
+            Self::Unknown => "未知",
+        }
+    }
     /// 按模型 ID 推断类型（ThinkRail `model_catalog::model_type`）：模型目录只返回 ID 时的初值，
     /// 用户可在同步列表或模型设置中改正。关键词按序匹配，首个命中生效；都不命中为聊天。
     pub fn infer(id: &str) -> Self {
@@ -38,7 +49,10 @@ impl ModelType {
             (&["video", "sora", "veo"], ModelType::Video),
         ];
         let id = id.to_ascii_lowercase();
-        TYPES.iter().find(|(words, _)| words.iter().any(|word| id.contains(word))).map_or(Self::Chat, |&(_, kind)| kind)
+        TYPES
+            .iter()
+            .find(|(words, _)| words.iter().any(|word| id.contains(word)))
+            .map_or(Self::Chat, |&(_, kind)| kind)
     }
 }
 /// 推理控制的协议编码方言。
@@ -178,7 +192,10 @@ impl<'a> EffectiveModel<'a> {
         if self.settings.reasoning_override == Some(false) {
             &[]
         } else {
-            self.settings.reasoning.as_ref().map_or(&[], |config| config.efforts.as_slice())
+            self.settings
+                .reasoning
+                .as_ref()
+                .map_or(&[], |config| config.efforts.as_slice())
         }
     }
     /// Whether a request effort is supported.
@@ -191,7 +208,30 @@ impl<'a> EffectiveModel<'a> {
     }
 }
 impl Default for ModelSettings {
-    fn default() -> Self { Self { name: None, group_name: None, model_type: ModelType::Chat, context_window: None, max_input: None, max_output: None, reasoning: None, reasoning_effort: None, reasoning_disabled: false, reasoning_override: None, supports_audio: false, supports_video: false, native_web_search: false, pricing: None, pricing_reference: false, supports_tools: None, supports_streaming: true, supports_vision: false, vision_override: None, image_edit: false } }
+    fn default() -> Self {
+        Self {
+            name: None,
+            group_name: None,
+            model_type: ModelType::Chat,
+            context_window: None,
+            max_input: None,
+            max_output: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_disabled: false,
+            reasoning_override: None,
+            supports_audio: false,
+            supports_video: false,
+            native_web_search: false,
+            pricing: None,
+            pricing_reference: false,
+            supports_tools: None,
+            supports_streaming: true,
+            supports_vision: false,
+            vision_override: None,
+            image_edit: false,
+        }
+    }
 }
 impl ModelSettings {
     /// Borrow this already-effective settings projection.
@@ -203,38 +243,126 @@ impl ModelSettings {
         self.reasoning_override.unwrap_or(self.reasoning.is_some())
     }
     /// 返回显示名，未设置或空白时返回模型标识。
-    pub fn display_name<'a>(&'a self, id: &'a str) -> &'a str { self.name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(id) }
+    pub fn display_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(id)
+    }
     /// 返回分组，未设置时取模型标识中 '-'、'/' 或 ':' 之前的前缀。
-    pub fn group_name<'a>(&'a self, id: &'a str) -> &'a str { self.group_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or_else(|| id.split(['-', '/', ':']).next().unwrap_or(id)) }
+    pub fn group_name<'a>(&'a self, id: &'a str) -> &'a str {
+        self.group_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| id.split(['-', '/', ':']).next().unwrap_or(id))
+    }
     /// 返回实际输出上限，包含原有默认值4096。
-    pub fn output_limit(&self) -> u32 { self.max_output.unwrap_or(4096) }
+    pub fn output_limit(&self) -> u32 {
+        self.max_output.unwrap_or(4096)
+    }
     /// 保存或构造请求前校验所有模型设置。
     pub fn validate(&self, protocol: Protocol) -> Result<(), String> {
-        for name in [&self.name, &self.group_name].into_iter().flatten() { if name.trim().chars().count() > 80 { return Err("模型名称和分组最多80个字符".into()); } }
-        if self.context_window == Some(0) || self.max_input == Some(0) || self.max_output == Some(0) { return Err("上下文、输入和输出上限必须大于零".into()); }
-        if self.max_input.zip(self.context_window).is_some_and(|(input, context)| input > context) { return Err("最大输入不能超过上下文窗口".into()); }
+        for name in [&self.name, &self.group_name].into_iter().flatten() {
+            if name.trim().chars().count() > 80 {
+                return Err("模型名称和分组最多80个字符".into());
+            }
+        }
+        if self.context_window == Some(0) || self.max_input == Some(0) || self.max_output == Some(0)
+        {
+            return Err("上下文、输入和输出上限必须大于零".into());
+        }
+        if self
+            .max_input
+            .zip(self.context_window)
+            .is_some_and(|(input, context)| input > context)
+        {
+            return Err("最大输入不能超过上下文窗口".into());
+        }
         let chat = self.model_type == ModelType::Chat;
-        if chat && self.context_window.is_some_and(|n| self.output_limit() >= n) { return Err("输出上限（默认4096）必须小于上下文窗口".into()); }
-        if !chat && (self.reasoning.is_some() || self.native_web_search || self.pricing.is_some() || self.supports_tools.is_some()) { return Err("推理、搜索、工具和聊天计费只适用于聊天模型".into()); }
-        if self.native_web_search && protocol == Protocol::OpenAiChat { return Err("Chat Completions不支持原生搜索，请使用Responses或Anthropic".into()); }
+        if chat
+            && self
+                .context_window
+                .is_some_and(|n| self.output_limit() >= n)
+        {
+            return Err("输出上限（默认4096）必须小于上下文窗口".into());
+        }
+        if !chat
+            && (self.reasoning.is_some()
+                || self.native_web_search
+                || self.pricing.is_some()
+                || self.supports_tools.is_some())
+        {
+            return Err("推理、搜索、工具和聊天计费只适用于聊天模型".into());
+        }
+        if self.native_web_search && protocol == Protocol::OpenAiChat {
+            return Err("Chat Completions不支持原生搜索，请使用Responses或Anthropic".into());
+        }
         if let Some(r) = &self.reasoning {
             use ReasoningDialect::*;
-            let fits = match r.dialect { OpenAi => protocol != Protocol::AnthropicMessages, AnthropicBudget | AnthropicAdaptive => protocol == Protocol::AnthropicMessages, ThinkingType | Qwen => protocol == Protocol::OpenAiChat };
-            if !fits { return Err("推理方言与线路协议不匹配".into()); }
-            if r.efforts.is_empty() || r.efforts.iter().enumerate().any(|(i,e)| r.efforts[..i].contains(e) || (*e == ReasoningEffort::Auto && !matches!(r.dialect, ThinkingType | Qwen))) { return Err("推理强度不能为空、重复或含不支持的auto".into()); }
+            let fits = match r.dialect {
+                OpenAi => protocol != Protocol::AnthropicMessages,
+                AnthropicBudget | AnthropicAdaptive => protocol == Protocol::AnthropicMessages,
+                ThinkingType | Qwen => protocol == Protocol::OpenAiChat,
+            };
+            if !fits {
+                return Err("推理方言与线路协议不匹配".into());
+            }
+            if r.efforts.is_empty()
+                || r.efforts.iter().enumerate().any(|(i, e)| {
+                    r.efforts[..i].contains(e)
+                        || (*e == ReasoningEffort::Auto
+                            && !matches!(r.dialect, ThinkingType | Qwen))
+                })
+            {
+                return Err("推理强度不能为空、重复或含不支持的auto".into());
+            }
             match r.dialect {
-                AnthropicBudget if !r.budget_tokens.is_some_and(|n| n >= 1024 && n < self.output_limit()) => return Err("Anthropic推理预算必须至少1024且小于输出上限".into()),
+                AnthropicBudget
+                    if !r
+                        .budget_tokens
+                        .is_some_and(|n| n >= 1024 && n < self.output_limit()) =>
+                {
+                    return Err("Anthropic推理预算必须至少1024且小于输出上限".into());
+                }
                 Qwen if r.budget_tokens == Some(0) => return Err("Qwen推理预算必须大于零".into()),
-                OpenAi | AnthropicAdaptive | ThinkingType if r.budget_tokens.is_some() => return Err("此推理方言不接受token预算".into()),
+                OpenAi | AnthropicAdaptive | ThinkingType if r.budget_tokens.is_some() => {
+                    return Err("此推理方言不接受token预算".into());
+                }
                 _ => {}
             }
         }
-        if self.reasoning_effort.is_some_and(|effort| !self.reasoning.as_ref().is_some_and(|config| config.efforts.contains(&effort))) { return Err("模型未声明该推理强度".into()); }
-        if let Some(p) = &self.pricing {
-            let valid = |n:f64| n.is_finite() && (0.0..=1_000_000.0).contains(&n);
-            if !matches!(p.currency.as_str(), "USD" | "CNY") || p.tiers.is_empty() || p.tiers.len() > 8 || p.tiers[0].min_input_tokens != 0 || p.tiers.iter().enumerate().any(|(i,t)| (i > 0 && t.min_input_tokens <= p.tiers[i-1].min_input_tokens) || !valid(t.input) || !valid(t.output) || t.cache_read.is_some_and(|n| !valid(n)) || t.cache_write.is_some_and(|n| !valid(n))) { return Err("价格须为USD/CNY、0起始升序的1至8档，单价须为0至1000000的有限数值".into()); }
+        if self.reasoning_effort.is_some_and(|effort| {
+            !self
+                .reasoning
+                .as_ref()
+                .is_some_and(|config| config.efforts.contains(&effort))
+        }) {
+            return Err("模型未声明该推理强度".into());
         }
-        if self.image_edit && (!self.supports_vision || self.model_type != ModelType::Image) { return Err("图像编辑模型必须声明视觉输入".into()); }
+        if let Some(p) = &self.pricing {
+            let valid = |n: f64| n.is_finite() && (0.0..=1_000_000.0).contains(&n);
+            if !matches!(p.currency.as_str(), "USD" | "CNY")
+                || p.tiers.is_empty()
+                || p.tiers.len() > 8
+                || p.tiers[0].min_input_tokens != 0
+                || p.tiers.iter().enumerate().any(|(i, t)| {
+                    (i > 0 && t.min_input_tokens <= p.tiers[i - 1].min_input_tokens)
+                        || !valid(t.input)
+                        || !valid(t.output)
+                        || t.cache_read.is_some_and(|n| !valid(n))
+                        || t.cache_write.is_some_and(|n| !valid(n))
+                })
+            {
+                return Err(
+                    "价格须为USD/CNY、0起始升序的1至8档，单价须为0至1000000的有限数值".into(),
+                );
+            }
+        }
+        if self.image_edit && (!self.supports_vision || self.model_type != ModelType::Image) {
+            return Err("图像编辑模型必须声明视觉输入".into());
+        }
         Ok(())
     }
 }
@@ -287,7 +415,10 @@ pub struct RoundUsage {
 /// 上下文前缀和请求开销的指纹；不持久化提示词内容。
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContextAnchor { pub prefix: String, pub overhead: String }
+pub struct ContextAnchor {
+    pub prefix: String,
+    pub overhead: String,
+}
 /// 保存的 token 金额来源，不将未知费用表示为零。
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -301,14 +432,49 @@ pub enum CostSource {
     Unknown,
 }
 impl RoundUsage {
-    pub(crate) fn start(model: Option<crate::ModelRef>) -> Result<(Self, std::time::Instant), String> {
-        let started_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?.as_millis().try_into().map_err(|_| "请求时间超出范围")?;
-        Ok((Self { request_id: lumakit_support::new_id().map_err(|error| error.to_string())?, started_at_ms: Some(started_at_ms), duration_ms: None, model, cost_source: CostSource::Unknown, legacy: false, context: None, usage: None, pricing: None, cost: None }, std::time::Instant::now()))
+    pub(crate) fn start(
+        model: Option<crate::ModelRef>,
+    ) -> Result<(Self, std::time::Instant), String> {
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "请求时间超出范围")?;
+        Ok((
+            Self {
+                request_id: lumakit_support::new_id().map_err(|error| error.to_string())?,
+                started_at_ms: Some(started_at_ms),
+                duration_ms: None,
+                model,
+                cost_source: CostSource::Unknown,
+                legacy: false,
+                context: None,
+                usage: None,
+                pricing: None,
+                cost: None,
+            },
+            std::time::Instant::now(),
+        ))
     }
-    pub(crate) fn finish(mut self, usage: Option<TokenUsage>, pricing: Option<ModelPricing>, reference: bool, started: std::time::Instant) -> Self {
-        self.cost = pricing.as_ref().zip(usage.as_ref()).and_then(|(price, usage)| price.cost(usage));
-        self.cost_source = if self.cost.is_none() { CostSource::Unknown } else if reference { CostSource::Reference } else { CostSource::Estimate };
+    pub(crate) fn finish(
+        mut self,
+        usage: Option<TokenUsage>,
+        pricing: Option<ModelPricing>,
+        reference: bool,
+        started: std::time::Instant,
+    ) -> Self {
+        self.cost = pricing
+            .as_ref()
+            .zip(usage.as_ref())
+            .and_then(|(price, usage)| price.cost(usage));
+        self.cost_source = if self.cost.is_none() {
+            CostSource::Unknown
+        } else if reference {
+            CostSource::Reference
+        } else {
+            CostSource::Estimate
+        };
         self.usage = usage;
         self.pricing = pricing;
         self.duration_ms = Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
@@ -320,41 +486,83 @@ impl ModelPricing {
     ///
     /// 无适用价格档、缓存数溢出或超过完整输入数时返回 None。
     pub fn cost(&self, usage: &TokenUsage) -> Option<f64> {
-        let t = self.tiers.iter().rev().find(|t| u64::from(t.min_input_tokens) <= usage.input_tokens)?;
-        let uncached = usage.input_tokens.checked_sub(usage.cache_read_tokens.checked_add(usage.cache_write_tokens)?)?;
-        Some((uncached as f64 * t.input + usage.output_tokens as f64 * t.output + usage.cache_read_tokens as f64 * t.cache_read.unwrap_or(t.input) + usage.cache_write_tokens as f64 * t.cache_write.unwrap_or(t.input)) / 1_000_000.0)
+        let t = self
+            .tiers
+            .iter()
+            .rev()
+            .find(|t| u64::from(t.min_input_tokens) <= usage.input_tokens)?;
+        let uncached = usage.input_tokens.checked_sub(
+            usage
+                .cache_read_tokens
+                .checked_add(usage.cache_write_tokens)?,
+        )?;
+        Some(
+            (uncached as f64 * t.input
+                + usage.output_tokens as f64 * t.output
+                + usage.cache_read_tokens as f64 * t.cache_read.unwrap_or(t.input)
+                + usage.cache_write_tokens as f64 * t.cache_write.unwrap_or(t.input))
+                / 1_000_000.0,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ModelType;
+    use super::{ModelSettings, ModelType, ReasoningConfig, ReasoningDialect, ReasoningEffort};
     #[test]
     fn effective_effort_selection_preserves_default_and_rejects_unknown() {
-        let settings = ModelSettings { reasoning: Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::Low, ReasoningEffort::High], budget_tokens: None }), ..Default::default() };
+        let settings = ModelSettings {
+            reasoning: Some(ReasoningConfig {
+                dialect: ReasoningDialect::OpenAi,
+                efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
         let model = settings.effective_model();
         assert_eq!(model.clamp_effort(None), None);
-        assert_eq!(model.clamp_effort(Some(ReasoningEffort::High)), Some(ReasoningEffort::High));
+        assert_eq!(
+            model.clamp_effort(Some(ReasoningEffort::High)),
+            Some(ReasoningEffort::High)
+        );
         assert_eq!(model.clamp_effort(Some(ReasoningEffort::Medium)), None);
-        assert_eq!(model.supported_efforts(), &[ReasoningEffort::Low, ReasoningEffort::High]);
+        assert_eq!(
+            model.supported_efforts(),
+            &[ReasoningEffort::Low, ReasoningEffort::High]
+        );
     }
 
     #[test]
     fn effective_efforts_are_empty_without_reasoning_or_when_overridden_off() {
         let mut settings = ModelSettings::default();
         assert!(settings.effective_model().supported_efforts().is_empty());
-        settings.reasoning = Some(ReasoningConfig { dialect: ReasoningDialect::OpenAi, efforts: vec![ReasoningEffort::High], budget_tokens: None });
+        settings.reasoning = Some(ReasoningConfig {
+            dialect: ReasoningDialect::OpenAi,
+            efforts: vec![ReasoningEffort::High],
+            budget_tokens: None,
+        });
         settings.reasoning_override = Some(false);
         assert!(settings.effective_model().supported_efforts().is_empty());
     }
     #[test]
     fn infer_classifies_catalog_ids_by_name() {
         for (id, kind) in [
-            ("gpt-5.6-luna", ModelType::Chat), ("codex-auto-review", ModelType::Chat), ("Qwen/Qwen3-VL-235B", ModelType::Chat),
-            ("gpt-image-2", ModelType::Image), ("gpt-image-2.5-flare", ModelType::Image), ("dall-e-3", ModelType::Image), ("black-forest-labs/FLUX.1-dev", ModelType::Image),
-            ("text-embedding-3-large", ModelType::Embedding), ("BAAI/bge-m3", ModelType::Chat),
-            ("BAAI/bge-reranker-v2-m3", ModelType::Rerank), ("whisper-1", ModelType::Stt), ("gpt-4o-transcribe", ModelType::Stt),
-            ("gpt-4o-mini-tts", ModelType::Tts), ("sora-2", ModelType::Video),
-        ] { assert_eq!(ModelType::infer(id), kind, "{id}"); }
+            ("gpt-5.6-luna", ModelType::Chat),
+            ("codex-auto-review", ModelType::Chat),
+            ("Qwen/Qwen3-VL-235B", ModelType::Chat),
+            ("gpt-image-2", ModelType::Image),
+            ("gpt-image-2.5-flare", ModelType::Image),
+            ("dall-e-3", ModelType::Image),
+            ("black-forest-labs/FLUX.1-dev", ModelType::Image),
+            ("text-embedding-3-large", ModelType::Embedding),
+            ("BAAI/bge-m3", ModelType::Chat),
+            ("BAAI/bge-reranker-v2-m3", ModelType::Rerank),
+            ("whisper-1", ModelType::Stt),
+            ("gpt-4o-transcribe", ModelType::Stt),
+            ("gpt-4o-mini-tts", ModelType::Tts),
+            ("sora-2", ModelType::Video),
+        ] {
+            assert_eq!(ModelType::infer(id), kind, "{id}");
+        }
     }
 }

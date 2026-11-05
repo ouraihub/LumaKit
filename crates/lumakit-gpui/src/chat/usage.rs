@@ -23,7 +23,7 @@ pub fn usage_totals(total: &UsageTotals, r: Roles) -> Div {
         .gap(space::S4)
         .text_style(text::METADATA)
         .child(format!(
-            "请求 {} · 缺少用量 {} · 费用未知 {}",
+            "请求 {} · 缺少用量 {} · 无可用单价 {}",
             total.requests, total.missing_usage, total.missing_cost
         ))
         .child(format!(
@@ -45,24 +45,17 @@ pub fn usage_totals(total: &UsageTotals, r: Roles) -> Div {
                 .reasoning_tokens
                 .map_or_else(|| "未知".into(), |tokens| tokens.to_string())
         ));
-    if total.costs.is_empty() {
-        body = body.child("token 费用估算：未知");
+    if total.configured_costs.is_empty() {
+        body = body.child("未配置完整用户单价，显示 token 消耗，不套用目录参考价");
     } else {
-        for (currency, amount) in &total.costs {
-            body = body.child(format!(
-                "token 费用估算：{currency} {amount}{}",
-                if total.missing_cost > 0 {
-                    "（已知部分）"
-                } else {
-                    ""
-                }
-            ));
+        for (currency, amount) in &total.configured_costs {
+            body = body.child(format!("用户单价估算：{currency} {amount}"));
         }
     }
     body.child(
         label(
             text::METADATA,
-            "估算来自请求时保存的配置或目录参考单价，并非服务商账单；不含搜索等额外服务费。",
+            "金额仅来自请求时保存的用户配置单价，并非服务商账单；未配置时显示 token，不含搜索等额外服务费。",
         )
         .text_color(r.text_muted)
         .whitespace_normal(),
@@ -95,7 +88,7 @@ pub(super) fn context_summary(context: &ContextUsage, r: Roles) -> Div {
 pub(super) fn usage_details(attempt: &Attempt) -> Div {
     let mut body = col().gap(space::S4).text_style(text::METADATA);
     if attempt.rounds.is_empty() {
-        body = body.child("用量未提供 · token 费用估算未知");
+        body = body.child("用量未提供 · 未配置用户单价");
     }
     for (index, round) in attempt.rounds.iter().enumerate() {
         let tokens = round.usage.as_ref().map_or_else(|| "用量未提供".into(), |usage| format!(
@@ -103,17 +96,12 @@ pub(super) fn usage_details(attempt: &Attempt) -> Div {
             usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
             usage.reasoning_tokens.map_or_else(|| "未知".into(), |tokens| tokens.to_string())));
         let cost = match (&round.pricing, round.cost, round.cost_source) {
-            (Some(price), Some(cost), source)
+            (Some(price), Some(cost), CostSource::Estimate)
                 if cost.is_finite() && cost >= 0. && !price.currency.trim().is_empty() =>
             {
-                let source = match source {
-                    CostSource::Estimate => "配置单价 token 费用估算",
-                    CostSource::Reference => "官方/目录参考单价 token 费用估算",
-                    CostSource::Unknown => "历史 token 费用估算（来源未知）",
-                };
-                format!("{source}：{} {cost}", price.currency)
+                format!("用户单价 token 费用估算：{} {cost}", price.currency)
             }
-            _ => "token 费用估算未知".into(),
+            _ => "未配置用户单价，不估算金额".into(),
         };
         body = body.child(
             label(
