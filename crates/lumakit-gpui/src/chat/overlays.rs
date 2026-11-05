@@ -8,7 +8,6 @@ impl ChatPanel {
         let mut content = col().gap(space::S8);
         let menu = !matches!(layer, Overlay::Edit);
         let compact = matches!(layer, Overlay::Tools | Overlay::Quick);
-        let combined = matches!(layer, Overlay::ModelPicker);
         match layer {
             Overlay::History => {
                 content = content.child("历史对话").child(Input::new(&self.search).aria_label("搜索对话"));
@@ -36,7 +35,6 @@ impl ChatPanel {
             }
             Overlay::Tools => { content = self.tools_menu(session, image_options, can_image, cx); }
             Overlay::Quick => { content = self.customize_toolbar(session, cx); }
-            Overlay::ModelPicker => { content = self.model_picker(session, options, window, cx); }
             Overlay::ImageModels => {
                 content = content.child("选择生图模型")
                     .child(Input::new(&self.search).aria_label("搜索模型、服务商、端点"))
@@ -131,14 +129,14 @@ impl ChatPanel {
         // Menus open below a trigger in the upper half of the window and above one in the lower half,
         // aligned to the trigger edge nearer the window centre. Dialogs, and menus whose trigger is gone, stay centered.
         let below = trigger.is_some_and(|t| f32::from(t.center().y) < height / 2.);
-        let layer_width = if combined { model_picker::WIDTH } else if compact { toolbar::TOOL_MENU_WIDTH } else { LAYER_W };
+        let layer_width = if compact { toolbar::TOOL_MENU_WIDTH } else { LAYER_W };
         let (surface_w, surface_h) = match trigger {
             Some(t) => (f32::from(layer_width).min(width - 2. * MENU_MARGIN),
                 if below { height - f32::from(t.bottom()) } else { f32::from(t.top()) } - MENU_MARGIN - f32::from(MENU_GAP)),
             None => (f32::from(layer_width).min(width - 2. * MENU_MARGIN), height - LAYER_MARGIN),
         };
         let surface = col().id("chat-layer").occlude().w(px(surface_w)).when(trigger.is_none(), |s| s.max_w_full())
-            .max_h(px(surface_h.max(LAYER_MIN_HEIGHT))).p(if combined { space::S0 } else if compact { space::S4 } else { space::S12 }).gap(space::S4).rounded(radius::LG)
+            .max_h(px(surface_h.max(LAYER_MIN_HEIGHT))).p(if compact { space::S4 } else { space::S12 }).gap(space::S4).rounded(radius::LG)
             .bg(r.container_elevated_bg).border_1().border_color(r.border_default).shadow_lg()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -148,8 +146,8 @@ impl ChatPanel {
                     if !search_ime && !edit_ime { this.close(window, cx); cx.stop_propagation(); }
                 }
             }))
-            .child(if combined { content.into_any_element() } else { div().id("chat-layer-scroll").flex_1().min_h_0().overflow_y_scroll().child(content).into_any_element() })
-            .when(!compact && !combined, |s| s.child(row().justify_end().child(Button::new("close-layer").small().ghost().label(if self.edit.is_some() { "取消" } else { "关闭" })
+            .child(div().id("chat-layer-scroll").flex_1().min_h_0().overflow_y_scroll().child(content))
+            .when(!compact, |s| s.child(row().justify_end().child(Button::new("close-layer").small().ghost().label(if self.edit.is_some() { "取消" } else { "关闭" })
                 .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))))))
             .focus_trap("chat-layer-trap", &self.focus);
         let Some(trigger) = trigger else {

@@ -13,6 +13,7 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 | `lumakit-design` | GPUI 设计系统：主题、令牌、字体、图标、组件、外观偏好与外观页 | GPUI 宿主 |
 | `lumakit-ai` | AI 协议、会话、目录、搜索、MCP、技能；聊天动作 `chat::{ChatAction, ModelOption}` | AI 宿主 |
 | `lumakit-gpui` | GPUI 聊天面板 | LumaDesk |
+| `lumakit-model-picker` | 独立 GPUI 模型／推理强度选择器，仅依赖 gpui-kit；读取宿主主题，不含网络或存储 | LumaDesk、ThinkRail Native |
 | `lumakit-egui` | egui 聊天面板，`examples/chat-host` 独立宿主 | LumaDesk `main` 分支；GPUI 版合并后删除 |
 
 `examples/lumakit-cli` 是无界面组合根，验证 AI 运行时与日志。
@@ -64,9 +65,11 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 
 - `lumakit-gpui::ChatPanel`：GPUI 聊天面板，样式只取自 `lumakit-design`；Markdown 先经 pulldown-cmark 清理，不加载图片。
 - GPUI 输入区“＋”菜单使用 256px 锚定浮层；“自定义工具栏”提供图标、拖动手柄、显示开关与恢复默认。手柄可拖放或用上下键调整已固定工具的顺序，关闭后重开、应用重启均保留。只列出实际实现的新对话、网络搜索、上传附件、生成图片，不改变请求开关或执行工具。未固定工具仍可从“＋”菜单执行；Esc 或点击外部关闭浮层。
-- GPUI 模型与推理强度合为一个入口及 360px 浮层：固定/最近/供应商分组、两行元数据、模糊搜索与 `模型名 high` 组合搜索；切换模型保持浮层打开，下方离散滑杆支持拖动、档位点击、左右键。默认状态独立于各档位，可恢复服务商默认；高开销档位提示费用与耗时。收藏/默认组合持久化，刷新通过 `RefreshModels` 交给宿主；元数据使用显式配置或可精确识别的内置目录，无法识别时保持未知。
+- GPUI 模型与推理强度入口由独立 `lumakit-model-picker::Picker` 提供：底部输入工具栏的紧凑模型按钮向上展开 360px 浮层，搜索支持 `模型名 high`；供应商分组、两行来源信息、当前选中标记、离散滑杆、档位点击及左右键共用实现。按截图不再重复铺“最近使用／全部模型／收藏”区块。底栏“设为默认”“重置为 off”和刷新具有不同含义；无 off 能力时不伪造关闭，默认继承不会自动变成第一档。
 - `lumakit-egui::ChatPanel`：egui/eframe **0.37.0** 版，Markdown 用 egui_commonmark **0.26.0**；`install_icon_font` 在 `set_fonts` 前注册 Phosphor 图标字体。只服务 LumaDesk `main` 分支与 `examples/chat-host`。
 - 两个面板沿用现有“用量”入口，弹层展示上下文估算和当前对话累计，上次回答明细默认折叠；全局按日期/模型/服务商统计由宿主设置页提供，独立 egui 示例在同一菜单内按需展开。金额区分配置与目录参考价，不进行币种换算。
+- 共享选择器只接收无密钥的 `PickerData`（模型稳定身份、来源、已声明档位、当前组合、默认组合和忙碌／错误状态），只发 `Select/SetDefault/Refresh` 意图。`lumakit-gpui` 将它们转为既有 `ChatAction`；ThinkRail Native 将它们转为原有 `AgentSession::set_model`、`ModelPrefService::set_default` 和目录刷新。两宿主的数据库和引擎状态不互相迁移。
+- 图标使用原版 ThinkRail `ModelEffortPicker.tsx` 所用的 `@remixicon/react` **4.9.0** 路径（npm SHA-1 `e4469985dc88af987f03c2309e36b04028cb4600`），不以相似 Lucide 图形替换：关闭 Zzz、最低 Leaf、低 Flashlight、中 ContrastDrop2（半填充水滴）、高 Sparkling2、极高 Sparkling、最高 Fire；图钉、钥匙、重置／刷新同源。通过 `PickerAssets(HostAssets)` 组合宿主资源；资源离线嵌入，许可见 `crates/lumakit-model-picker/LICENSE-REMIX`（https://github.com/Remix-Design/RemixIcon/blob/master/License）。
 
 egui 与 GPUI 两条线在同一 `Cargo.lock` 解析版本，所以 `gpui-kit/test-support`（无头窗口测试）目前无法启用；删除 egui 线后再引入。
 
@@ -88,6 +91,10 @@ CLI 默认不发请求；设置 `LUMAKIT_AI_URL` 后追加真实流式请求，`
 2026-11-05 会话合同调整验证：workspace 166 项测试、LumaDesk 36 项测试通过；GPUI 产品宿主与独立 egui 宿主均用隔离目录、回环 HTTP 完成真实发送、接收、正常退出及 SQLite 回读。两端均观察到服务商默认独立于关闭/最低至高档位。
 
 本次模块规模评审：`chat.rs` 198 行，数据合同 165 行、历史编辑 175 行、请求编排 254 行、事件归约 138 行、已存搜索/工具操作 75 行。尚超阈值的既有文件：`lib.rs`（702 行，运行时及公共合同）、`model_config.rs`（548 行，模型设置与计费合同）、egui `chat.rs`（980 行，既有渲染器）；本次仅接入共享视图/等待事件/空闲门控，不在这些文件新增第二套流程。暂不连带重构完整运行时、计费或旧 egui 布局，避免把会话拆分扩大为无关迁移；GPUI `chat.rs` 442 行为面板协调入口，子视图已拆分。
+
+2026-11-05 独立模型选择器验证：LumaKit workspace 168 项、LumaDesk 36 项、ThinkRail Native 280 项测试通过（Native 既有 16 项下载／外部引擎测试按原约定忽略）；共享选择器严格 clippy 通过。两个实际 GPUI 窗口均确认底部入口向上展开、Zzz／叶子／闪电／半填充水滴图标、分组、等级搜索、设默认及重置 off。Native 使用真实 pi 会话执行切换，无模型请求，SQLite 回读确认默认组合保存且普通切换不改默认；点击、拖动、左右键、Esc 和刷新已操作。LumaDesk 在 320/375/414/768 客户区宽度观察浮层与按钮可达，无纵排档位标签。
+
+提炼后模块行数：共享 `state` 142、`effort` 116、`icons` 77、`presentation` 219、`rail` 212、`view` 226；ThinkRail Native 适配层 297 行。组件不含服务、数据库或第二套会话状态机；旧聊天内选择器实现已移除。
 
 ## Windows EXE
 

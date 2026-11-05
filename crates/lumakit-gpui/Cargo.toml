@@ -8,5 +8,6 @@ license.workspace = true
 gpui-kit = "=0.9.0"
 lumakit-ai = { path = "../lumakit-ai" }
 lumakit-design = { path = "../lumakit-design" }
+lumakit-model-picker = { path = "../lumakit-model-picker" }
 pulldown-cmark = { version = "0.13", default-features = false }
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

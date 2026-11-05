@@ -1,0 +1,8 @@
+[package]
+name = "lumakit-model-picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = "=0.9.0"

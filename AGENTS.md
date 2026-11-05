@@ -1,6 +1,6 @@
 # 项目约束
 
-LumaKit 是多个 Rust 桌面产品共用的基础库。当前消费方：LumaDesk（AI agent 工作台）与冰蓝复刻（`../rust-desktop-preview`，Windows 桌面伴侣）。
+LumaKit 是多个 Rust 桌面产品共用的基础库。当前消费方：LumaDesk（AI agent 工作台）、ThinkRail Native（独立模型选择器）。计划中的消费方：冰蓝复刻（`../rust-desktop-preview`，Windows 桌面伴侣），目前只有其验证工程 `spikes/gpui-surfaces` 使用 `lumakit-design`。
 
 ## 什么能进 Kit
 
@@ -16,11 +16,12 @@ LumaKit 是多个 Rust 桌面产品共用的基础库。当前消费方：LumaDe
 - `lumakit-support`、`lumakit-observability` 不依赖任何 UI 或 AI crate。
 - `lumakit-design` 只依赖 gpui-kit 与通用库，不依赖 `lumakit-ai`；除读取主题与字体文件外不碰网络、数据库或设置存储，偏好持久化由宿主负责。
 - `lumakit-ai` 不依赖任何 UI；`lumakit-gpui` / `lumakit-egui` 只是 AI 聊天面板，依赖 `lumakit-ai`。
+- `lumakit-model-picker` 只依赖 gpui-kit，通过 `ActiveTheme` 读取宿主安装的主题；不依赖 `lumakit-ai`、`lumakit-design` 或任何产品 crate，不安装第二套全局主题。尺寸来自自身组件令牌；该边界专供不同设计系统的 GPUI 宿主共用选择器。
 - 产品仓库依赖 Kit，Kit 不依赖产品。
 
 ## 界面
 
-- GPUI 界面的颜色只取 `LumaTheme::global(cx).roles`，间距、尺寸、圆角、字体样式只取 `lumakit_design::metrics`；不写十六进制颜色，主题调色板只在主题目录 JSON。
+- 依赖 `lumakit-design` 的 GPUI 界面颜色只取 `LumaTheme::global(cx).roles`，间距、尺寸、圆角、字体样式只取 `lumakit_design::metrics`；不写十六进制颜色，主题调色板只在主题目录 JSON。独立 `lumakit-model-picker` 按上方边界读取 GPUI ActiveTheme，不引入 LumaTheme。
 - 设计系统提炼自 ThinkRail Native `crates/ui`；新增组件先找 ThinkRail 的对应物，不自创布局。
 - 修改共享组件必须运行每个受影响的消费宿主做实窗验证；没有实窗观察不能宣称 UI 验收完成。
 

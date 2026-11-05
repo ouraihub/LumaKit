@@ -43,7 +43,7 @@ const EDITOR_HEIGHT: Pixels = px(220.);
 const SCROLL_LINE: Pixels = px(20.);
 
 #[derive(Clone)]
-enum Overlay { History, Tools, Quick, ImageModels, ModelPicker, Usage, More(String, String, String), RetryModels, Edit }
+enum Overlay { History, Tools, Quick, ImageModels, Usage, More(String, String, String), RetryModels, Edit }
 struct Edit { conversation: String, turn: String, attempt: String, expected: SharedString }
 /// Last laid-out bounds of each menu trigger, written during prepaint so a menu opens beside its button.
 type Anchors = Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>;
@@ -67,7 +67,7 @@ impl ChatPanel {
         let input = cx.new(|cx| TextareaState::new(window, cx).placeholder("输入消息…").rows(3));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let editor = cx.new(|cx| TextareaState::new(window, cx).rows(8));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&input, |this, state, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = state.read(cx).value();
@@ -78,24 +78,22 @@ impl ChatPanel {
                     }
                 }
             }),
-            cx.subscribe(&search, |this, _, event, cx| { if matches!(event, InputEvent::Change) { this.picker.highlighted = 0; this.picker.search_folded.clear(); cx.notify(); } }),
+            cx.subscribe(&search, |_, _, event, cx| { if matches!(event, InputEvent::Change) { cx.notify(); } }),
         ];
+        let (picker, subscription) = model_picker::PickerState::new(window, cx);
+        subscriptions.push(subscription);
         Self { input, search, editor, _subscriptions: subscriptions,
             conversation: None, draft: "".into(), external_busy: false, unlocked: true, valid_model: false,
             expanded: false, overlay: None, delete: None, edit: None, details: HashSet::new(),
             focus: cx.focus_handle(), scroll: ScrollHandle::new(), follow: true,
-            markdown: MarkdownCache::default(), media: MediaPreview::default(), anchors: Anchors::default(), anchor: None, image_notice: "请先选择生图模型", picker: model_picker::PickerState::default() }
+            markdown: MarkdownCache::default(), media: MediaPreview::default(), anchors: Anchors::default(), anchor: None, image_notice: "请先选择生图模型", picker }
     }
     /// Disable writes while the host owns an asynchronous file picker.
     pub fn set_external_busy(&mut self, busy: bool) { self.external_busy = busy; }
     /// `trigger` names the button that opened the layer; a layer opened from inside a menu keeps that menu's anchor.
     fn open(&mut self, overlay: Overlay, trigger: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         if self.anchors.borrow().contains_key(&trigger) { self.anchor = Some(trigger); }
-        if matches!(overlay, Overlay::ModelPicker) {
-            self.picker.initialized = false; self.picker.expanded.clear(); self.picker.search_folded.clear(); self.picker.show_all = false; self.picker.highlighted = 0;
-            cx.emit(ChatAction::RefreshModels { force: false });
-        }
-        if matches!(overlay, Overlay::History | Overlay::ImageModels | Overlay::RetryModels | Overlay::ModelPicker) {
+        if matches!(overlay, Overlay::History | Overlay::ImageModels | Overlay::RetryModels) {
             self.search.update(cx, |state, cx| { state.set_value("", window, cx); state.focus(window, cx); });
         } else { self.focus.focus(window, cx); }
         self.overlay = Some(overlay); cx.notify();
@@ -262,7 +260,7 @@ impl ChatPanel {
             toolbar = toolbar.child(self.action("remove-image-mode", "生成图片", self.unlocked, ChatAction::SetComposer(next), cx)
                 .icon(IconName::X).accessibility_label("关闭生成图片"));
         }
-        toolbar = toolbar.child(self.tracked("model", self.model_pill(session, options, cx)))
+        toolbar = toolbar.child(self.model_pill(session, options, cx))
             .child(self.tracked("usage", self.layer_button("usage", "用量", true, Overlay::Usage, cx)));
         if !self.follow { toolbar = toolbar.child(icon_button("bottom", IconName::ArrowDown, "回到底部")
             .on_click(cx.listener(|this, _, _, cx| { this.follow = true; this.scroll.scroll_to_bottom(); cx.notify(); }))); }
@@ -415,11 +413,6 @@ fn icon_button(id: impl Into<ElementId>, icon: IconName, label: &'static str) ->
 }
 fn same_model(a: &ModelRef, b: &ModelRef) -> bool { a.provider == b.provider && a.endpoint == b.endpoint && a.model == b.model && a.protocol == b.protocol }
 fn model_label(option: &ModelOption) -> String { format!("{} · {} / {}", option.name, option.provider, option.endpoint) }
-fn reasoning_label(effort: Option<ReasoningEffort>) -> &'static str {
-    match effort { None => "默认", Some(ReasoningEffort::None) => "关闭", Some(ReasoningEffort::Auto) => "自动",
-        Some(ReasoningEffort::Minimal) => "最低", Some(ReasoningEffort::Low) => "低", Some(ReasoningEffort::Medium) => "中",
-        Some(ReasoningEffort::High) => "高", Some(ReasoningEffort::Xhigh) => "极高", Some(ReasoningEffort::Max) => "最高" }
-}
 
 /// Call on the host's file-picker worker, never during render.
 pub fn pick_attachment() -> Result<Option<std::path::PathBuf>, String> {

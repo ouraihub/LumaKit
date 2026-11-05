@@ -4214,7 +4214,15 @@ dependencies = [
  "image",
  "lumakit-ai",
  "lumakit-design",
+ "lumakit-model-picker",
  "pulldown-cmark",
+]
+
+[[package]]
+name = "lumakit-model-picker"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
 ]
 
 [[package]]
