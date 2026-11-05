@@ -15,7 +15,7 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 | `lumakit-gpui` | GPUI 聊天面板 | LumaDesk |
 | `lumakit-model-picker` | 独立 GPUI 模型／推理强度选择器，仅依赖 gpui-kit；读取宿主主题，不含网络或存储 | LumaDesk、ThinkRail Native |
 | `lumakit-usage-status` | 受控上下文占用／累计 token／费用状态与系统图标，仅依赖 gpui-kit | LumaDesk、ThinkRail Native |
-| `lumakit-egui` | egui 聊天面板，`examples/chat-host` 独立宿主 | LumaDesk `legacy/egui` 分支；GPUI 版已合入 `main`，待删除 |
+| `lumakit-egui` | egui 聊天面板，`examples/chat-host` 独立宿主 | LumaDesk 旧 egui 版（标签 `legacy-egui`）；GPUI 版已合入 `main`，待删除 |
 
 `examples/lumakit-cli` 是无界面组合根，验证 AI 运行时与日志。
 
@@ -67,7 +67,7 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 - `lumakit-gpui::ChatPanel`：GPUI 聊天面板，样式只取自 `lumakit-design`；Markdown 先经 pulldown-cmark 清理，不加载图片。
 - GPUI 输入区“＋”菜单使用 256px 锚定浮层；“自定义工具栏”提供图标、拖动手柄、显示开关与恢复默认。手柄可拖放或用上下键调整已固定工具的顺序，关闭后重开、应用重启均保留。只列出实际实现的新对话、网络搜索、上传附件、生成图片，不改变请求开关或执行工具。未固定工具仍可从“＋”菜单执行；Esc 或点击外部关闭浮层。
 - GPUI 模型与推理强度入口由独立 `lumakit-model-picker::Picker` 提供：底部输入工具栏的紧凑模型按钮向上展开 360px 浮层，搜索支持 `模型名 high`；供应商分组、两行来源信息、当前选中标记、离散滑杆、档位点击及左右键共用实现。按截图不再重复铺“最近使用／全部模型／收藏”区块。底栏“设为默认”“重置为 off”和刷新具有不同含义；无 off 能力时不伪造关闭，默认继承不会自动变成第一档。
-- `lumakit-egui::ChatPanel`：egui/eframe **0.37.0** 版，Markdown 用 egui_commonmark **0.26.0**；`install_icon_font` 在 `set_fonts` 前注册 Phosphor 图标字体。只服务 LumaDesk `legacy/egui` 分支与 `examples/chat-host`。
+- `lumakit-egui::ChatPanel`：egui/eframe **0.37.0** 版，Markdown 用 egui_commonmark **0.26.0**；`install_icon_font` 在 `set_fonts` 前注册 Phosphor 图标字体。只服务 LumaDesk 旧 egui 版（标签 `legacy-egui`）与 `examples/chat-host`。
 - 两个面板沿用现有“用量”入口，弹层展示上下文估算和当前对话累计，上次回答明细默认折叠；全局按日期／模型／服务商统计由宿主设置页提供。仅用户配置的请求价格用于金额显示；未配置时显示 token，不套用目录参考价，不进行币种换算。
 - 共享选择器只接收无密钥的 `PickerData`（模型稳定身份、来源、已声明档位、当前组合、默认组合和忙碌／错误状态），只发 `Select/SetDefault/Refresh` 意图。`lumakit-gpui` 将它们转为既有 `ChatAction`；ThinkRail Native 将它们转为原有 `AgentSession::set_model`、`ModelPrefService::set_default` 和目录刷新。两宿主的数据库和引擎状态不互相迁移。
 - 图标使用原版 ThinkRail `ModelEffortPicker.tsx` 所用的 `@remixicon/react` **4.9.0** 路径（npm SHA-1 `e4469985dc88af987f03c2309e36b04028cb4600`），不以相似 Lucide 图形替换：关闭 Zzz、最低 Leaf、低 Flashlight、中 ContrastDrop2（半填充水滴）、高 Sparkling2、极高 Sparkling、最高 Fire；图钉、钥匙、重置／刷新同源。通过 `PickerAssets(HostAssets)` 组合宿主资源；资源离线嵌入，许可见 `crates/lumakit-model-picker/LICENSE-REMIX`（https://github.com/Remix-Design/RemixIcon/blob/master/License）。
