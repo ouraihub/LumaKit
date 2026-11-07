@@ -1,4 +1,4 @@
-//! Structured file logging and diagnostics for Rust desktop hosts.
+//! Structured file logging, trace context and diagnostics for Rust desktop hosts.
 use lumakit_support::SupportError;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,6 +12,16 @@ use tracing_subscriber::{
     EnvFilter, Registry, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+mod operation;
+mod redact;
+#[cfg(test)]
+mod tests;
+mod trace;
+
+pub use operation::{OperationGuard, operation};
+pub use redact::{bounded_text, diagnostic_hash, redact_secret, redact_url};
+pub use trace::TraceContext;
+
 /// 文件日志的最低记录级别；同时包含比所选级别更严重的事件。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LogLevel {
@@ -23,6 +33,8 @@ pub enum LogLevel {
     Info,
     /// 记录调试及更严重的事件，不包含 trace。
     Debug,
+    /// 记录所有诊断事件。
+    Trace,
 }
 impl LogLevel {
     fn as_filter(self) -> &'static str {
@@ -31,6 +43,7 @@ impl LogLevel {
             Self::Warn => "warn",
             Self::Info => "info",
             Self::Debug => "debug",
+            Self::Trace => "trace",
         }
     }
 }
