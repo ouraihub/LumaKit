@@ -5,19 +5,15 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-/// 交互式聊天界面及其会话状态。
-pub mod chat;
 /// 从已保存的服务商快照解析模型连接。
 pub mod catalog;
 /// SQLite 服务商目录持久化。
 pub mod catalog_store;
+/// 交互式聊天界面及其会话状态。
+pub mod chat;
 /// 模型元数据、请求限制、推理方言与计费。
 pub mod model_config;
 pub use model_config::{RoundUsage, TokenUsage};
-/// 持久化请求用量账本与按范围统计。
-pub mod usage;
-/// 自动补全的模型目录参考元数据；显式设置优先。
-pub mod model_reference;
 /// 聊天历史记录与持久化存储。
 pub mod history;
 /// 内嵌图片的大小、数量和编码校验。
@@ -26,6 +22,8 @@ pub mod images;
 pub mod mcp;
 /// 带作用域和令牌授权的 MCP 服务端处理。
 pub mod mcp_server;
+/// 自动补全的模型目录参考元数据；显式设置优先。
+pub mod model_reference;
 mod protocol;
 /// 服务商配置、模型能力与密钥存储。
 pub mod providers;
@@ -35,6 +33,8 @@ pub mod search;
 pub mod search_adapters;
 /// 技能文档解析、确认与本地存储。
 pub mod skills;
+/// 持久化请求用量账本与按范围统计。
+pub mod usage;
 
 /// 模型请求与流式响应使用的协议。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,8 +66,12 @@ impl AiConnection {
     ///
     /// # Errors
     /// 未配置推理能力、所选强度不在允许列表或模型设置无效时返回错误说明。
-    pub fn with_reasoning_effort(mut self, effort: model_config::ReasoningEffort) -> Result<Self, String> {
-        self.settings = model_reference::effective_settings(&self.model, self.protocol, &self.settings);
+    pub fn with_reasoning_effort(
+        mut self,
+        effort: model_config::ReasoningEffort,
+    ) -> Result<Self, String> {
+        self.settings =
+            model_reference::effective_settings(&self.model, self.protocol, &self.settings);
         if !self.settings.effective_model().supports_effort(effort) {
             return Err("模型未声明该推理强度".into());
         }
@@ -128,46 +132,106 @@ pub async fn stream_chat_with_usage<F>(
 where
     F: FnMut(String) + Send,
 {
-    connection.settings = model_reference::effective_settings(&connection.model, connection.protocol, &connection.settings);
+    connection.settings = model_reference::effective_settings(
+        &connection.model,
+        connection.protocol,
+        &connection.settings,
+    );
     let messages = validated_messages(&connection, messages, &cancel)?;
-    let result = round(&http_client()?, &connection, None, &messages, &[], &cancel, &mut on_text).await?;
-    if !result.tool_calls.is_empty() { return Err(AiError::Provider("unexpected tool calls in text chat".into())); }
+    let result = round(
+        &http_client()?,
+        &connection,
+        None,
+        &messages,
+        &[],
+        &cancel,
+        &mut on_text,
+    )
+    .await?;
+    if !result.tool_calls.is_empty() {
+        return Err(AiError::Provider(
+            "unexpected tool calls in text chat".into(),
+        ));
+    }
     Ok(result)
 }
 
-fn validated_messages(connection: &AiConnection, messages: Vec<ChatMessage>, cancel: &CancellationToken) -> Result<Vec<Message>, AiError> {
-    if messages.is_empty() || messages.len() % 2 == 0 { return Err(AiError::Provider("chat must start and end with a user message".into())); }
+fn validated_messages(
+    connection: &AiConnection,
+    messages: Vec<ChatMessage>,
+    cancel: &CancellationToken,
+) -> Result<Vec<Message>, AiError> {
+    if messages.is_empty() || messages.len() % 2 == 0 {
+        return Err(AiError::Provider(
+            "chat must start and end with a user message".into(),
+        ));
+    }
     let mut bytes = 0usize;
     for (index, message) in messages.iter().enumerate() {
         let (text, images) = match message {
             ChatMessage::User(text) if index % 2 == 0 => (text.as_str(), None),
             ChatMessage::UserImages { text, images } if index % 2 == 0 => {
-                if !connection.settings.supports_vision { return Err(AiError::Provider("所选模型不支持视觉输入".into())); }
+                if !connection.settings.supports_vision {
+                    return Err(AiError::Provider("所选模型不支持视觉输入".into()));
+                }
                 images::validate(images).map_err(|error| AiError::Provider(error.to_string()))?;
                 (text.as_str(), Some(images.as_slice()))
             }
             ChatMessage::Assistant(text) if index % 2 == 1 => (text.as_str(), None),
-            _ => return Err(AiError::Provider("chat roles must alternate user and assistant".into())),
+            _ => {
+                return Err(AiError::Provider(
+                    "chat roles must alternate user and assistant".into(),
+                ));
+            }
         };
         bytes = bytes.saturating_add(text.len());
-        if (text.trim().is_empty() && images.is_none_or(<[_]>::is_empty)) || bytes > 1024 * 1024 { return Err(AiError::Provider("chat text must be nonempty and total at most 1 MiB".into())); }
+        if (text.trim().is_empty() && images.is_none_or(<[_]>::is_empty)) || bytes > 1024 * 1024 {
+            return Err(AiError::Provider(
+                "chat text must be nonempty and total at most 1 MiB".into(),
+            ));
+        }
     }
-    if connection.model.trim().is_empty() { return Err(AiError::ModelNotConfigured); }
-    if cancel.is_cancelled() { return Err(AiError::Cancelled); }
-    Ok(messages.into_iter().map(|message| match message {
-        ChatMessage::User(text) => Message::User { text, images: Vec::new() },
-        ChatMessage::UserImages { text, images } => Message::User { text, images },
-        ChatMessage::Assistant(text) => Message::Assistant { text, tool_calls: Vec::new(), reasoning_blocks: Vec::new() },
-    }).collect())
+    if connection.model.trim().is_empty() {
+        return Err(AiError::ModelNotConfigured);
+    }
+    if cancel.is_cancelled() {
+        return Err(AiError::Cancelled);
+    }
+    Ok(messages
+        .into_iter()
+        .map(|message| match message {
+            ChatMessage::User(text) => Message::User {
+                text,
+                images: Vec::new(),
+            },
+            ChatMessage::UserImages { text, images } => Message::User { text, images },
+            ChatMessage::Assistant(text) => Message::Assistant {
+                text,
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+            },
+        })
+        .collect())
 }
 
 /// 发送文本会话；不需要持久化用量时只返回正文。
 ///
 /// # Errors
 /// 输入、模型设置或协议无效、取消、上游报错、响应截断或返回意外工具调用时返回错误。
-pub async fn stream_chat<F>(connection: AiConnection, messages: Vec<ChatMessage>, cancel: CancellationToken, on_text: F) -> Result<String, AiError>
-where F: FnMut(String) + Send {
-    Ok(stream_chat_with_usage(connection, messages, cancel, on_text).await?.text)
+pub async fn stream_chat<F>(
+    connection: AiConnection,
+    messages: Vec<ChatMessage>,
+    cancel: CancellationToken,
+    on_text: F,
+) -> Result<String, AiError>
+where
+    F: FnMut(String) + Send,
+{
+    Ok(
+        stream_chat_with_usage(connection, messages, cancel, on_text)
+            .await?
+            .text,
+    )
 }
 
 /// 交由宿主选择模型、提示词和工具的运行请求。
@@ -340,53 +404,135 @@ impl<H: AiHost> AiRuntime<H> {
     }
     /// 返回宿主为该请求公开的工具，不执行调用或审批。
     pub fn available_tools(&self, request: &RunRequest) -> Vec<ToolSpec> {
-        let Ok(model) = self.host.select_model(request) else { return Vec::new(); };
-        let Ok(connection) = self.host.connection(&model) else { return Vec::new(); };
-        if connection.settings.model_type != model_config::ModelType::Chat || connection.settings.supports_tools == Some(false) { Vec::new() } else { self.host.tools(request) }
+        let Ok(model) = self.host.select_model(request) else {
+            return Vec::new();
+        };
+        let Ok(connection) = self.host.connection(&model) else {
+            return Vec::new();
+        };
+        if connection.settings.model_type != model_config::ModelType::Chat
+            || connection.settings.supports_tools == Some(false)
+        {
+            Vec::new()
+        } else {
+            self.host.tools(request)
+        }
     }
     /// 使用单条用户输入运行；完整历史入口见 `run_with_history`。
-    pub async fn run<F>(&self, request: RunRequest, cancel: CancellationToken, on_text: F) -> Result<AiRun, AiError>
-    where F: FnMut(String) + Send {
+    pub async fn run<F>(
+        &self,
+        request: RunRequest,
+        cancel: CancellationToken,
+        on_text: F,
+    ) -> Result<AiRun, AiError>
+    where
+        F: FnMut(String) + Send,
+    {
         let messages = vec![ChatMessage::User(request.input.clone())];
-        self.run_with_history(request, messages, cancel, on_text, |_| {}).await
+        self.run_with_history(request, messages, cancel, on_text, |_| {})
+            .await
     }
 
     /// 校验并保留完整文本/视觉历史，复用同一授权与工具续轮循环。
     /// 工具失败作为错误结果回传模型；取消立即终止，重复调用标识不重复执行。
-    pub async fn run_with_history<F, E>(&self, request: RunRequest, messages: Vec<ChatMessage>, cancel: CancellationToken, mut on_text: F, mut on_event: E) -> Result<AiRun, AiError>
-    where F: FnMut(String) + Send, E: FnMut(RunEvent) + Send {
+    pub async fn run_with_history<F, E>(
+        &self,
+        request: RunRequest,
+        messages: Vec<ChatMessage>,
+        cancel: CancellationToken,
+        mut on_text: F,
+        mut on_event: E,
+    ) -> Result<AiRun, AiError>
+    where
+        F: FnMut(String) + Send,
+        E: FnMut(RunEvent) + Send,
+    {
         let model = self.host.select_model(&request)?;
         let mut connection = self.host.connection(&model)?;
-        connection.settings = model_reference::effective_settings(&connection.model, connection.protocol, &connection.settings);
+        connection.settings = model_reference::effective_settings(
+            &connection.model,
+            connection.protocol,
+            &connection.settings,
+        );
         let mut messages = validated_messages(&connection, messages, &cancel)?;
         let system = self.host.system_prompt(&request)?;
         let tools = self.host.tools(&request);
-        if connection.settings.supports_tools == Some(false) && !tools.is_empty() { return Err(AiError::Provider("所选模型声明不支持工具".into())); }
+        if connection.settings.supports_tools == Some(false) && !tools.is_empty() {
+            return Err(AiError::Provider("所选模型声明不支持工具".into()));
+        }
         let mut text = String::new();
         let mut rounds = Vec::new();
         let mut reasoning = Vec::new();
-        let mut completed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut completed: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for _ in 0..5 {
-            let mut round = round(&self.http, &connection, system.as_deref(), &messages, &tools, &cancel, &mut on_text).await?;
-            for usage in &mut round.rounds { usage.model = Some(model.clone()); }
-            if round.text.len() > (1024 * 1024usize).saturating_sub(text.len()) { return Err(AiError::Provider("回答超过 1 MiB，已停止。".into())); }
+            let mut round = round(
+                &self.http,
+                &connection,
+                system.as_deref(),
+                &messages,
+                &tools,
+                &cancel,
+                &mut on_text,
+            )
+            .await?;
+            for usage in &mut round.rounds {
+                usage.model = Some(model.clone());
+            }
+            if round.text.len() > (1024 * 1024usize).saturating_sub(text.len()) {
+                return Err(AiError::Provider("回答超过 1 MiB，已停止。".into()));
+            }
             text.push_str(&round.text);
-            on_event(RunEvent::Round { usage: round.rounds.clone(), reasoning: round.reasoning_blocks.clone() });
+            on_event(RunEvent::Round {
+                usage: round.rounds.clone(),
+                reasoning: round.reasoning_blocks.clone(),
+            });
             rounds.extend(round.rounds);
             reasoning.extend(round.reasoning_blocks.iter().cloned());
-            if round.tool_calls.is_empty() { return Ok(AiRun { text, tool_calls: Vec::new(), rounds, reasoning_blocks: reasoning }); }
-            messages.push(Message::Assistant { text: round.text, tool_calls: round.tool_calls.clone(), reasoning_blocks: round.reasoning_blocks });
+            if round.tool_calls.is_empty() {
+                return Ok(AiRun {
+                    text,
+                    tool_calls: Vec::new(),
+                    rounds,
+                    reasoning_blocks: reasoning,
+                });
+            }
+            messages.push(Message::Assistant {
+                text: round.text,
+                tool_calls: round.tool_calls.clone(),
+                reasoning_blocks: round.reasoning_blocks,
+            });
             for call in round.tool_calls {
-                if cancel.is_cancelled() { return Err(AiError::Cancelled); }
+                if cancel.is_cancelled() {
+                    return Err(AiError::Cancelled);
+                }
                 if let Some(output) = completed.get(&call.id) {
-                    messages.push(Message::Tool { call_id: call.id, text: output.clone() });
+                    messages.push(Message::Tool {
+                        call_id: call.id,
+                        text: output.clone(),
+                    });
                     continue;
                 }
-                let mut event = ToolEvent { id: call.id.clone(), name: call.name.clone(), arguments: call.arguments.clone(), approval: None, result: None, is_error: false, error: None };
+                let mut event = ToolEvent {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    approval: None,
+                    result: None,
+                    is_error: false,
+                    error: None,
+                };
                 on_event(RunEvent::Tool(event.clone()));
                 let spec = tools.iter().find(|tool| tool.name == call.name);
                 let output = if let Some(spec) = spec {
-                    let approval = self.host.authorize(&call, if spec.requires_approval { Approval::Ask } else { Approval::Allow });
+                    let approval = self.host.authorize(
+                        &call,
+                        if spec.requires_approval {
+                            Approval::Ask
+                        } else {
+                            Approval::Allow
+                        },
+                    );
                     let approval = if approval == Approval::Ask {
                         on_event(RunEvent::Waiting { waiting: true });
                         let approval = tokio::select! {
@@ -402,11 +548,16 @@ impl<H: AiHost> AiRuntime<H> {
                         };
                         on_event(RunEvent::Waiting { waiting: false });
                         approval
-                    } else { approval };
+                    } else {
+                        approval
+                    };
                     event.approval = Some(approval);
                     on_event(RunEvent::Tool(event.clone()));
                     match approval {
-                        Approval::Deny | Approval::Ask => ToolOutput { text: "该工具调用已被拒绝，未执行。".into(), is_error: true },
+                        Approval::Deny | Approval::Ask => ToolOutput {
+                            text: "该工具调用已被拒绝，未执行。".into(),
+                            is_error: true,
+                        },
                         Approval::Allow => {
                             let result = tokio::select! { biased; _ = cancel.cancelled() => Err(AiError::Cancelled), result = self.host.call_tool(call.clone(), cancel.clone()) => result };
                             match result {
@@ -416,21 +567,36 @@ impl<H: AiHost> AiRuntime<H> {
                                     event.error = Some("工具执行已取消。".into());
                                     on_event(RunEvent::Tool(event));
                                     return Err(AiError::Cancelled);
+                                }
+                                Err(error) => ToolOutput {
+                                    text: format!(
+                                        "工具执行失败；不得声称操作成功，也不要自动重试相同失败请求。{error}"
+                                    ),
+                                    is_error: true,
                                 },
-                                Err(error) => ToolOutput { text: format!("工具执行失败；不得声称操作成功，也不要自动重试相同失败请求。{error}"), is_error: true },
                             }
                         }
                     }
-                } else { ToolOutput { text: "error unknown_tool".into(), is_error: true } };
+                } else {
+                    ToolOutput {
+                        text: "error unknown_tool".into(),
+                        is_error: true,
+                    }
+                };
                 event.is_error = output.is_error;
                 event.error = output.is_error.then(|| output.text.clone());
                 event.result = Some(output.text.clone());
                 on_event(RunEvent::Tool(event));
                 completed.insert(call.id.clone(), output.text.clone());
-                messages.push(Message::Tool { call_id: call.id, text: output.text });
+                messages.push(Message::Tool {
+                    call_id: call.id,
+                    text: output.text,
+                });
             }
         }
-        Err(AiError::Provider("工具续轮超过五轮，已停止；已保留输出和工具结果。".into()))
+        Err(AiError::Provider(
+            "工具续轮超过五轮，已停止；已保留输出和工具结果。".into(),
+        ))
     }
 }
 
@@ -446,14 +612,29 @@ async fn round<F>(
 where
     F: FnMut(String) + Send,
 {
-    let input_bytes = messages.iter().try_fold(system.map_or(0, str::len), |total, message| {
-        let text = match message { Message::User { text, .. } | Message::Assistant {text,..} | Message::Tool {text,..} => text };
-        total.checked_add(text.len())
-    });
-    if input_bytes.is_none_or(|n| n > 1024 * 1024) { return Err(AiError::Provider("chat messages must total at most 1 MiB".into())); }
-    connection.settings.validate(connection.protocol).map_err(AiError::Provider)?;
+    let input_bytes = messages
+        .iter()
+        .try_fold(system.map_or(0, str::len), |total, message| {
+            let text = match message {
+                Message::User { text, .. }
+                | Message::Assistant { text, .. }
+                | Message::Tool { text, .. } => text,
+            };
+            total.checked_add(text.len())
+        });
+    if input_bytes.is_none_or(|n| n > 1024 * 1024) {
+        return Err(AiError::Provider(
+            "chat messages must total at most 1 MiB".into(),
+        ));
+    }
+    connection
+        .settings
+        .validate(connection.protocol)
+        .map_err(AiError::Provider)?;
     if connection.settings.model_type != model_config::ModelType::Chat {
-        return Err(AiError::Provider("所选模型不是聊天类型；图片、语音、向量和重排需各自专用接口".into()));
+        return Err(AiError::Provider(
+            "所选模型不是聊天类型；图片、语音、向量和重排需各自专用接口".into(),
+        ));
     }
     if connection.settings.supports_tools == Some(false) && !tools.is_empty() {
         return Err(AiError::Provider("所选模型声明不支持工具".into()));
@@ -463,7 +644,14 @@ where
     let mut builder = http
         .post(url)
         .timeout(std::time::Duration::from_secs(120))
-        .header(reqwest::header::ACCEPT, if connection.settings.supports_streaming { "text/event-stream" } else { "application/json" });
+        .header(
+            reqwest::header::ACCEPT,
+            if connection.settings.supports_streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        );
     if connection.protocol == Protocol::AnthropicMessages {
         builder = builder.header("anthropic-version", "2023-06-01");
     }
@@ -487,25 +675,42 @@ where
             let mut response = response;
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(network)? {
-                if chunk.len() > 4 * 1024 * 1024 - body.len() { return Err(AiError::Provider("response exceeds 4 MiB".into())); }
+                if chunk.len() > 4 * 1024 * 1024 - body.len() {
+                    return Err(AiError::Provider("response exceeds 4 MiB".into()));
+                }
                 body.extend_from_slice(&chunk);
             }
-            let value = serde_json::from_slice(&body).map_err(|_| AiError::Provider("invalid response JSON".into()))?;
+            let value = serde_json::from_slice(&body)
+                .map_err(|_| AiError::Provider("invalid response JSON".into()))?;
             let mut decoder = protocol::Decoder::default();
-            let text = decoder.complete(connection.protocol, &value).map_err(|e| provider_error(e, connection.api_key.as_ref()))?;
+            let text = decoder
+                .complete(connection.protocol, &value)
+                .map_err(|e| provider_error(e, connection.api_key.as_ref()))?;
             let usage = decoder.usage.clone();
             let pricing = connection.settings.pricing.clone();
-            let round_usage = round_usage.finish(usage, pricing, connection.settings.pricing_reference, started);
+            let round_usage = round_usage.finish(
+                usage,
+                pricing,
+                connection.settings.pricing_reference,
+                started,
+            );
             let reasoning_blocks = std::mem::take(&mut decoder.reasoning_blocks);
             let tool_calls = decoder.finish().map_err(AiError::Provider)?;
-            Ok(AiRun { text, tool_calls, reasoning_blocks, rounds: vec![round_usage] })
+            Ok(AiRun {
+                text,
+                tool_calls,
+                reasoning_blocks,
+                rounds: vec![round_usage],
+            })
         };
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
             result = tokio::time::timeout(std::time::Duration::from_secs(120), read) => result.map_err(|_| AiError::Provider("response read timed out".into()))??,
         };
-        if !result.text.is_empty() { on_text(result.text.clone()); }
+        if !result.text.is_empty() {
+            on_text(result.text.clone());
+        }
         return Ok(result);
     }
     let mut parser = protocol::SseParser::default();
@@ -548,40 +753,103 @@ where
     }
     let usage = decoder.usage.clone();
     let pricing = connection.settings.pricing.clone();
-    let round_usage = round_usage.finish(usage, pricing, connection.settings.pricing_reference, started);
+    let round_usage = round_usage.finish(
+        usage,
+        pricing,
+        connection.settings.pricing_reference,
+        started,
+    );
     let reasoning_blocks = std::mem::take(&mut decoder.reasoning_blocks);
     let tool_calls = decoder.finish().map_err(AiError::Provider)?;
-    Ok(AiRun { text, tool_calls, reasoning_blocks, rounds: vec![round_usage] })
+    Ok(AiRun {
+        text,
+        tool_calls,
+        reasoning_blocks,
+        rounds: vec![round_usage],
+    })
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    User { text: String, images: Vec<images::ImagePart> },
-    Assistant { text: String, tool_calls: Vec<ToolCall>, reasoning_blocks: Vec<serde_json::Value> },
-    Tool { call_id: String, text: String },
+    User {
+        text: String,
+        images: Vec<images::ImagePart>,
+    },
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCall>,
+        reasoning_blocks: Vec<serde_json::Value>,
+    },
+    Tool {
+        call_id: String,
+        text: String,
+    },
 }
 // ponytail: conservative Unicode scalar estimate, not model tokenization; replace with a provider tokenizer if exact admission is needed.
-fn check_context(connection: &AiConnection, system: Option<&str>, messages: &[Message], tools: &[ToolSpec]) -> Result<(), AiError> {
+fn check_context(
+    connection: &AiConnection,
+    system: Option<&str>,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Result<(), AiError> {
     let capacity = u64::from(connection.settings.context_window.unwrap_or(32000));
     let mut estimate = system.map_or(0u64, |s| s.chars().count() as u64 * 4 + 32);
     for message in messages {
         let (text, calls, images) = match message {
             Message::User { text, images } => (text, None, images.as_slice()),
             Message::Tool { text, .. } => (text, None, &[] as &[images::ImagePart]),
-            Message::Assistant { text, tool_calls, reasoning_blocks } => {
-                for block in reasoning_blocks { estimate = estimate.saturating_add(block.to_string().chars().count() as u64 * 4 + 32); }
+            Message::Assistant {
+                text,
+                tool_calls,
+                reasoning_blocks,
+            } => {
+                for block in reasoning_blocks {
+                    estimate =
+                        estimate.saturating_add(block.to_string().chars().count() as u64 * 4 + 32);
+                }
                 (text, Some(tool_calls), &[] as &[images::ImagePart])
             }
         };
         estimate = estimate.saturating_add(text.chars().count() as u64 * 4 + 32);
         // ponytail: 图片按每张4096 token保守预留；精确预算需接入各模型的分辨率计价规则。
         estimate = estimate.saturating_add(images.len() as u64 * 4096);
-        if let Some(calls) = calls { for call in calls { estimate = estimate.saturating_add((call.name.chars().count() + call.id.chars().count() + call.arguments.to_string().chars().count()) as u64 * 4 + 32); } }
+        if let Some(calls) = calls {
+            for call in calls {
+                estimate = estimate.saturating_add(
+                    (call.name.chars().count()
+                        + call.id.chars().count()
+                        + call.arguments.to_string().chars().count()) as u64
+                        * 4
+                        + 32,
+                );
+            }
+        }
     }
-    for tool in tools { estimate = estimate.saturating_add((tool.name.chars().count() + tool.description.chars().count() + tool.parameters.to_string().chars().count()) as u64 * 4 + 32); }
-    if connection.settings.native_web_search { estimate = estimate.saturating_add(256); }
-    if connection.settings.max_input.is_some_and(|limit| estimate > u64::from(limit)) { return Err(AiError::Provider("输入预算不足：当前提示词的保守 token 估算超过最大输入上限；请缩短历史或调整输入上限".into())); }
-    if estimate.saturating_add(u64::from(connection.settings.output_limit())) > capacity { return Err(AiError::Provider("上下文预算不足：按每个Unicode字符最多4 token及消息开销保守估算（非精确token计数），并预留完整输出上限；请缩短历史或增加窗口".into())); }
+    for tool in tools {
+        estimate = estimate.saturating_add(
+            (tool.name.chars().count()
+                + tool.description.chars().count()
+                + tool.parameters.to_string().chars().count()) as u64
+                * 4
+                + 32,
+        );
+    }
+    if connection.settings.native_web_search {
+        estimate = estimate.saturating_add(256);
+    }
+    if connection
+        .settings
+        .max_input
+        .is_some_and(|limit| estimate > u64::from(limit))
+    {
+        return Err(AiError::Provider(
+            "输入预算不足：当前提示词的保守 token 估算超过最大输入上限；请缩短历史或调整输入上限"
+                .into(),
+        ));
+    }
+    if estimate.saturating_add(u64::from(connection.settings.output_limit())) > capacity {
+        return Err(AiError::Provider("上下文预算不足：按每个Unicode字符最多4 token及消息开销保守估算（非精确token计数），并预留完整输出上限；请缩短历史或增加窗口".into()));
+    }
     Ok(())
 }
 fn endpoint(connection: &AiConnection) -> Result<String, AiError> {
@@ -633,10 +901,31 @@ async fn provider_response(
 ) -> AiError {
     let status = response.status().as_u16();
     // 只读请求标识白名单，绝不打印 Authorization、Cookie 或全部响应头。
-    let request_id = ["x-request-id", "request-id", "x-oneapi-request-id", "x-new-api-request-id", "trace-id", "cf-ray"]
-        .iter().filter_map(|name| response.headers().get(*name).and_then(|value| value.to_str().ok()).filter(|value| value.len() <= 256).map(|value| (*name, value)))
-        .map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>().join(", ");
-    let request_id = if request_id.is_empty() { "unavailable".into() } else { request_id };
+    let request_id = [
+        "x-request-id",
+        "request-id",
+        "x-oneapi-request-id",
+        "x-new-api-request-id",
+        "trace-id",
+        "cf-ray",
+    ]
+    .iter()
+    .filter_map(|name| {
+        response
+            .headers()
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() <= 256)
+            .map(|value| (*name, value))
+    })
+    .map(|(name, value)| format!("{name}={value}"))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let request_id = if request_id.is_empty() {
+        "unavailable".into()
+    } else {
+        request_id
+    };
     let url = response.url();
     // URL 查询参数可能带凭据；日志只保留无查询的源和路径。
     let endpoint = format!("{}{}", url.origin().ascii_serialization(), url.path());
@@ -667,7 +956,11 @@ async fn provider_response(
     let request_id = redact(request_id);
     let body = redact(body);
     tracing::error!(target: "lumakit_ai::http", event = "ai.http.rejected", %endpoint, status, request_id = ?request_id, "上游拒绝请求；错误正文仅返回调用方，不写入日志");
-    AiError::Http { status, request_id, body }
+    AiError::Http {
+        status,
+        request_id,
+        body,
+    }
 }
 
 #[cfg(test)]
@@ -675,27 +968,122 @@ mod model_runtime_tests {
     use super::*;
     #[tokio::test]
     async fn context_and_type_gates_reject_before_network() {
-        let mut c = AiConnection { base_url: "https://invalid.invalid".into(), protocol: Protocol::OpenAiChat, api_key: None, model: "model".into(), settings: model_config::ModelSettings { context_window: Some(50), max_output: Some(10), ..Default::default() } };
-        assert!(check_context(&c,None,&[Message::User { text:"你好".into(), images:Vec::new() }],&[]).is_ok());
-        assert!(check_context(&c,None,&[Message::User { text:"你好🙂".into(), images:Vec::new() }],&[]).is_err());
+        let mut c = AiConnection {
+            base_url: "https://invalid.invalid".into(),
+            protocol: Protocol::OpenAiChat,
+            api_key: None,
+            model: "model".into(),
+            settings: model_config::ModelSettings {
+                context_window: Some(50),
+                max_output: Some(10),
+                ..Default::default()
+            },
+        };
+        assert!(
+            check_context(
+                &c,
+                None,
+                &[Message::User {
+                    text: "你好".into(),
+                    images: Vec::new()
+                }],
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            check_context(
+                &c,
+                None,
+                &[Message::User {
+                    text: "你好🙂".into(),
+                    images: Vec::new()
+                }],
+                &[]
+            )
+            .is_err()
+        );
         c.settings.context_window = None;
         c.settings.model_type = model_config::ModelType::Image;
-        let mut ignore = |_:String| {};
-        let error = round(&http_client().unwrap(),&c,None,&[Message::User { text:"hello".into(), images:Vec::new() }],&[],&CancellationToken::new(),&mut ignore).await.unwrap_err();
+        let mut ignore = |_: String| {};
+        let error = round(
+            &http_client().unwrap(),
+            &c,
+            None,
+            &[Message::User {
+                text: "hello".into(),
+                images: Vec::new(),
+            }],
+            &[],
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("不是聊天类型"));
         c.settings.model_type = model_config::ModelType::Chat;
         c.settings.supports_tools = Some(false);
-        let tools = [ToolSpec { name:"x".into(),description:String::new(),parameters:serde_json::json!({}),read_only:true,requires_approval:false }];
-        let error = round(&http_client().unwrap(),&c,None,&[Message::User { text:"hello".into(), images:Vec::new() }],&tools,&CancellationToken::new(),&mut ignore).await.unwrap_err();
+        let tools = [ToolSpec {
+            name: "x".into(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+            read_only: true,
+            requires_approval: false,
+        }];
+        let error = round(
+            &http_client().unwrap(),
+            &c,
+            None,
+            &[Message::User {
+                text: "hello".into(),
+                images: Vec::new(),
+            }],
+            &tools,
+            &CancellationToken::new(),
+            &mut ignore,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("不支持工具"));
-        c.settings.pricing = Some(model_config::ModelPricing { currency:"USD".into(), tiers:vec![model_config::PriceTier { min_input_tokens:0,input:f64::NAN,output:0.0,cache_read:None,cache_write:None }] });
+        c.settings.pricing = Some(model_config::ModelPricing {
+            currency: "USD".into(),
+            tiers: vec![model_config::PriceTier {
+                min_input_tokens: 0,
+                input: f64::NAN,
+                output: 0.0,
+                cache_read: None,
+                cache_write: None,
+            }],
+        });
         assert!(c.settings.validate(c.protocol).is_err());
         c.settings.pricing = None;
         c.settings.supports_tools = None;
         c.settings.context_window = Some(1000);
         c.settings.max_input = Some(40);
-        assert!(check_context(&c,None,&[Message::User { text:"你好".into(), images:Vec::new() }],&[]).is_ok());
-        assert!(check_context(&c,None,&[Message::User { text:"你好🙂".into(), images:Vec::new() }],&[]).is_err());
+        assert!(
+            check_context(
+                &c,
+                None,
+                &[Message::User {
+                    text: "你好".into(),
+                    images: Vec::new()
+                }],
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            check_context(
+                &c,
+                None,
+                &[Message::User {
+                    text: "你好🙂".into(),
+                    images: Vec::new()
+                }],
+                &[]
+            )
+            .is_err()
+        );
         c.settings.max_input = Some(1001);
         assert!(c.settings.validate(c.protocol).is_err());
     }

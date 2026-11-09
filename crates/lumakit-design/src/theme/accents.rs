@@ -36,7 +36,11 @@ const fn hex(value: u32) -> Rgba {
 }
 
 const fn preset(id: &'static str, light: u32, dark: u32) -> AccentPreset {
-    AccentPreset { id, light: hex(light), dark: hex(dark) }
+    AccentPreset {
+        id,
+        light: hex(light),
+        dark: hex(dark),
+    }
 }
 
 /// Vermilion, blue, green, yellow, cyan, purple, gray: LumaDesk's original accent pairs.

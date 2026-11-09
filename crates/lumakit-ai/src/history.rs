@@ -1,15 +1,14 @@
 //! SQLite 历史记录、崩溃恢复与保守重试策略。
-use serde::{Deserialize, Serialize};
 use crate::chat::store;
 use lumakit_support::FileLock;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-
 
 /// 历史记录读取、解析或持久化失败的原因。
 #[derive(Debug, Error)]
@@ -151,8 +150,13 @@ impl HistoryFile {
                 if turn.id.trim().is_empty() || !turns.insert(&turn.id) {
                     return Err(HistoryError::InvalidData("问题标识为空或重复"));
                 }
-                if turn.conversation_id != conversation.id || turn.model.trim().is_empty() || turn.attempt == 0 {
-                    return Err(HistoryError::InvalidData("问题所属对话、模型或尝试序号无效"));
+                if turn.conversation_id != conversation.id
+                    || turn.model.trim().is_empty()
+                    || turn.attempt == 0
+                {
+                    return Err(HistoryError::InvalidData(
+                        "问题所属对话、模型或尝试序号无效",
+                    ));
                 }
             }
         }
@@ -176,7 +180,13 @@ impl HistoryStore {
         let path = path.as_ref();
         let lock = FileLock::acquire(&path.with_file_name("chat-history.lock"))?;
         let connection = store::connect(path)?;
-        let imported = connection.query_row("SELECT value FROM legacy_meta WHERE key='imported'", [], |row| row.get::<_, String>(0)).optional()?;
+        let imported = connection
+            .query_row(
+                "SELECT value FROM legacy_meta WHERE key='imported'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         let mut data = if imported.is_none() {
             let legacy = path.with_extension("json");
             match fs::read(legacy) {
@@ -200,8 +210,14 @@ impl HistoryStore {
                 }
             }
         }
-        let store = Self { connection, _lock: lock, data };
-        if recovered || imported.is_none() { store.persist()?; }
+        let store = Self {
+            connection,
+            _lock: lock,
+            data,
+        };
+        if recovered || imported.is_none() {
+            store.persist()?;
+        }
         Ok(store)
     }
 
@@ -219,7 +235,8 @@ impl HistoryStore {
         let conversation_id = conversation_id.into();
         let timestamp = now();
         let turn = Turn {
-            id: lumakit_support::new_id().map_err(|_| HistoryError::InvalidData("无法生成问题标识"))?,
+            id: lumakit_support::new_id()
+                .map_err(|_| HistoryError::InvalidData("无法生成问题标识"))?,
             conversation_id: conversation_id.clone(),
             model: model.into(),
             status: TurnStatus::Running,
@@ -328,14 +345,42 @@ impl HistoryStore {
 
     fn read(connection: &Connection) -> Result<HistoryFile, HistoryError> {
         let mut data = HistoryFile::default();
-        let mut conversations = connection.prepare("SELECT id,title,created_at,updated_at FROM legacy_conversations ORDER BY position")?;
+        let mut conversations = connection.prepare(
+            "SELECT id,title,created_at,updated_at FROM legacy_conversations ORDER BY position",
+        )?;
         let mut turns = connection.prepare("SELECT id,model,status,messages,skill_refs,image_refs,error,usage,source_turn_id,attempt,created_at,finished_at FROM legacy_turns WHERE conversation_id=?1 ORDER BY position")?;
         let mut rows = conversations.query([])?;
         while let Some(row) = rows.next()? {
-            let mut conversation = Conversation { id: row.get(0)?, title: row.get(1)?, created_at: timestamp_from_sql(row.get(2)?)?, updated_at: timestamp_from_sql(row.get(3)?)?, turns: Vec::new() };
+            let mut conversation = Conversation {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at: timestamp_from_sql(row.get(2)?)?,
+                updated_at: timestamp_from_sql(row.get(3)?)?,
+                turns: Vec::new(),
+            };
             let mut turn_rows = turns.query([&conversation.id])?;
             while let Some(row) = turn_rows.next()? {
-                conversation.turns.push(Turn { id: row.get(0)?, conversation_id: conversation.id.clone(), model: row.get(1)?, status: store::parse_status(&row.get::<_, String>(2)?)?, messages: serde_json::from_str(&row.get::<_, String>(3)?)?, skill_refs: serde_json::from_str(&row.get::<_, String>(4)?)?, image_refs: serde_json::from_str(&row.get::<_, String>(5)?)?, error: row.get(6)?, usage: row.get::<_, Option<String>>(7)?.map(|value| serde_json::from_str(&value)).transpose()?, source_turn_id: row.get(8)?, attempt: row.get(9)?, created_at: timestamp_from_sql(row.get(10)?)?, finished_at: row.get::<_, Option<i64>>(11)?.map(timestamp_from_sql).transpose()? });
+                conversation.turns.push(Turn {
+                    id: row.get(0)?,
+                    conversation_id: conversation.id.clone(),
+                    model: row.get(1)?,
+                    status: store::parse_status(&row.get::<_, String>(2)?)?,
+                    messages: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                    skill_refs: serde_json::from_str(&row.get::<_, String>(4)?)?,
+                    image_refs: serde_json::from_str(&row.get::<_, String>(5)?)?,
+                    error: row.get(6)?,
+                    usage: row
+                        .get::<_, Option<String>>(7)?
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                    source_turn_id: row.get(8)?,
+                    attempt: row.get(9)?,
+                    created_at: timestamp_from_sql(row.get(10)?)?,
+                    finished_at: row
+                        .get::<_, Option<i64>>(11)?
+                        .map(timestamp_from_sql)
+                        .transpose()?,
+                });
             }
             data.conversations.push(conversation);
         }
@@ -432,13 +477,25 @@ mod tests {
         let maximum = u64::try_from(i64::MAX).unwrap();
         assert_eq!(timestamp_to_sql(maximum).unwrap(), i64::MAX);
         assert_eq!(timestamp_from_sql(i64::MAX).unwrap(), maximum);
-        assert!(matches!(timestamp_to_sql(maximum + 1), Err(HistoryError::InvalidData(_))));
-        assert!(matches!(timestamp_to_sql(u64::MAX), Err(HistoryError::InvalidData(_))));
-        assert!(matches!(timestamp_from_sql(-1), Err(HistoryError::InvalidData(_))));
+        assert!(matches!(
+            timestamp_to_sql(maximum + 1),
+            Err(HistoryError::InvalidData(_))
+        ));
+        assert!(matches!(
+            timestamp_to_sql(u64::MAX),
+            Err(HistoryError::InvalidData(_))
+        ));
+        assert!(matches!(
+            timestamp_from_sql(-1),
+            Err(HistoryError::InvalidData(_))
+        ));
     }
 
     fn temp_path(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("lumakit-history-{name}-{}", lumakit_support::new_id().unwrap()));
+        let root = std::env::temp_dir().join(format!(
+            "lumakit-history-{name}-{}",
+            lumakit_support::new_id().unwrap()
+        ));
         fs::create_dir_all(&root).unwrap();
         root.join("history.db")
     }
@@ -484,7 +541,13 @@ mod tests {
             assert!(HistoryStore::open(&path).is_err(), "case {kind}");
             let database = Connection::open(&path).unwrap();
             for table in ["legacy_meta", "legacy_conversations", "legacy_turns"] {
-                assert_eq!(database.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+                assert_eq!(
+                    database
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
             }
             assert_eq!(fs::read(&legacy).unwrap(), bytes);
             drop(database);
@@ -501,7 +564,11 @@ mod tests {
         let turn = source.begin("conversation", "model").unwrap();
         let mut finished = turn.clone();
         finished.status = TurnStatus::Completed;
-        finished.messages.push(MessageRecord { role: "assistant".into(), content: "保留回答".into(), images: Vec::new() });
+        finished.messages.push(MessageRecord {
+            role: "assistant".into(),
+            content: "保留回答".into(),
+            images: Vec::new(),
+        });
         source.finish(finished).unwrap();
         let bytes = serde_json::to_vec(&source.data).unwrap();
         drop(source);
@@ -509,12 +576,31 @@ mod tests {
         let database = Connection::open(&path).unwrap();
         database.execute_batch("DELETE FROM legacy_turns; DELETE FROM legacy_conversations; DELETE FROM legacy_meta; CREATE TRIGGER reject_import BEFORE INSERT ON legacy_turns BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
         assert!(HistoryStore::open(&path).is_err());
-        assert_eq!(database.query_row("SELECT count(*) FROM legacy_meta", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
-        assert_eq!(database.query_row("SELECT count(*) FROM legacy_conversations", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            database
+                .query_row("SELECT count(*) FROM legacy_meta", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .query_row("SELECT count(*) FROM legacy_conversations", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
         assert_eq!(fs::read(&legacy).unwrap(), bytes);
-        database.execute_batch("DROP TRIGGER reject_import;").unwrap();
+        database
+            .execute_batch("DROP TRIGGER reject_import;")
+            .unwrap();
         let mut store = HistoryStore::open(&path).unwrap();
-        assert_eq!(store.load("conversation", &turn.id).unwrap().messages[0].content, "保留回答");
+        assert_eq!(
+            store.load("conversation", &turn.id).unwrap().messages[0].content,
+            "保留回答"
+        );
         assert!(HistoryStore::open(&path).is_err());
         database.execute_batch("CREATE TRIGGER reject_finish BEFORE INSERT ON legacy_turns BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
         let before = store.conversations();
@@ -524,12 +610,19 @@ mod tests {
         changed.messages[0].content = "不应保存".into();
         assert!(store.finish(changed).is_err());
         assert_eq!(store.conversations(), before);
-        database.execute_batch("DROP TRIGGER reject_finish;").unwrap();
+        database
+            .execute_batch("DROP TRIGGER reject_finish;")
+            .unwrap();
         store.data.conversations.clear();
         store.persist().unwrap();
         drop(store);
         fs::write(&legacy, b"broken JSON backup").unwrap();
-        assert!(HistoryStore::open(&path).unwrap().conversations().is_empty());
+        assert!(
+            HistoryStore::open(&path)
+                .unwrap()
+                .conversations()
+                .is_empty()
+        );
         drop(database);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -541,7 +634,13 @@ mod tests {
         fs::write(&legacy, b"invalid JSON").unwrap();
         assert!(HistoryStore::open(&path).is_err());
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(connection.query_row("SELECT count(*) FROM legacy_meta", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM legacy_meta", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert_eq!(fs::read(&legacy).unwrap(), b"invalid JSON");
         drop(connection);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();

@@ -3,9 +3,9 @@
 
 mod buttons;
 mod panel;
+pub mod settings;
 mod tabs;
 mod top_bar;
-pub mod settings;
 
 use gpui_kit::{App, ClickEvent, ParentElement, SharedString, Styled, Window, div};
 

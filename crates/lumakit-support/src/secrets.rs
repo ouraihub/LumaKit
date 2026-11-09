@@ -1,7 +1,7 @@
 use crate::sqlite::{open_secret, seal_secret};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
 use std::fmt::Write as _;
+use zeroize::Zeroizing;
 
 /// 用系统随机源生成 16 字节随机值，编码为 32 位小写十六进制标识。
 ///
@@ -11,7 +11,9 @@ pub fn new_id() -> Result<String, String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| "无法生成配置标识，请重试".to_owned())?;
     let mut id = String::with_capacity(32);
-    for byte in bytes { write!(&mut id, "{byte:02x}").map_err(|_| "无法生成配置标识".to_owned())?; }
+    for byte in bytes {
+        write!(&mut id, "{byte:02x}").map_err(|_| "无法生成配置标识".to_owned())?;
+    }
     Ok(id)
 }
 
@@ -32,7 +34,11 @@ impl SavedKey {
     /// # Errors
     /// 随机标识生成、密钥校验或系统加密失败时返回错误。
     pub fn new(value: &str) -> Result<Self, String> {
-        let mut key = Self { id: new_id()?, masked: String::new(), ciphertext: Vec::new() };
+        let mut key = Self {
+            id: new_id()?,
+            masked: String::new(),
+            ciphertext: Vec::new(),
+        };
         key.replace(value)?;
         Ok(key)
     }
@@ -47,7 +53,8 @@ impl SavedKey {
             return Err("密钥不能为空，不能含控制字符，且不能超过 4096 字节".into());
         }
         // 先加密再替换：失败时原凭据仍然可用，不能留下空密钥。
-        let ciphertext = seal_secret(value.as_bytes()).map_err(|_| "系统无法加密密钥，原凭据未修改".to_owned())?;
+        let ciphertext = seal_secret(value.as_bytes())
+            .map_err(|_| "系统无法加密密钥，原凭据未修改".to_owned())?;
         self.ciphertext = ciphertext;
         self.masked = "••••••••".into();
         Ok(())
@@ -58,7 +65,10 @@ impl SavedKey {
     /// # Errors
     /// 平台不支持、用户环境不匹配、密文损坏或解密后非 UTF-8 时返回错误。
     pub fn open(&self) -> Result<Zeroizing<String>, String> {
-        let bytes = Zeroizing::new(open_secret(&self.ciphertext).map_err(|_| "无法解密此密钥，请在原 Windows 用户下运行或重新填写".to_owned())?);
+        let bytes = Zeroizing::new(
+            open_secret(&self.ciphertext)
+                .map_err(|_| "无法解密此密钥，请在原 Windows 用户下运行或重新填写".to_owned())?,
+        );
         let text = std::str::from_utf8(&bytes).map_err(|_| "已保存密钥格式无效".to_owned())?;
         Ok(Zeroizing::new(text.to_owned()))
     }

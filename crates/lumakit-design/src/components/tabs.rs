@@ -71,7 +71,10 @@ impl RenderOnce for Tab {
         };
         let close_id = ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), "close".into());
         // Kept across frames so focus survives the re-render an activation causes.
-        let focus: FocusHandle = window.use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle()).read(cx).clone();
+        let focus: FocusHandle = window
+            .use_keyed_state(self.id.clone(), cx, |_, cx| cx.focus_handle())
+            .read(cx)
+            .clone();
         let close_label: SharedString = format!("关闭 {}", self.label).into();
         h_flex()
             .id(self.id)
@@ -239,13 +242,20 @@ impl RenderOnce for Segment {
                 let handler = handler.clone();
                 let id = ElementId::NamedChild(base.clone(), index.to_string().into());
                 // Kept across frames so focus survives the re-render a selection causes.
-                let focus: FocusHandle = window.use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle()).read(cx).clone();
+                let focus: FocusHandle = window
+                    .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
                 div()
                     .id(id)
                     .test_support()
                     .role(Role::RadioButton)
                     // Assistive technology reads either state; Kit's Radio states both too.
-                    .aria_toggled(if active { Toggled::True } else { Toggled::False })
+                    .aria_toggled(if active {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    })
                     .aria_selected(active)
                     .aria_label(option.clone())
                     .aria_position_in_set(index + 1)

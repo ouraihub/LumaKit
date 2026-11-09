@@ -18,5 +18,5 @@ mod theme_map;
 pub mod typography;
 
 pub use assets::UiAssets;
-pub use theme::{Appearance, Contrast, Roles, ThemeCatalog, LumaTheme};
+pub use theme::{Appearance, Contrast, LumaTheme, Roles, ThemeCatalog};
 pub use typography::{TerminalFont, Typography};

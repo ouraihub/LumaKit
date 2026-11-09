@@ -19,6 +19,12 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 
 `examples/lumakit-cli` 是无界面组合根，验证 AI 运行时与日志。
 
+## 设计文档
+
+- [`docs/Rust-LumaKit-日志-请求-响应-异常封装详细设计.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装详细设计.md)：具体 API、字段、OperationGuard、迁移顺序、兼容和测试设计。
+- [`docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md)：按 LumaKit、LumaDesk、ThinkRail Native 分阶段跟进的任务、依赖和验收。
+- [`docs/traceable-logging-requirement.md`](docs/traceable-logging-requirement.md)：可复制给其他项目大模型的通用可追踪日志需求模板。
+
 ## lumakit-design
 
 GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui`：
@@ -26,7 +32,7 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 - 主题目录：ThinkRail 六套 + 暖纸 `warm-light`/`warm-dark`，支持用户主题文件；颜色角色由调色板推导并映射到 Kit `ThemeColor`；`LumaTheme::with_accent` 强调色覆盖。
 - `metrics`：间距、尺寸、圆角、字体样式令牌；`Typography`：中文回退与密度缩放。
 - 内置 Geist / JetBrains Mono / Orbitron（OFL，许可随 `assets/fonts`）；图标源 `UiAssets`。
-- `components`：无状态组件；`components::settings`：设置页模式（分组导航、group/row/field、链接标签、头像、虚线空态、提示、列表行与行菜单）。
+- `components`：无状态组件；`components::settings`：设置页模式（分组导航、group/row/field、链接标签、头像、虚线空态、提示、列表行与行菜单，以及已保存密钥控件 `KeyRow`/`KeyManager`/`key_manage_button`/`delete_confirm`）。
 - `appearance`：外观偏好 `Preferences`（主题 id、跟随系统的浅/深主题对、强调色、密度）、切换规则与 `apply`，以及无状态外观页 `AppearancePage`。序列化字段名是稳定 schema；持久化与旧格式迁移由宿主负责。
 
 宿主启动顺序：注册 `UiAssets`、调用 `fonts::register_bundled`，再 `Preferences::apply`（或 `LumaTheme::install`）。

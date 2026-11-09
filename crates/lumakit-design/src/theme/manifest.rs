@@ -12,7 +12,7 @@ use std::fmt;
 use serde_json::Value;
 
 use self::colors::{ANSI_KEYS, SYNTAX_KEYS, ansi, block, note_unexpected_keys, palette, syntax};
-use super::{Appearance, Contrast, Roles, LumaTheme};
+use super::{Appearance, Contrast, LumaTheme, Roles};
 
 /// JSON nested deeper than this is rejected before parsing (a manifest needs 2).
 pub const MAX_NESTING: usize = 32;

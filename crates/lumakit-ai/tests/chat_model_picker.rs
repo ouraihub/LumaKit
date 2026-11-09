@@ -84,19 +84,51 @@ fn catalog_reasoning_validates_and_reconciles_without_saved_capability_override(
     let mut session = open(&root.db());
     let mut selected = option("openai/gpt-6.1-sol");
     selected.settings = ModelSettings::default();
-    session.select_model_pair(&selected, Some(ReasoningEffort::Max)).unwrap();
-    session.set_default_model_pair(&selected, Some(ReasoningEffort::Max)).unwrap();
-    session.reconcile_model_catalog(&[selected.clone()]).unwrap();
+    session
+        .select_model_pair(&selected, Some(ReasoningEffort::Max))
+        .unwrap();
+    session
+        .set_default_model_pair(&selected, Some(ReasoningEffort::Max))
+        .unwrap();
+    session
+        .reconcile_model_catalog(&[selected.clone()])
+        .unwrap();
     assert_eq!(session.composer().reasoning, Some(ReasoningEffort::Max));
-    assert_eq!(session.model_picker_preferences().default_pair.as_ref().unwrap().effort, Some(ReasoningEffort::Max));
-    assert!(session.select_model_pair(&selected, Some(ReasoningEffort::None)).is_err());
+    assert_eq!(
+        session
+            .model_picker_preferences()
+            .default_pair
+            .as_ref()
+            .unwrap()
+            .effort,
+        Some(ReasoningEffort::Max)
+    );
+    assert!(
+        session
+            .select_model_pair(&selected, Some(ReasoningEffort::None))
+            .is_err()
+    );
     selected.settings.reasoning_disabled = true;
-    session.reconcile_model_catalog(&[selected.clone()]).unwrap();
+    session
+        .reconcile_model_catalog(&[selected.clone()])
+        .unwrap();
     assert_eq!(session.composer().reasoning, None);
-    assert_eq!(session.model_picker_preferences().default_pair.as_ref().unwrap().effort, None);
+    assert_eq!(
+        session
+            .model_picker_preferences()
+            .default_pair
+            .as_ref()
+            .unwrap()
+            .effort,
+        None
+    );
     selected.model.protocol = Protocol::AnthropicMessages;
     selected.settings.reasoning_disabled = false;
-    assert!(session.select_model_pair(&selected, Some(ReasoningEffort::High)).is_err());
+    assert!(
+        session
+            .select_model_pair(&selected, Some(ReasoningEffort::High))
+            .is_err()
+    );
 }
 
 #[test]

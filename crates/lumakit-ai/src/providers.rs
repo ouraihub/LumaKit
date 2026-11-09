@@ -245,8 +245,12 @@ impl ProviderStore {
             .iter()
             .find(|e| e.models.iter().any(|m| m.id == model))
             .ok_or_else(|| ProviderError::ModelNotFound(model.into()))?;
-        let capabilities = e.models.iter().find(|entry| entry.id == model)
-            .ok_or_else(|| ProviderError::ModelNotFound(model.into()))?.capabilities;
+        let capabilities = e
+            .models
+            .iter()
+            .find(|entry| entry.id == model)
+            .ok_or_else(|| ProviderError::ModelNotFound(model.into()))?
+            .capabilities;
         Ok(AiConnection {
             base_url: e.base_url.clone(),
             protocol: e.protocol,
@@ -348,7 +352,11 @@ mod tests {
         let connection = s.resolve("p", "m").unwrap();
         assert_eq!(connection.settings.supports_tools, Some(true));
         assert!(connection.settings.supports_streaming);
-        s.providers[0].endpoints[0].models[0].capabilities = ModelCapabilities { streaming: false, tools: false, vision: true };
+        s.providers[0].endpoints[0].models[0].capabilities = ModelCapabilities {
+            streaming: false,
+            tools: false,
+            vision: true,
+        };
         let connection = s.resolve("p", "m").unwrap();
         assert!(!connection.settings.supports_streaming);
         assert_eq!(connection.settings.supports_tools, None);

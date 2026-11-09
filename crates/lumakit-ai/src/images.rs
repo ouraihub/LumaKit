@@ -38,11 +38,22 @@ pub enum ImageError {
 
 /// 校验数量、MIME 声明、Base64 编码、文件签名及单图解码大小，返回首个错误。
 pub fn validate(images: &[ImagePart]) -> Result<(), ImageError> {
-    if images.len() > MAX_IMAGES { return Err(ImageError::Count); }
+    if images.len() > MAX_IMAGES {
+        return Err(ImageError::Count);
+    }
     for image in images {
-        if !matches!(image.mime.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif") { return Err(ImageError::Mime); }
-        let bytes = STANDARD.decode(&image.data).map_err(|_| ImageError::Encoding)?;
-        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES { return Err(ImageError::Size); }
+        if !matches!(
+            image.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        ) {
+            return Err(ImageError::Mime);
+        }
+        let bytes = STANDARD
+            .decode(&image.data)
+            .map_err(|_| ImageError::Encoding)?;
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+            return Err(ImageError::Size);
+        }
         let valid = match image.mime.as_str() {
             "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
             "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
@@ -50,14 +61,19 @@ pub fn validate(images: &[ImagePart]) -> Result<(), ImageError> {
             "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
             _ => false,
         };
-        if !valid { return Err(ImageError::Magic); }
+        if !valid {
+            return Err(ImageError::Magic);
+        }
     }
     Ok(())
 }
 
 /// 将已验证的图片字节编码为内嵌图片。
 pub fn from_bytes(mime: impl Into<String>, bytes: &[u8]) -> Result<ImagePart, ImageError> {
-    let image = ImagePart { mime: mime.into(), data: STANDARD.encode(bytes) };
+    let image = ImagePart {
+        mime: mime.into(),
+        data: STANDARD.encode(bytes),
+    };
     validate(std::slice::from_ref(&image))?;
     Ok(image)
 }
@@ -73,10 +89,13 @@ mod tests {
 
     #[test]
     fn validates_limits_and_mime() {
-        assert!(validate(&[ImagePart {
-            mime: "image/png".into(),
-            data: "iVBORw0KGgo=".into(),
-        }]).is_ok());
+        assert!(
+            validate(&[ImagePart {
+                mime: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            }])
+            .is_ok()
+        );
         assert_eq!(
             validate(&[ImagePart {
                 mime: "text/plain".into(),

@@ -61,7 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         purpose: "desktop".into(),
     };
     let runtime = lumakit_ai::AiRuntime::new(Arc::new(Host))?;
-    println!("LumaKit CLI | tools={}", runtime.available_tools(&request).len());
+    println!(
+        "LumaKit CLI | tools={}",
+        runtime.available_tools(&request).len()
+    );
     if std::env::var_os("LUMAKIT_AI_URL").is_some() {
         let run = runtime
             .run(

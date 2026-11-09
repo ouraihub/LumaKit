@@ -24,7 +24,10 @@ fn defaults_render_the_bundled_faces_at_the_original_sizes() {
 
 #[test]
 fn density_scales_every_style_and_its_line_height() {
-    let compact = Typography { scale: 13. / 14., ..Typography::default() };
+    let compact = Typography {
+        scale: 13. / 14.,
+        ..Typography::default()
+    };
     let ui = resolve_with(compact.clone(), &text::UI);
     assert_eq!(ui.size, px(13.));
     assert_eq!(ui.line_height, px(13.) * 1.3);

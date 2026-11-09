@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use super::{Appearance, Contrast, ManifestErrorKind, LumaTheme, manifest::is_theme_slug};
+use super::{Appearance, Contrast, LumaTheme, ManifestErrorKind, manifest::is_theme_slug};
 
 /// The configured default theme (original `DEFAULT_CONFIG.theme`); listed first.
 pub const DEFAULT_THEME: &str = "dark";
@@ -40,8 +40,14 @@ const BUNDLED: [(&str, &str); 8] = [
         include_str!("../../themes/high-contrast-light.theme.json"),
     ),
     // LumaDesk's warm paper palette, as one family.
-    ("warm-dark", include_str!("../../themes/warm-dark.theme.json")),
-    ("warm-light", include_str!("../../themes/warm-light.theme.json")),
+    (
+        "warm-dark",
+        include_str!("../../themes/warm-dark.theme.json"),
+    ),
+    (
+        "warm-light",
+        include_str!("../../themes/warm-light.theme.json"),
+    ),
 ];
 
 /// Why the app could not hand a user theme file's contents over.
@@ -150,8 +156,8 @@ impl Bundled {
     fn load() -> Result<Self, String> {
         let mut themes: Vec<Arc<LumaTheme>> = Vec::new();
         for (name, json) in BUNDLED {
-            let theme = LumaTheme::parse(json)
-                .map_err(|e| format!("内置主题 {name} 无法解析：{e}"))?;
+            let theme =
+                LumaTheme::parse(json).map_err(|e| format!("内置主题 {name} 无法解析：{e}"))?;
             if themes.iter().any(|t| t.id == theme.id) || theme.id.starts_with(USER_PREFIX) {
                 return Err(format!("内置主题 id 无效或重复：{}", theme.id));
             }

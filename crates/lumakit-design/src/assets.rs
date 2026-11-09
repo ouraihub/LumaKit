@@ -136,12 +136,30 @@ mod tests {
     #[test]
     fn icons_outside_the_kit_bundle_resolve_and_kit_icons_still_do() {
         // These render as empty boxes with the Kit-only source, which reports a missing asset as an error.
-        for icon in [IconName::Paperclip, IconName::Image, IconName::KeyRound, IconName::SlidersHorizontal] {
-            assert!(!Assets.load(&icon.path()).is_ok_and(|bytes| bytes.is_some()), "{icon:?} is now in the Kit bundle; drop it from Extra");
-            assert!(UiAssets.load(&icon.path()).is_ok_and(|bytes| bytes.is_some()), "{icon:?} must resolve");
+        for icon in [
+            IconName::Paperclip,
+            IconName::Image,
+            IconName::KeyRound,
+            IconName::SlidersHorizontal,
+        ] {
+            assert!(
+                !Assets.load(&icon.path()).is_ok_and(|bytes| bytes.is_some()),
+                "{icon:?} is now in the Kit bundle; drop it from Extra"
+            );
+            assert!(
+                UiAssets
+                    .load(&icon.path())
+                    .is_ok_and(|bytes| bytes.is_some()),
+                "{icon:?} must resolve"
+            );
         }
         for icon in [IconName::Globe, IconName::Menu, IconName::LayoutDashboard] {
-            assert!(UiAssets.load(&icon.path()).is_ok_and(|bytes| bytes.is_some()), "{icon:?} must still come from the Kit bundle");
+            assert!(
+                UiAssets
+                    .load(&icon.path())
+                    .is_ok_and(|bytes| bytes.is_some()),
+                "{icon:?} must still come from the Kit bundle"
+            );
         }
     }
 }

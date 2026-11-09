@@ -137,7 +137,9 @@ fn an_accent_override_reaches_every_accent_role_and_keeps_text_on_it_readable() 
     let light = theme(Appearance::Light);
     let vermilion = rgba(0xae3224ff);
     let custom = light.with_accent(vermilion);
-    for role in [custom.roles.primary, custom.roles.control_primary_bg] { same(role, vermilion); }
+    for role in [custom.roles.primary, custom.roles.control_primary_bg] {
+        same(role, vermilion);
+    }
     same(custom.roles.primary_subtle, vermilion.opacity(0.10));
     same(custom.roles.control_primary_text, rgba(0xffffffff));
     assert_ne!(custom.roles.control_primary_bg_hovered, vermilion);
@@ -145,6 +147,9 @@ fn an_accent_override_reaches_every_accent_role_and_keeps_text_on_it_readable() 
     let dark = theme(Appearance::Dark).with_accent(rgba(0xff9c89ff));
     same(dark.roles.control_primary_text, rgba(0x000000ff));
     // Everything not derived from the accent is unchanged.
-    same(custom.roles.container_workspace_bg, light.roles.container_workspace_bg);
+    same(
+        custom.roles.container_workspace_bg,
+        light.roles.container_workspace_bg,
+    );
     same(custom.roles.feedback_error, light.roles.feedback_error);
 }

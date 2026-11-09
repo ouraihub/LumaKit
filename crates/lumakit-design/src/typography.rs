@@ -39,7 +39,12 @@ pub struct Typography {
 
 /// Chinese glyphs come from these, in order, before the system's own fallback; the bundled
 /// faces have none.
-pub const CJK_FALLBACKS: [&str; 4] = ["Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC"];
+pub const CJK_FALLBACKS: [&str; 4] = [
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "PingFang SC",
+    "Noto Sans CJK SC",
+];
 
 impl Default for Typography {
     /// The bundled faces at their original sizes, with explicit CJK fallbacks.
