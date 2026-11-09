@@ -1,451 +1,97 @@
 # Rust / LumaKit 日志、请求、响应与异常封装任务列表
 
-> 配套设计：
+> 设计：[Rust-LumaKit-日志-请求-响应-异常封装设计.md](Rust-LumaKit-日志-请求-响应-异常封装设计.md)。
 >
-> - `Rust-LumaKit-日志-请求-响应-异常封装概要设计.md`
-> - `Rust-LumaKit-日志-请求-响应-异常封装详细设计.md`
-> - `observability-trace-design.md`
->
-> 本表供人和大模型跟进实施。每个任务只服务一个可验证目标；完成任务时必须填写实际验证命令和结果。
+> 每个任务只服务一个可验证目标。完成时填写实际运行的验证命令和结果。
 
-## 1. 状态与任务规则
+## 1. 规则
 
-状态值：
+状态：`TODO`、`DOING`、`BLOCKED`（写明阻塞原因）、`DONE`、`SKIPPED`（写明范围决策）。
+
+开始任务前必须：读取设计文档和本任务；搜索目标符号的全部调用方；不向 `lumakit-observability` 加产品依赖；不删除或放宽测试。
+
+只有在以下条件都满足时才能标 `DONE`：实现已落盘；直接测试通过；受影响的 workspace 检查通过；文档已更新；真实链路已观察（消费者任务）。
+
+Windows 下 Git 自带的 `link.exe` 会遮住 MSVC 链接器，cargo 命令需要经 `..\LumaDesk\scripts\cargo-msvc.bat` 执行（加 `--manifest-path Cargo.toml`）。
+
+## 2. 依赖
 
 ```text
-TODO       尚未开始
-BLOCKED    有明确外部依赖，必须写明阻塞原因
-DOING      当前正在实施
-DONE       代码、测试和验收均完成
-SKIPPED    有记录的范围决策，不是静默删除
+L1–L5 公共 crate（DONE）─ L6 LumaDesk AI 请求（DONE）
+  ├─ L7 LumaDesk 设置/网络入口 ─┬─ L10 产品日志查看页 ─ L11 双 workspace 验证与真实 smoke
+  └─ L8 Native 升级依赖 ─ L9 Native 下层 ─┘
 ```
 
-每个任务必须记录：
-
-- 负责人/执行会话；
-- 修改文件；
-- 依赖任务；
-- 公共 API 变化；
-- 验证命令与真实结果；
-- 未验证项；
-- 生产文件行数是否超过 LumaKit 300 行评审线。
-
-大模型开始任务前 MUST：
-
-1. 读取本表对应任务和三个设计文档；
-2. 搜索目标符号的全部调用方；
-3. 不新增产品依赖到 `lumakit-observability`；
-4. 不为了通过检查删除或放宽测试；
-5. 先写实施计划，再修改代码。
-
-## 2. 总依赖图
-
-```text
-L1 日志级别
-  ↓
-L2 TraceContext
-  ↓
-L3 OperationGuard + 脱敏
-  ↓
-L4 observability tests
-  ↓
-L5 LumaDesk AI request
-  ↓
-L6 LumaDesk settings/network
-  ↓
-L7 Native state::run
-  ↓
-L8 Native HostTool/Agent/ReviewRunner
-  ↓
-L9 产品日志查看器
-  ↓
-L10 双 workspace 验证与 smoke
-```
-
-## 3. LumaKit 公共 crate
-
-### L1. 扩展日志级别
-
-| 字段 | 内容 |
-|---|---|
-| ID | L1 |
-| 状态 | `TODO` |
-| 文件 | `crates/lumakit-observability/src/lib.rs` |
-| 依赖 | 无 |
-| 目标 | 支持 `Error/Warn/Info/Debug/Trace` |
-
-实施：
-
-- 给 `LogLevel` 增加 `Trace`；
-- 更新 `as_filter()`；
-- 保持 serde 兼容；
-- 保持 `level.json` 读取；
-- 保持 `LogHandle::init/set_level/status/tail` API；
-- 环境变量优先于持久化级别；
-- 不修改日志目录、文件名、轮转行为。
-
-验收：
-
-- 每个级别过滤正确；
-- 旧 `level.json` 可读取；
-- 运行时 reload 不重启进程；
-- `cargo test -p lumakit-observability` 通过。
-
-### L2. 实现 TraceContext
-
-| 字段 | 内容 |
-|---|---|
-| ID | L2 |
-| 状态 | `TODO` |
-| 文件 | `crates/lumakit-observability/src/trace.rs`、`src/lib.rs` |
-| 依赖 | L1 |
-| 目标 | 统一 root/child trace 和显式传播 |
-
-API：
-
-```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TraceContext {
-    pub trace_id: String,
-}
-
-impl TraceContext {
-    pub fn root(operation: &'static str) -> (Self, tracing::Span);
-    pub fn child(&self, operation: &'static str) -> tracing::Span;
-    pub fn trace_id(&self) -> &str;
-}
-```
-
-实施约束：
-
-- 32 位小写十六进制 TraceId；
-- 不使用全局 mutable current trace；
-- context 可 clone；
-- root/child span 包含 `trace_id`、`operation`、`event`；
-- 不依赖产品字段；
-- 不引入第二个 tracing subscriber。
-
-验收：
-
-- root id 格式稳定；
-- child 保留 trace id；
-- 两个并发 root 不串线；
-- 公开 API 有 rustdoc。
-
-### L3. 实现 OperationGuard
-
-| 字段 | 内容 |
-|---|---|
-| ID | L3 |
-| 状态 | `TODO` |
-| 文件 | `crates/lumakit-observability/src/operation.rs`、`src/lib.rs` |
-| 依赖 | L2 |
-| 目标 | 统一方法 ENTRY/EXIT/ERROR/CANCEL/TIMEOUT 生命周期 |
-
-API：
-
-```rust
-pub struct OperationGuard { /* private */ }
-
-pub fn operation(
-    trace: &TraceContext,
-    operation: &'static str,
-    layer: &'static str,
-) -> OperationGuard;
-
-impl OperationGuard {
-    pub fn finish(self, result: &'static str);
-    pub fn fail(self, error_code: &str);
-    pub fn cancel(self, reason: &str);
-    pub fn timeout(self, timeout_ms: u64);
-}
-```
-
-字段：
-
-```text
-TraceId
-SpanId
-ParentSpanId
-Layer
-ME / operation
-EV
-RT / duration_ms
-Result
-Error
-```
-
-规则：
-
-- 创建时记录 `event=entry`；
-- 完成记录 `event=exit`、`duration_ms`、`result`；
-- 失败记录 `event=error`、`error_code`；
-- 取消使用 Warn/Info，不伪装成 Error；
-- Drop 未结束时记录 `event=unfinished`；
-- 不记录业务正文和敏感参数。
-
-验收：
-
-- success/error/cancel/timeout/unfinished 都有测试；
-- duration 非负；
-- 重复终结调用不会重复写终态；
-- `cargo clippy -p lumakit-observability --all-targets -- -D warnings` 通过。
-
-### L4. 实现脱敏与摘要
-
-| 字段 | 内容 |
-|---|---|
-| ID | L4 |
-| 状态 | `TODO` |
-| 文件 | `crates/lumakit-observability/src/redact.rs`、`src/lib.rs` |
-| 依赖 | L1 |
-| 目标 | 公共安全边界 |
-
-API：
-
-```rust
-pub fn redact_secret(value: &str) -> String;
-pub fn redact_url(value: &str) -> String;
-pub fn bounded_text(value: &str, max_chars: usize) -> String;
-pub fn diagnostic_hash(value: &str) -> String;
-```
-
-验收：
-
-- password/token/API key 不泄漏；
-- URL userinfo/query/fragment 被处理；
-- Unicode 截断不破坏字符；
-- 长正文有上限；
-- hash 不可逆且测试稳定。
-
-### L5. observability 单元测试与兼容检查
-
-| 字段 | 内容 |
-|---|---|
-| ID | L5 |
-| 状态 | `TODO` |
-| 依赖 | L1-L4 |
-| 目标 | 锁定公共 crate 行为 |
-
-测试：
-
-- LogLevel 序列化和 filter mapping；
-- `level.json` 重启读取；
-- writer rotation；
-- TraceContext root/child；
-- thread/async/channel 传播；
-- OperationGuard 所有终态；
-- 脱敏 helper；
-- 现有 LumaKit consumers 编译不变。
-
-验收命令：
-
-```bat
-cargo +1.99.0 fmt --all -- --check
-cargo +1.99.0 test -p lumakit-observability
-cargo +1.99.0 clippy -p lumakit-observability --all-targets -- -D warnings
-```
-
-## 4. LumaDesk 迁移
-
-### L6. AI 请求 TraceContext
-
-| 字段 | 内容 |
-|---|---|
-| ID | L6 |
-| 状态 | `TODO` |
-| 文件 | `crates/lumakit-ai/src/chat_request.rs` |
-| 依赖 | L5 |
-| 目标 | 把当前 `ai.request` span 迁移到公共 TraceContext |
-
-实施：
-
-- 每次 AI turn 创建 root `ai.request`；
-- 保留 `conversation_id/turn_id/attempt_id/model/protocol/image_mode`；
-- worker thread 显式 clone context；
-- HTTP 请求创建 child `ai.http.request`；
-- tool、stream、usage、cancel、failure 使用 child operation；
-- `AiError::Http` 记录状态码和白名单 request id；
-- 不记录完整 prompt、授权 header、完整响应正文。
-
-验收：
-
-- 一次真实 AI request 能按 TraceId 找到 start/http/complete 或 failure；
-- cancel 记录 Info/Warn，不记录 ERROR；
-- failure 保留 typed error；
-- `lumakit-ai` tests 通过。
-
-### L7. LumaDesk settings/network
-
-| 字段 | 内容 |
-|---|---|
-| ID | L7 |
-| 状态 | `TODO` |
-| 文件 | `LumaDesk/src/model_settings/*`、`search_settings/*`、相关网络模块 |
-| 依赖 | L5、L6 |
-| 目标 | 配置刷新、搜索和 MCP 也可以按 TraceId 还原 |
-
-验收：
-
-- 每个可取消网络 job 有 root/child；
-- 取消、超时、HTTP 失败有终态；
-- 密钥不出日志；
-- 设置失败不会留下未完成 operation。
-
-## 5. ThinkRail Native 迁移
-
-### L8. Native state::run
-
-| 字段 | 内容 |
-|---|---|
-| ID | L8 |
-| 状态 | `TODO` |
-| 文件 | ThinkRail Native `crates/app/src/state.rs` |
-| 依赖 | L5 |
-| 目标 | 替代当前单纯 `op()` 传播，保留兼容期行为 |
-
-实施：
-
-- root `ui.background`；
-- background executor 显式 clone context；
-- completion callback 重新 enter；
-- 旧 `op()` 先作为 wrapper；
-- success/error/cancel 都有终态。
-
-### L9. Native HostTool/Agent
-
-| 字段 | 内容 |
-|---|---|
-| ID | L9 |
-| 状态 | `TODO` |
-| 文件 | HostTool bridge、MCP、OMP、Agent process/session |
-| 依赖 | L8 |
-| 目标 | tool call、engine turn、protocol 和 cleanup 同 TraceId |
-
-验收：
-
-- HostTool 入口、handler、workspace/plan、返回可串联；
-- Agent process start/request/response/settled/exit 可串联；
-- MCP worker thread 不丢 TraceId；
-- cancellation/timeout 有终态；
-- 不输出 token、prompt、文件正文。
-
-### L10. Native ReviewRunner
-
-| 字段 | 内容 |
-|---|---|
-| ID | L10 |
-| 状态 | `TODO` |
-| 文件 | Native app ReviewRunner、ReviewEvent |
-| 依赖 | L9 |
-| 目标 | worker chat、reviewer chat、verdict、cleanup 可串联 |
-
-验收：
-
-- 每次 review 一个 root trace；
-- 临时 reviewer session 是 child；
-- verdict parse/apply 有 child；
-- router release、dispose、support cleanup 有终态；
-- DSH async 事件保持 trace_id；
-- cancel/failure/timeout 不泄漏 running entry。
-
-## 6. 产品日志查看器
-
-### L11. TraceId 搜索
-
-| 字段 | 内容 |
-|---|---|
-| ID | L11 |
-| 状态 | `TODO` |
-| 依赖 | L5、L8 |
-| 目标 | LumaDesk/Native 日志页能够按 TraceId 查询 |
-
-功能：
-
-- TraceId 文本过滤；
-- operation/layer/component 过滤；
-- 一键复制 TraceId；
-- 显示事件时间顺序和 duration；
-- 默认显示 Info/Warn/Error，Debug/Trace 可开启；
-- 不改变日志文件 rotation/tail 契约。
-
-## 7. 全局验证
-
-### L12. Workspace 验证
-
-| 字段 | 内容 |
-|---|---|
-| ID | L12 |
-| 状态 | `TODO` |
-| 依赖 | L1-L11 |
-| 目标 | 两个消费者同时稳定 |
-
-LumaKit：
-
-```bat
-cargo +1.99.0 fmt --all -- --check
-cargo +1.99.0 check --workspace --all-targets
-cargo +1.99.0 test --workspace
-cargo +1.99.0 clippy --workspace --all-targets -- -D warnings
-```
-
-LumaDesk：
-
-```bat
-scripts\cargo-msvc.bat fmt --all -- --check
-scripts\cargo-msvc.bat check --workspace --all-targets
-scripts\cargo-msvc.bat test --workspace
-scripts\cargo-msvc.bat clippy --workspace --all-targets -- -D warnings
-```
-
-Native：使用其现有 MSVC wrapper 跑同等检查。
-
-### L13. 真实 smoke
-
-| 字段 | 内容 |
-|---|---|
-| ID | L13 |
-| 状态 | `TODO` |
-| 依赖 | L6-L12 |
-| 目标 | 真实边界行为证明链路，不只证明编译 |
-
-必须实际观察：
-
-- LumaDesk AI 请求成功/失败/取消；
-- LumaDesk settings network 请求；
-- Native host tool；
-- Native Agent turn；
-- Native ReviewRunner；
-- 通过 TraceId 找到入口、出口和错误；
-- 敏感信息扫描没有命中。
-
-## 8. 状态跟进模板
-
-每次开始任务复制一行到变更记录：
-
-```text
-ID: L1
-Status: DOING
-Owner: <name/session>
-Changed: <files>
-Depends: -
-Check: <command>
-Result: <actual result>
-Unverified: <none or exact limitation>
-```
-
-完成只能在以下条件同时满足时标记 `DONE`：
-
-- 实现已落盘；
-- 直接测试通过；
-- 受影响 workspace 检查通过；
-- 文档/公共 API 已更新；
-- 没有未说明的兼容风险。
-
-## 9. 大模型实施交接模板
-
-> 请实施任务 `<ID>`。先阅读本任务、概要设计和详细设计，搜索目标符号全部调用方。不要扩大范围。
->
-> 实施前报告：当前调用链、预计修改文件、公共 API 影响、TraceContext 传播点、脱敏点和验证命令。
->
-> 实施后报告：修改文件、实际行为、测试命令及结果、未验证项、文件规模和后续依赖。不要把编译通过当作运行链路验证。
+## 3. 公共 crate `lumakit-observability`
+
+| ID | 内容 | 状态 |
+|---|---|---|
+| L1 | `LogLevel` 五级、`level.json` 兼容、运行时重载 | `DONE` |
+| L2 | `TraceContext::root(operation, layer) -> (Self, OperationGuard)`，不会失败；32 位小写十六进制 TraceId | `DONE` |
+| L3 | `OperationGuard`：ENTRY 写成独立日志行；EXIT/ERROR/CANCEL/TIMEOUT/UNFINISHED 恰好一个终态；`RT` 自动计算；`timeout(limit_ms)` 输出 `Limit` | `DONE` |
+| L4 | grep 格式 `TraceId:…\|SpanId:…\|ParentSpanId:…\|Layer:…\|ME:…\|EV:…\|RT:…`，值内分隔符转义，业务 span 字段展开；公开 `SpanFields`、`GrepFormat`、`parse_line` 供自带 appender 的宿主和日志页复用 | `DONE` |
+| L5 | 脱敏：`redact_secret`、`redact_url`、`bounded_text`、`diagnostic_hash` | `DONE` |
+
+L1–L5 记录（2026-11-09）：
+
+- 修改：`src/trace.rs`、`src/operation.rs`、`src/format.rs`（新增）、`src/lib.rs`、`src/tests.rs`；`lumakit-ai` 新增依赖，`chat_request.rs` 的 `ai.request` 改用 root；`examples/lumakit-cli` 增加 `cli.run` 入口。
+- 公共 API 变化：`root` 由 `Result<(Self, Span), String>` 改为 `(Self, OperationGuard)`，并新增 `layer` 参数；删除 `child`；新增 `OperationGuard::span`；`timeout` 参数改名为 `limit_ms`。
+- 检查：`cargo test -p lumakit-observability`，8 项通过；`cargo test -p lumakit-ai -p lumakit-observability`，全部通过；`cargo clippy -p lumakit-observability --no-deps --all-targets -- -D warnings` 通过；LumaDesk `cargo test`，37 项通过。
+- 真实链路：运行 `lumakit-cli`，`app.log` 中出现入口 ENTRY/EXIT（INFO）和下层 ENTRY/EXIT（DEBUG），父子 SpanId 正确。把 `LUMAKIT_AI_URL` 指向一个关闭的端口后，reqwest/hyper 的内部日志带同一 TraceId，终态为 `EV:ERROR|RT:2062|Error:AI_RUN_FAILED`（ERROR）。
+- 文件规模：`format.rs` 241 行、`lib.rs` 240 行、`operation.rs` 157 行，都低于 300 行。
+- 未验证：LumaDesk 实窗 AI 请求链路（已在 L6 完成）。
+- 后续补充（同日）：
+  - 公开 `SpanFields`、`GrepFormat<T>`（`utc()` / `new(timer)`）与 `parse_line`，新增 `src/parse.rs`；
+  - 修正：普通事件的 `event` 字段不再映射为 `EV:`，只有生命周期事件使用保留段名；
+  - 原有问题已处理：`lumakit-cli` 改为显式写 stdout，写失败返回错误；`lumakit-support` 补 `# Errors`；workspace 跑过 rustfmt，此前未格式化的 `chat_request.rs` 单独提交为 `style: rustfmt chat_request`。
+  - 检查：`cargo test -p lumakit-observability`，10 项通过；`cargo clippy -p lumakit-observability --all-targets -- -D warnings`、`cargo clippy -p lumakit-support -p lumakit-cli --no-deps --lib --bins -- -D warnings` 通过。
+  - 仍有：`cargo clippy --workspace --all-targets -D warnings` 不通过，`lumakit-ai`/`lumakit-support` 的测试代码有大量 `unwrap`，`lumakit-ai` 的旧公开函数缺 `# Errors`、可合并的 `if` 等，合计约 280 处，均为本次之前已有。
+
+## 4. LumaDesk
+
+### L6. AI 请求下层操作 — `DONE`
+
+文件：`crates/lumakit-ai/src/lib.rs`、`chat_generation.rs`、`chat_request.rs`；`examples/lumakit-cli`。
+
+- `AiError::code()` 与新变体 `AiError::Timeout { stage, limit_ms }`；reqwest 超时和读取超时不再折叠成字符串。
+- `AiRuntime::run` / `run_with_history` 增加 `trace: Option<&TraceContext>`；下层操作 `ai.http.request`、`ai.tool.call`、`ai.image.generate`，终态由 `end_operation` 统一按 `AiError` 写 CANCEL / TIMEOUT / ERROR。
+- 入口 `ai.request` 由 worker 按实际结果结束，失败写具体错误码（`AI_HTTP_RATE_LIMITED`、`AI_EMPTY_REPLY` 等），不再统一写 `AI_REQUEST_FAILED`。
+- 上游拒绝的说明日志由 ERROR 降为 WARN，避免一次失败出现两条 ERROR。
+- 未做：单独的 `ai.image.download` 操作（下载包含在 `ai.image.generate` 内，超时以 `stage:image_download`、`Limit:60000` 区分）；翻译入口未建 root。
+
+验收记录（2026-11-09）：
+
+- 方式：LumaDesk debug 构建、隔离数据目录 `LUMADESK_DATA_DIR`、本机回环 OpenAI Chat 服务（不连外网）；用真实 `CatalogStore` API 写入回环服务商；通过 UIA 操作实窗选择模型、发送和停止，用 PrintWindow 截取 LumaDesk 窗口。
+- 成功：界面显示回答；日志 `ai.request` ENTRY → `ai.http.request` ENTRY/EXIT（DEBUG）→ `ai.request` `EV:EXIT|RT:604|Result:SUCCESS`。
+- 上游 429：界面显示“回答失败，请重试或更换模型”，诊断详情默认折叠；日志 `ai.http.request` `EV:ERROR|Error:AI_HTTP_RATE_LIMITED`（WARN）、状态说明行带 `status:429|request_id:x-request-id=req-loop-429`（WARN）、入口 `EV:ERROR|Error:AI_HTTP_RATE_LIMITED`（ERROR，仅一条）。
+- 取消：生成中点“停止生成”，界面显示“已停止，保留部分回答”；日志入口 `EV:CANCEL|RT:14504|Reason:user_cancelled`（INFO）。
+- 每次请求的 TraceId 都不同；HTTP 子操作的 `ParentSpanId` 指向入口 `SpanId`。
+- 敏感信息：在 `app.log` 中搜索测试密钥、上游错误正文和两条用户消息原文，0 处命中。
+- 检查：`cargo test --workspace`（LumaKit）全部通过；LumaDesk `cargo test` 37 项通过。
+- 未验证：真实供应商；超时终态只在单元路径上，未在实窗触发 120 秒超时。
+
+### L7. 设置与网络入口 — `TODO`
+
+文件：`LumaDesk/src/model_settings/*`、`search_settings/*`、`mcp_settings/*`。
+
+每个可取消的网络任务（目录刷新、连接检测、搜索测试、MCP 发现）在用户动作处创建 root，HTTP 和持久化使用下层 `operation`。设置失败不能留下 `UNFINISHED`。
+
+## 5. ThinkRail Native
+
+### L8. 升级 LumaKit 依赖 — `DOING`
+
+把 `Cargo.toml` 中固定的 `b5c0207` 升级到包含 L1–L6 的提交，并完成设计 §9 列出的改动：删除 `Err(_)` 降级分支，`child` 改为 `operation`；保留按日滚动和北京时间，格式换成 `GrepFormat` + `SpanFields`，`tail` 用 `parse_line`，删除旧 `op()` / `finish()`，同步 `tests/init.rs` 与 `tests/tail.rs`。
+
+### L9. Native 下层 — `TODO`
+
+在 `state::run`、HostTool bridge/MCP worker、Agent session/process、ReviewRunner 中补齐 `operation`，覆盖成功、失败、取消和超时终态。
+
+## 6. 产品与验证
+
+### L10. 日志查看页 — `TODO`
+
+按 TraceId、`ME`、`Layer`、`EV` 过滤；复制 TraceId；按时间显示同一 trace 的事件和 `RT`；默认显示 INFO 及以上。解析规则以设计 §4 为准。
+
+### L11. Workspace 验证与真实 smoke — `TODO`
+
+LumaKit、LumaDesk、Native 分别运行 fmt、check、clippy、test；对 L6、L7、L9 的真实操作各观察一次成功、失败和取消链路，并扫描日志中是否有敏感信息。

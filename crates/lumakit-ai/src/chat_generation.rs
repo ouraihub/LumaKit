@@ -17,6 +17,9 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// 单张生成图片 URL 下载的时限。
+const DOWNLOAD_LIMIT_MS: u64 = 60_000;
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 enum ImageSize {
     #[default]
@@ -58,6 +61,8 @@ pub(super) struct PaintingHost {
     pub tx: EventSender,
     pub wake: Arc<dyn Fn() + Send + Sync>,
     pub executions: Arc<AtomicUsize>,
+    /// 所属聊天请求的链路；图片生成与下载在其下记录生命周期。
+    pub trace: Option<lumakit_observability::TraceContext>,
 }
 impl AiHost for PaintingHost {
     fn select_model(&self, _: &RunRequest) -> Result<ModelRef, AiError> {
@@ -82,6 +87,7 @@ impl AiHost for PaintingHost {
         let tx = self.tx.clone();
         let wake = self.wake.clone();
         let executions = self.executions.clone();
+        let trace = self.trace.clone();
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err(AiError::Cancelled);
@@ -96,13 +102,15 @@ impl AiHost for PaintingHost {
             }
             let request = ImageRequest::parse(call.arguments)?;
             tracing::info!(event = "ai.image.tool", call_id = %call.id, prompt_chars = request.prompt.chars().count(), size = ?request.size, "执行绘图工具");
-            let (mut run, images) = generate(
-                painting.ok_or_else(|| error("尚未配置绘图连接。"))?,
-                request,
-                &root,
-                &cancel,
-            )
-            .await?;
+            let painting = painting.ok_or_else(|| error("尚未配置绘图连接。"))?;
+            let op = trace.as_ref().map(|trace| {
+                lumakit_observability::operation(trace, "ai.image.generate", "external")
+            });
+            let result = generate(painting, request, &root, &cancel).await;
+            if let Some(op) = op {
+                crate::end_operation(op, &result, "SUCCESS");
+            }
+            let (mut run, images) = result?;
             for round in &mut run.rounds {
                 round.model = painting_model.clone();
             }
@@ -170,7 +178,7 @@ async fn generate(
     body["n"] = serde_json::json!(1);
     let mut request = http
         .post(url)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_millis(crate::REQUEST_LIMIT_MS))
         .json(&body);
     if let Some(key) = &connection.api_key {
         request = request.bearer_auth(key.as_str());
@@ -232,7 +240,7 @@ async fn generate(
                 .resolve_to_addrs(host, &addresses)
                 .build()
                 .map_err(crate::network)?;
-            let response = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = download.get(url.clone()).timeout(std::time::Duration::from_secs(60)).send() => result.map_err(crate::network)? };
+            let response = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = download.get(url.clone()).timeout(std::time::Duration::from_millis(DOWNLOAD_LIMIT_MS)).send() => result.map_err(|error| crate::network_within(error, "image_download", DOWNLOAD_LIMIT_MS))? };
             if !response.status().is_success() {
                 return Err(error("生成图片下载失败；不跟随重定向。"));
             }
@@ -336,7 +344,7 @@ async fn read_body(
         }
         Ok(bytes)
     };
-    tokio::select! { biased; _ = cancel.cancelled() => Err(AiError::Cancelled), result = tokio::time::timeout(std::time::Duration::from_secs(120), read) => result.map_err(|_| error("图片响应读取超时。"))? }
+    tokio::select! { biased; _ = cancel.cancelled() => Err(AiError::Cancelled), result = tokio::time::timeout(std::time::Duration::from_millis(crate::REQUEST_LIMIT_MS), read) => result.map_err(|_| AiError::Timeout { stage: "image_response", limit_ms: crate::REQUEST_LIMIT_MS })? }
 }
 fn public_ip(ip: std::net::IpAddr) -> bool {
     match ip {

@@ -417,7 +417,8 @@ impl ChatSession {
                 connection.settings.native_web_search,
             )
         });
-        let span = tracing::info_span!("ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, model = %connection.model, protocol = ?connection.protocol, image_mode);
+        let (trace, root) = lumakit_observability::TraceContext::root("ai.request", "service");
+        let span = tracing::info_span!(parent: root.span(), "ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, model = %connection.model, protocol = ?connection.protocol, image_mode);
         let worker = thread::Builder::new()
             .name("lumakit-chat".into())
             .spawn(move || {
@@ -428,21 +429,12 @@ impl ChatSession {
                     painting,
                     painting_model,
                     messages,
+                    Some((&trace, root)),
                     worker_cancel,
                     &tx,
                     &wake,
                     media_root,
                 );
-                match &result {
-                    Ok(_) => tracing::info!(event = "ai.request.completed", "AI request completed"),
-                    Err((TurnStatus::Cancelled, _)) => {
-                        tracing::info!(event = "ai.request.cancelled", "AI request cancelled")
-                    }
-                    Err(_) => tracing::error!(
-                        event = "ai.request.failed",
-                        "AI 请求失败；详情仅保存到会话，不记录私有正文"
-                    ),
-                }
                 let _ = tx.send(Event::End(result));
                 wake();
             });
@@ -485,6 +477,7 @@ fn run_worker(
         None,
         None,
         messages,
+        None,
         cancel,
         tx,
         wake,
@@ -492,25 +485,85 @@ fn run_worker(
     )
 }
 
+/// 运行一次聊天请求；传入链路时由这里按实际结果结束入口操作，失败写稳定错误码，不写正文。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "私有 worker 入口，参数来自同一次请求快照"
+)]
 fn run_session_worker(
     connection: AiConnection,
     painting: Option<AiConnection>,
     painting_model: Option<ModelRef>,
     messages: Vec<ChatMessage>,
+    trace: Option<(
+        &lumakit_observability::TraceContext,
+        lumakit_observability::OperationGuard,
+    )>,
     cancel: CancellationToken,
     tx: &EventSender,
     wake: &Arc<dyn Fn() + Send + Sync>,
     media_root: PathBuf,
 ) -> Result<crate::AiRun, (TurnStatus, String)> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let (context, root) = trace.unzip();
+    let (result, code) = session_result(
+        connection,
+        painting,
+        painting_model,
+        messages,
+        context,
+        cancel,
+        tx,
+        wake,
+        media_root,
+    );
+    if let Some(root) = root {
+        match (&result, code) {
+            (Ok(_), _) => root.finish("SUCCESS"),
+            (Err(_), Some(Ok(limit_ms))) => root.timeout(limit_ms),
+            (Err((TurnStatus::Cancelled, _)), _) => root.cancel("user_cancelled"),
+            (Err(_), Some(Err(code))) => root.fail(code),
+            (Err(_), None) => root.fail("AI_REQUEST_FAILED"),
+        }
+    }
+    result
+}
+
+/// 结果与日志结论：`Some(Ok(limit_ms))` 为超时，`Some(Err(code))` 为稳定错误码。
+type Outcome = (
+    Result<crate::AiRun, (TurnStatus, String)>,
+    Option<Result<u64, &'static str>>,
+);
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "私有 worker 入口，参数来自同一次请求快照"
+)]
+fn session_result(
+    connection: AiConnection,
+    painting: Option<AiConnection>,
+    painting_model: Option<ModelRef>,
+    messages: Vec<ChatMessage>,
+    trace: Option<&lumakit_observability::TraceContext>,
+    cancel: CancellationToken,
+    tx: &EventSender,
+    wake: &Arc<dyn Fn() + Send + Sync>,
+    media_root: PathBuf,
+) -> Outcome {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| {
-            (
-                TurnStatus::Failed,
-                "无法启动聊天网络运行时，请重试。".into(),
-            )
-        })?;
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return (
+                Err((
+                    TurnStatus::Failed,
+                    "无法启动聊天网络运行时，请重试。".into(),
+                )),
+                Some(Err("AI_RUNTIME_UNAVAILABLE")),
+            );
+        }
+    };
     let mut bytes = 0usize;
     let mut overflow = false;
     let host = generation::PaintingHost {
@@ -527,9 +580,17 @@ fn run_session_worker(
         tx: tx.clone(),
         wake: wake.clone(),
         executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        trace: trace.cloned(),
     };
-    let engine = crate::AiRuntime::new(Arc::new(host))
-        .map_err(|error| (TurnStatus::Failed, error.to_string()))?;
+    let engine = match crate::AiRuntime::new(Arc::new(host)) {
+        Ok(engine) => engine,
+        Err(error) => {
+            return (
+                Err((TurnStatus::Failed, error.to_string())),
+                Some(Err(error.code())),
+            );
+        }
+    };
     let result = runtime.block_on(engine.run_with_history(
         crate::RunRequest {
             input: String::new(),
@@ -537,6 +598,7 @@ fn run_session_worker(
             purpose: "chat".into(),
         },
         messages,
+        trace,
         cancel.clone(),
         |text| {
             if overflow {
@@ -571,22 +633,44 @@ fn run_session_worker(
         },
     ));
     if overflow {
-        return Err((
-            TurnStatus::Failed,
-            "回答超过 1 MiB，已停止；保留已有内容。".into(),
-        ));
+        return (
+            Err((
+                TurnStatus::Failed,
+                "回答超过 1 MiB，已停止；保留已有内容。".into(),
+            )),
+            Some(Err("AI_REPLY_TOO_LARGE")),
+        );
     }
     match result {
-        Ok(result) if result.text.trim().is_empty() => Err((
-            TurnStatus::Failed,
-            "服务返回了空回答，请重试；空回答不会用于后续上下文。".into(),
-        )),
-        Ok(result) if result.text.len() <= MAX_TEXT => Ok(result),
-        Ok(_) => Err((TurnStatus::Failed, "回答超过 1 MiB，已停止。".into())),
-        Err(AiError::Cancelled) => Err((
-            TurnStatus::Cancelled,
-            "已停止；部分回答不会用于后续上下文。".into(),
-        )),
-        Err(error) => Err((TurnStatus::Failed, format!("请求失败：{error}"))),
+        Ok(result) if result.text.trim().is_empty() => (
+            Err((
+                TurnStatus::Failed,
+                "服务返回了空回答，请重试；空回答不会用于后续上下文。".into(),
+            )),
+            Some(Err("AI_EMPTY_REPLY")),
+        ),
+        Ok(result) if result.text.len() <= MAX_TEXT => (Ok(result), None),
+        Ok(_) => (
+            Err((TurnStatus::Failed, "回答超过 1 MiB，已停止。".into())),
+            Some(Err("AI_REPLY_TOO_LARGE")),
+        ),
+        Err(AiError::Cancelled) => (
+            Err((
+                TurnStatus::Cancelled,
+                "已停止；部分回答不会用于后续上下文。".into(),
+            )),
+            None,
+        ),
+        Err(error @ AiError::Timeout { limit_ms, .. }) => (
+            Err((TurnStatus::Failed, format!("请求失败：{error}"))),
+            Some(Ok(limit_ms)),
+        ),
+        Err(error) => {
+            let code = error.code();
+            (
+                Err((TurnStatus::Failed, format!("请求失败：{error}"))),
+                Some(Err(code)),
+            )
+        }
     }
 }

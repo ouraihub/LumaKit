@@ -49,6 +49,12 @@ pub enum SqliteError {
 ///
 /// A copy at `path` with a `.bak` extension is made before the first pending
 /// migration. Each migration and its `user_version` update are one transaction.
+///
+/// # Errors
+/// Returns [`SqliteError::InvalidMigrations`] for unordered or zero versions,
+/// [`SqliteError::FutureVersion`] when the file is newer than `migrations`,
+/// [`SqliteError::ForeignKeysDisabled`] when enforcement cannot be enabled,
+/// and SQLite or backup I/O errors. A failed migration rolls back its own transaction.
 pub fn open_and_migrate(
     path: impl AsRef<Path>,
     migrations: &[Migration],
@@ -122,11 +128,18 @@ pub enum SecretError {
 }
 
 /// Seals secret bytes using the current user's OS protection.
+///
+/// # Errors
+/// Returns [`SecretError::Unsupported`] off Windows and [`SecretError::Dpapi`] when DPAPI fails.
 pub fn seal_secret(secret: &[u8]) -> Result<Vec<u8>, SecretError> {
     secret::seal(secret)
 }
 
 /// Opens bytes previously returned by [`seal_secret`].
+///
+/// # Errors
+/// Returns [`SecretError::Unsupported`] off Windows and [`SecretError::Dpapi`] when the
+/// data is corrupt or was sealed by another user or machine.
 pub fn open_secret(sealed: &[u8]) -> Result<Vec<u8>, SecretError> {
     secret::open(sealed)
 }

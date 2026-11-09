@@ -1,4 +1,4 @@
-//! Structured file logging, trace context and diagnostics for Rust desktop hosts.
+//! 文件日志、TraceId 链路与诊断工具：同一 TraceId 的入口、出口、错误和耗时可用 grep 检索。
 use lumakit_support::SupportError;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,13 +12,17 @@ use tracing_subscriber::{
     EnvFilter, Registry, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+mod format;
 mod operation;
+mod parse;
 mod redact;
 #[cfg(test)]
 mod tests;
 mod trace;
 
+pub use format::{GrepFormat, SpanFields};
 pub use operation::{OperationGuard, operation};
+pub use parse::{LogLine, parse_line};
 pub use redact::{bounded_text, diagnostic_hash, redact_secret, redact_url};
 pub use trace::TraceContext;
 
@@ -146,6 +150,9 @@ impl LogHandle {
     ///
     /// 优先读取 `level.json`，读取或解析失败时使用 `default`。
     /// 写入使文件超过 `max_bytes` 时轮转到 `app.log.1`，仅保留一份旧文件。
+    /// 每行使用 `TraceId:…|Layer:…|ME:…|EV:…` 的 grep 格式。
+    ///
+    /// # Errors
     /// 目录或文件操作失败、全局订阅器已安装时返回错误。
     pub fn init(dir: &Path, default: LogLevel, max_bytes: u64) -> Result<Self, LogError> {
         fs::create_dir_all(dir)?;
@@ -164,9 +171,11 @@ impl LogHandle {
         )?)));
         let output = fmt::layer()
             .with_ansi(false)
+            .event_format(GrepFormat::utc())
             .with_writer(move || shared.clone());
         Registry::default()
             .with(layer)
+            .with(SpanFields)
             .with(output)
             .try_init()
             .map_err(|_| LogError::AlreadyInitialized)?;
@@ -182,6 +191,7 @@ impl LogHandle {
     }
     /// 更新过滤器及内存级别，再将级别写入 `level.json`。
     ///
+    /// # Errors
     /// 重载、锁定或持久化失败时返回错误；持久化失败不会回滚已更新的级别。
     pub fn set_level(&self, level: LogLevel) -> Result<LogStatus, LogError> {
         self.reload
@@ -207,7 +217,10 @@ impl LogHandle {
     }
     /// 读取当前文件的最后若干行，按原顺序返回，最多 2000 行。
     ///
-    /// 读取时载入整个文件；打开、读取或 UTF-8 解码失败时返回错误，不读取轮转文件。
+    /// 读取时载入整个文件，不读取轮转文件。
+    ///
+    /// # Errors
+    /// 打开、读取或 UTF-8 解码失败时返回错误。
     pub fn tail(&self, limit: usize) -> Result<Vec<String>, LogError> {
         let mut s = String::new();
         File::open(&self.path)?.read_to_string(&mut s)?;
@@ -220,7 +233,10 @@ impl LogHandle {
             .rev()
             .collect())
     }
-    /// 当前不执行额外刷盘操作，始终返回成功。
+    /// 当前不执行额外刷盘操作。
+    ///
+    /// # Errors
+    /// 始终返回成功；保留 `Result` 供宿主统一处理关闭流程。
     pub fn flush(&self) -> Result<(), LogError> {
         Ok(())
     }

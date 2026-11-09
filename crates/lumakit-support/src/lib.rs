@@ -49,7 +49,12 @@ pub fn data_root(app_slug: &str) -> Result<PathBuf, SupportError> {
     portable_data_root()
 }
 
+/// 返回 EXE 旁的 `data` 目录，确认可写后才返回。
+///
 /// 可写目录必须明确；静默回退会让用户误以为历史丢失。
+///
+/// # Errors
+/// 无法定位 EXE 目录返回 [`SupportError::InvalidAppSlug`]；目录创建或写入探测失败返回 I/O 错误。
 pub fn portable_data_root() -> Result<PathBuf, SupportError> {
     let root = std::env::current_exe()?
         .parent()
@@ -91,6 +96,9 @@ impl FileLock {
 }
 
 /// 在旧文件仍存在时完成新文件写入；替换失败不删除原数据。
+///
+/// # Errors
+/// 临时文件创建、`write` 回调、刷盘或替换失败时返回错误，并删除临时文件。
 pub fn atomic_write(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), SupportError>,

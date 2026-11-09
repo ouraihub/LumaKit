@@ -139,6 +139,7 @@ where
     );
     let messages = validated_messages(&connection, messages, &cancel)?;
     let result = round(
+        None,
         &http_client()?,
         &connection,
         None,
@@ -361,9 +362,39 @@ pub enum AiError {
     /// 请求已取消。
     #[error("request cancelled")]
     Cancelled,
+    /// 超过时限仍未完成；`limit_ms` 是配置的时限，不是实际耗时。
+    #[error("{stage} timed out after {limit_ms} ms")]
+    Timeout {
+        /// 超时阶段：`request`、`response`、`image_download` 等。
+        stage: &'static str,
+        /// 配置的时限毫秒数。
+        limit_ms: u64,
+    },
     /// 连接地址解析或安全策略校验失败。
     #[error("invalid endpoint: {0}")]
     InvalidEndpoint(String),
+}
+
+impl AiError {
+    /// 稳定、可检索的错误码，用于日志 `Error:` 段与调用方分支；不随错误文案变化。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ModelNotConfigured => "AI_MODEL_NOT_CONFIGURED",
+            Self::ToolDenied => "AI_TOOL_DENIED",
+            Self::Provider(_) => "AI_PROVIDER_ERROR",
+            Self::Http {
+                status: 401 | 403, ..
+            } => "AI_HTTP_UNAUTHORIZED",
+            Self::Http { status: 429, .. } => "AI_HTTP_RATE_LIMITED",
+            Self::Http {
+                status: 400..=499, ..
+            } => "AI_HTTP_REJECTED",
+            Self::Http { .. } => "AI_HTTP_UPSTREAM_ERROR",
+            Self::Cancelled => "AI_CANCELLED",
+            Self::Timeout { .. } => "AI_TIMEOUT",
+            Self::InvalidEndpoint(_) => "AI_INVALID_ENDPOINT",
+        }
+    }
 }
 /// 可跨线程发送的异步工具审批结果。
 pub type ApprovalFuture = Pin<Box<dyn Future<Output = Approval> + Send>>;
@@ -419,9 +450,13 @@ impl<H: AiHost> AiRuntime<H> {
         }
     }
     /// 使用单条用户输入运行；完整历史入口见 `run_with_history`。
+    ///
+    /// # Errors
+    /// 同 [`Self::run_with_history`]。
     pub async fn run<F>(
         &self,
         request: RunRequest,
+        trace: Option<&lumakit_observability::TraceContext>,
         cancel: CancellationToken,
         on_text: F,
     ) -> Result<AiRun, AiError>
@@ -429,16 +464,23 @@ impl<H: AiHost> AiRuntime<H> {
         F: FnMut(String) + Send,
     {
         let messages = vec![ChatMessage::User(request.input.clone())];
-        self.run_with_history(request, messages, cancel, on_text, |_| {})
+        self.run_with_history(request, messages, trace, cancel, on_text, |_| {})
             .await
     }
 
     /// 校验并保留完整文本/视觉历史，复用同一授权与工具续轮循环。
     /// 工具失败作为错误结果回传模型；取消立即终止，重复调用标识不重复执行。
+    ///
+    /// 传入 `trace` 时，每轮上游请求记为 `ai.http.request`、每次工具执行记为 `ai.tool.call`，
+    /// 都挂在调用方的链路下；`None` 不写生命周期日志。
+    ///
+    /// # Errors
+    /// 模型未配置、输入无效、上游拒绝、超时、取消或工具续轮超过五轮时返回错误。
     pub async fn run_with_history<F, E>(
         &self,
         request: RunRequest,
         messages: Vec<ChatMessage>,
+        trace: Option<&lumakit_observability::TraceContext>,
         cancel: CancellationToken,
         mut on_text: F,
         mut on_event: E,
@@ -467,6 +509,7 @@ impl<H: AiHost> AiRuntime<H> {
             std::collections::HashMap::new();
         for _ in 0..5 {
             let mut round = round(
+                trace,
                 &self.http,
                 &connection,
                 system.as_deref(),
@@ -559,7 +602,13 @@ impl<H: AiHost> AiRuntime<H> {
                             is_error: true,
                         },
                         Approval::Allow => {
+                            let op = trace.map(|trace| {
+                                lumakit_observability::operation(trace, "ai.tool.call", "external")
+                            });
                             let result = tokio::select! { biased; _ = cancel.cancelled() => Err(AiError::Cancelled), result = self.host.call_tool(call.clone(), cancel.clone()) => result };
+                            if let Some(op) = op {
+                                end_operation(op, &result, "SUCCESS");
+                            }
                             match result {
                                 Ok(output) => output,
                                 Err(AiError::Cancelled) => {
@@ -600,7 +649,48 @@ impl<H: AiHost> AiRuntime<H> {
     }
 }
 
+/// 一轮上游请求；有链路时记录 `ai.http.request` 的进入、终态与耗时。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "私有边界函数，参数各自独立且只有两个调用方"
+)]
 async fn round<F>(
+    trace: Option<&lumakit_observability::TraceContext>,
+    http: &reqwest::Client,
+    connection: &AiConnection,
+    system: Option<&str>,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    cancel: &CancellationToken,
+    on_text: &mut F,
+) -> Result<AiRun, AiError>
+where
+    F: FnMut(String) + Send,
+{
+    let op =
+        trace.map(|trace| lumakit_observability::operation(trace, "ai.http.request", "external"));
+    let result = round_inner(http, connection, system, messages, tools, cancel, on_text).await;
+    if let Some(op) = op {
+        end_operation(op, &result, "SUCCESS");
+    }
+    result
+}
+
+/// 按 [`AiError`] 结束操作：取消写 CANCEL，超时写 TIMEOUT 与配置时限，其余写稳定错误码。
+pub(crate) fn end_operation<T>(
+    op: lumakit_observability::OperationGuard,
+    result: &Result<T, AiError>,
+    success: &'static str,
+) {
+    match result {
+        Ok(_) => op.finish(success),
+        Err(AiError::Cancelled) => op.cancel("user_cancelled"),
+        Err(AiError::Timeout { limit_ms, .. }) => op.timeout(*limit_ms),
+        Err(error) => op.fail(error.code()),
+    }
+}
+
+async fn round_inner<F>(
     http: &reqwest::Client,
     connection: &AiConnection,
     system: Option<&str>,
@@ -643,7 +733,7 @@ where
     let url = endpoint(connection)?;
     let mut builder = http
         .post(url)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_millis(REQUEST_LIMIT_MS))
         .header(
             reqwest::header::ACCEPT,
             if connection.settings.supports_streaming {
@@ -706,7 +796,7 @@ where
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(AiError::Cancelled),
-            result = tokio::time::timeout(std::time::Duration::from_secs(120), read) => result.map_err(|_| AiError::Provider("response read timed out".into()))??,
+            result = tokio::time::timeout(std::time::Duration::from_millis(REQUEST_LIMIT_MS), read) => result.map_err(|_| AiError::Timeout { stage: "response", limit_ms: REQUEST_LIMIT_MS })??,
         };
         if !result.text.is_empty() {
             on_text(result.text.clone());
@@ -877,13 +967,20 @@ fn http_client() -> Result<reqwest::Client, AiError> {
         .map_err(network)
 }
 
+/// 单次模型 HTTP 请求（连接、发送与读取）的总时限。
+const REQUEST_LIMIT_MS: u64 = 120_000;
+
 fn network(error: reqwest::Error) -> AiError {
+    network_within(error, "request", REQUEST_LIMIT_MS)
+}
+
+/// reqwest 超时映射为 [`AiError::Timeout`]，带上触发它的时限；其他错误只保留固定说明。
+fn network_within(error: reqwest::Error, stage: &'static str, limit_ms: u64) -> AiError {
+    if error.is_timeout() {
+        return AiError::Timeout { stage, limit_ms };
+    }
     // 不显示 reqwest 的错误链：其中可能包含带凭据的 URL 或请求头。
-    AiError::Provider(if error.is_timeout() {
-        "network request timed out".into()
-    } else {
-        "network request failed".into()
-    })
+    AiError::Provider("network request failed".into())
 }
 
 fn provider_error(body: String, secret: Option<&Zeroizing<String>>) -> AiError {
@@ -955,7 +1052,8 @@ async fn provider_response(
     let endpoint = redact(endpoint);
     let request_id = redact(request_id);
     let body = redact(body);
-    tracing::error!(target: "lumakit_ai::http", event = "ai.http.rejected", %endpoint, status, request_id = ?request_id, "上游拒绝请求；错误正文仅返回调用方，不写入日志");
+    // 只记 WARN：请求链路的终态（入口 ERROR）已带错误码；这里补充状态码、请求 ID 与端点。
+    tracing::warn!(target: "lumakit_ai::http", %endpoint, status, request_id = %request_id, "上游拒绝请求；错误正文仅返回调用方，不写入日志");
     AiError::Http {
         status,
         request_id,
@@ -1007,6 +1105,7 @@ mod model_runtime_tests {
         c.settings.model_type = model_config::ModelType::Image;
         let mut ignore = |_: String| {};
         let error = round(
+            None,
             &http_client().unwrap(),
             &c,
             None,
@@ -1031,6 +1130,7 @@ mod model_runtime_tests {
             requires_approval: false,
         }];
         let error = round(
+            None,
             &http_client().unwrap(),
             &c,
             None,

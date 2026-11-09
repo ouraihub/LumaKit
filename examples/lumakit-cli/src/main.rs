@@ -2,8 +2,8 @@
 use lumakit_ai::{
     AiConnection, AiError, AiHost, Approval, RunRequest, ToolCall, ToolFuture, ToolOutput, ToolSpec,
 };
-use lumakit_observability::{LogHandle, LogLevel};
-use std::sync::Arc;
+use lumakit_observability::{LogHandle, LogLevel, TraceContext, operation};
+use std::{io::Write as _, sync::Arc};
 use zeroize::Zeroizing;
 
 struct Host;
@@ -60,22 +60,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         purpose: "desktop".into(),
     };
+    let (trace, root) = TraceContext::root("cli.run", "command");
+    let _entered = root.span().clone().entered();
+    let tools = operation(&trace, "cli.tools.list", "service");
     let runtime = lumakit_ai::AiRuntime::new(Arc::new(Host))?;
-    println!(
-        "LumaKit CLI | tools={}",
-        runtime.available_tools(&request).len()
-    );
+    let count = runtime.available_tools(&request).len();
+    tools.finish("SUCCESS");
+    // 显式写 stdout：写失败（如管道关闭）作为错误返回，而不是像 print! 那样 panic。
+    // 回调须为 Send，不持有 StdoutLock，每次写入时再取句柄。
+    let mut out = std::io::stdout();
+    writeln!(out, "LumaKit CLI | tools={count}")?;
     if std::env::var_os("LUMAKIT_AI_URL").is_some() {
+        let mut write_error = None;
         let run = runtime
             .run(
                 request,
+                Some(&trace),
                 tokio_util::sync::CancellationToken::new(),
-                |delta| print!("{delta}"),
+                |delta| {
+                    if write_error.is_none() {
+                        let mut out = std::io::stdout();
+                        write_error = out
+                            .write_all(delta.as_bytes())
+                            .and_then(|()| out.flush())
+                            .err();
+                    }
+                },
             )
-            .await?;
-        println!("\nAI text length={}", run.text.chars().count());
+            .await;
+        match &run {
+            Ok(_) => root.finish("SUCCESS"),
+            Err(AiError::Cancelled) => root.cancel("user_cancelled"),
+            Err(AiError::Timeout { limit_ms, .. }) => root.timeout(*limit_ms),
+            Err(error) => root.fail(error.code()),
+        }
+        if let Some(error) = write_error {
+            return Err(error.into());
+        }
+        writeln!(out, "\nAI text length={}", run?.text.chars().count())?;
+    } else {
+        root.finish("SKIPPED_NO_URL");
     }
-    println!("log={}", logs.status().path.display());
+    writeln!(out, "log={}", logs.status().path.display())?;
     Ok(())
 }
 

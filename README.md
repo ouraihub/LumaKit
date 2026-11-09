@@ -21,7 +21,7 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 
 ## 设计文档
 
-- [`docs/Rust-LumaKit-日志-请求-响应-异常封装详细设计.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装详细设计.md)：具体 API、字段、OperationGuard、迁移顺序、兼容和测试设计。
+- [`docs/Rust-LumaKit-日志-请求-响应-异常封装设计.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装设计.md)：日志级别、grep 格式契约（`TraceId:…|Layer:…|ME:…|EV:…|RT:…`）、`TraceContext`/`OperationGuard` API、脱敏、错误与响应边界、消费者迁移。
 - [`docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md)：按 LumaKit、LumaDesk、ThinkRail Native 分阶段跟进的任务、依赖和验收。
 - [`docs/traceable-logging-requirement.md`](docs/traceable-logging-requirement.md)：可复制给其他项目大模型的通用可追踪日志需求模板。
 

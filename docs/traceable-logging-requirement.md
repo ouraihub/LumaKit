@@ -55,14 +55,14 @@
 日志级别应采用标准阈值语义：选择某级别时，记录该级别及更严重事件。
 
 ```text
-ERROR：系统异常、未处理异常、进程失败、数据损坏
-WARN ：取消、超时、业务拒绝、可恢复异常
-INFO ：正常启动、正常完成、关键生命周期状态
-DEBUG：方法入口、方法出口、耗时、关键输入/输出摘要
+ERROR：需要人工处理的失败（只在关键入口记一次）、数据损坏
+WARN ：超时、下层失败、可恢复异常、生命周期缺失
+INFO ：正常启动、关键入口的进入与结束、用户取消
+DEBUG：每层方法入口、出口、耗时、关键输入/输出摘要
 TRACE：协议帧、底层通信、事件归约和极细节诊断
 ```
 
-默认级别为 `INFO`。
+默认级别为 `INFO`：默认就能看到每个关键入口是否被调用、结果和耗时；排查时切到 `DEBUG` 看完整层级。
 
 项目应支持：
 
@@ -79,120 +79,79 @@ TRACE：协议帧、底层通信、事件归约和极细节诊断
 
 实现一个可跨线程和异步任务传播的 TraceContext。不要使用全局可变的“当前 Trace ID”来隐式关联业务。
 
-建议接口：
+建议接口（Rust 参考实现见 LumaKit `lumakit-observability`）：
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TraceContext {
-    pub trace_id: String,
-}
+pub struct TraceContext { /* 只读 trace_id */ }
 
 impl TraceContext {
-    pub fn root(operation: &'static str) -> (Self, tracing::Span);
-    pub fn child(&self, operation: &'static str) -> tracing::Span;
+    /// 关键入口：生成新 TraceId，写出 INFO 级 ENTRY，返回入口生命周期。
+    pub fn root(operation: &'static str, layer: &'static str) -> (Self, OperationGuard);
+    pub fn trace_id(&self) -> &str;
 }
+
+/// 下层操作：在当前 span 下写出 DEBUG 级 ENTRY。
+pub fn operation(trace: &TraceContext, operation: &'static str, layer: &'static str) -> OperationGuard;
 ```
 
 如果项目不是 Rust，应使用该语言等价的不可变/可复制上下文对象。
 
 契约：
 
-- 顶层操作创建 root trace；
-- 子层创建 child span；
+- 关键入口（UI 动作、请求、命令、后台任务、工具调用）创建 root，并且必须写出入口日志；
+- 下层每个边界都有 ENTRY 和恰好一条终态，不允许只建 span 而不写生命周期；
+- 生成 TraceId 不应失败，避免调用方为“拿不到 TraceId”写降级分支；
 - `trace_id` 在整个调用链保持不变；
 - `span_id` 和 `parent_span_id` 表示局部层级；
 - 跨 thread、async task、channel、worker、队列和外部进程边界时显式传递；
 - 不能依赖线程本地变量猜测父级关系；
 - 一个用户会话 ID、聊天 ID 或请求参数 ID 不能替代 Trace ID；
+- 在一个链路内新开 root 必须得到新的 Trace ID，不能挂到外层链路；
 - 不同请求之间绝不能串用同一个 Trace ID。
 
-## 统一结构化字段
+## 日志格式（grep 契约）
 
-所有边界日志尽量使用结构化字段，不要把所有字段拼进不可解析的大字符串。
-
-至少包含：
+内部使用结构化字段；文本输出统一为一行一个事件、`|` 分隔的 `Key:Value` 段：
 
 ```text
-trace_id
-span_id
-parent_span_id
-operation
-component
-layer
-event
-result
-duration_ms
-error_code
+<时间> <级别> TraceId:<id>|SpanId:<n>|ParentSpanId:<n|->|Layer:<layer>|ME:<operation>|EV:<event>|RT:<ms>|Result:<result>|Error:<code>
 ```
 
-有业务上下文时追加：
+示例：
 
 ```text
-request_kind
-workspace_id
-chat_id
-user_id（仅在安全且确有必要时）
-backend
-provider
-model
-item_id
+INFO  TraceId:7f3a…|SpanId:1|ParentSpanId:-|Layer:controller|ME:auth.login|EV:ENTRY
+DEBUG TraceId:7f3a…|SpanId:2|ParentSpanId:1|Layer:repository|ME:user.find|EV:EXIT|RT:8|Result:SUCCESS
+WARN  TraceId:7f3a…|SpanId:3|ParentSpanId:1|Layer:repository|ME:user.update|EV:ERROR|RT:9|Result:FAILED|Error:DATABASE_TIMEOUT
+ERROR TraceId:7f3a…|SpanId:1|ParentSpanId:-|Layer:controller|ME:auth.login|EV:ERROR|RT:14|Result:FAILED|Error:DATABASE_TIMEOUT
 ```
 
-字段名应稳定、简洁、可搜索。推荐使用 snake_case。
+要求：
+
+- 段名稳定：`TraceId`、`SpanId`、`ParentSpanId`、`Layer`、`ME`、`EV`、`RT`、`Result`、`Error`、`Reason`、`Limit`；业务字段（`chat_id`、`model` 等）追加在后面；
+- 值中的 `|` 和换行必须转义，保证一个事件只占一行；
+- TraceId 由格式器从上下文写出，不在业务消息里手工拼接；
+- 同一链路内第三方库的日志也带上 TraceId；
+- 未来增加 JSON sink 时字段语义不变。
 
 ## 方法入口/出口日志
 
 每个有副作用、跨边界、可能失败或可能耗时的公共方法，必须有统一生命周期日志。
 
-### 入口
+| `EV` | 时机 | 附加段 | 关键入口级别 | 下层级别 |
+|---|---|---|---|---|
+| `ENTRY` | 进入 | — | INFO | DEBUG |
+| `EXIT` | 成功 | `RT`、`Result`（有限摘要） | INFO | DEBUG |
+| `ERROR` | 失败 | `RT`、`Result:FAILED`、`Error`（稳定错误码） | ERROR | WARN |
+| `CANCEL` | 取消 | `RT`、`Reason` | INFO | DEBUG |
+| `TIMEOUT` | 超时 | `RT`、`Limit`（配置时限） | WARN | WARN |
+| `UNFINISHED` | 生命周期对象未结束就被释放 | `RT` | WARN | WARN |
 
-```text
-event=entry
-operation=<stable.operation.name>
-layer=<controller|service|repository|external>
-trace_id=<...>
-```
-
-记录必要的输入摘要，但不能记录敏感信息或无限长度内容。
-
-### 成功出口
-
-```text
-event=exit
-result=ok
-duration_ms=<...>
-```
-
-记录有限的结果摘要。不要默认序列化完整响应、完整数据库对象或完整文件内容。
-
-### 失败出口
-
-```text
-event=error
-error_code=<stable code>
-error_type=<type>
-duration_ms=<...>
-```
-
-记录异常堆栈或脱敏摘要，保留原始错误用于上层处理。
-
-### 取消和超时
-
-取消和超时必须有独立终态：
-
-```text
-event=cancel
-reason=<...>
-duration_ms=<...>
-```
-
-```text
-event=timeout
-duration_ms=<...>
-timeout_ms=<...>
-```
-
-正常用户取消不应伪装成系统 ERROR；如果取消本身导致资源清理失败，再单独记录 ERROR。
+- `RT` 由结束时间减开始时间自动得出；`Limit` 是配置的时限，与 `RT` 对照可判断超时是否按时触发。
+- 错误只在关键入口记一次 ERROR，下层用 WARN，避免一个故障刷出多条 ERROR。
+- 正常用户取消不应伪装成系统 ERROR；如果取消本身导致资源清理失败，再单独记录 ERROR。
+- 只记录输入/结果摘要，不能记录敏感信息或无限长度内容；原始错误保留给上层处理。
 
 ## 层级边界
 
@@ -274,10 +233,13 @@ external process reader
 示例：
 
 ```rust
-let child_trace = trace.clone();
+let span = root.span().clone();
+let worker_trace = trace.clone();
 std::thread::spawn(move || {
-    let _span = child_trace.child("repository.query").entered();
-    // 这里的日志必须带原 trace_id
+    let _entered = span.entered();
+    let op = operation(&worker_trace, "repository.query", "repository");
+    // 这里的日志带原 trace_id，ParentSpanId 指向入口
+    op.finish("SUCCESS");
 });
 ```
 
