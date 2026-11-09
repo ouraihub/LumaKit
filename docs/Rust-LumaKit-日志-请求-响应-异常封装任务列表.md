@@ -78,19 +78,40 @@ L1–L5 记录（2026-11-09）：
 
 ## 5. ThinkRail Native
 
-### L8. 升级 LumaKit 依赖 — `DOING`
+### L8. 升级 LumaKit 依赖 — `DONE`
 
 把 `Cargo.toml` 中固定的 `b5c0207` 升级到包含 L1–L6 的提交，并完成设计 §9 列出的改动：删除 `Err(_)` 降级分支，`child` 改为 `operation`；保留按日滚动和北京时间，格式换成 `GrepFormat` + `SpanFields`，`tail` 用 `parse_line`，删除旧 `op()` / `finish()`，同步 `tests/init.rs` 与 `tests/tail.rs`。
 
-### L9. Native 下层 — `TODO`
+记录（2026-11-09，Native `c7046db`，分支 `feat/models-page-review`，LumaKit `a5b9bf3`）：
+
+- 修改：`crates/observability/src/{lib,tail}.rs`，删除 `format.rs`、`op.rs`；`tests/{init,tail}.rs` 按新格式重写；`app/src/state.rs`、`services.rs`、`services/review/dispatch.rs`、`host-tools/src/{bridge,mcp}.rs`、`agents/src/trace.rs`、`app/src/panels/settings/logs.rs`。
+- `LogEntry` 删除 `spans`、`target`，新增 `event`、`duration_ms`；`component` 优先取业务行的 `Target`，生命周期行取 `Layer`。
+- 检查：`cargo fmt --all -- --check` 通过；`cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace` 324 项通过、0 失败。
+- 真实程序：用隔离 `--data-dir` 启动 debug 构建。日志文件中共 20 个 trace，每个都有终态；重启后调试级别从存储中恢复（`level:debug`）。日志页列表显示 `ENTRY` / `EXIT 25ms`；把 TraceId 填进筛选框后，只剩该操作的 ENTRY、业务行和 EXIT 三行。
+- 文件规模：`mcp.rs` 311 行（原 306）、`services.rs` 356 行（原 369）、`logs.rs` 444 行（原 423），都超过 300 行评审线，且在本次之前就已超过；均未超过 500 行。
+
+### L9. Native 下层 — `DOING`
 
 在 `state::run`、HostTool bridge/MCP worker、Agent session/process、ReviewRunner 中补齐 `operation`，覆盖成功、失败、取消和超时终态。
 
+已完成（随 L8）：
+
+- `ui.background`：root，结果写 EXIT，或带 `ErrorCode` 写 ERROR。
+- `host_tool.call`：root，`is_error` 时写 `host_tool_error`。
+- `review.run`：root，覆盖取消、失败和 SUCCESS；线程启动失败时由 guard 写 UNFINISHED。
+- `host_bridge.request`：每个请求一个 operation。
+- `mcp.call`：每次调用一个 operation，引擎撤回写 CANCEL，管道失败写 `MCP_BRIDGE_FAILED`；`mcp.session` 在输入结束、全部 worker 退出后写 `CLOSED`。
+- `agent.session` 与 `host_bridge.session` 是长期关联上下文，root 立即以 `REGISTERED` 结束，下层沿用其 span 和 TraceId。
+
+未完成：Agent process/turn/request 边界目前只是普通 span，还没有 ENTRY/终态；超时终态没有覆盖；这些路径还没有实窗验证。
+
 ## 6. 产品与验证
 
-### L10. 日志查看页 — `TODO`
+### L10. 日志查看页 — `DOING`
 
 按 TraceId、`ME`、`Layer`、`EV` 过滤；复制 TraceId；按时间显示同一 trace 的事件和 `RT`；默认显示 INFO 及以上。解析规则以设计 §4 为准。
+
+Native 进度：按 TraceId 的文本筛选和逐行复制 TraceId 已可用；生命周期行显示 `EV`、`RT`、`Error`/`Reason`。未完成：`EV`/`Layer` 专用筛选；复制按钮的位置（目前每行一个，同一 trace 重复出现）待确认；失败提示中显示可复制的 TraceId。LumaDesk 日志页尚未开始。
 
 ### L11. Workspace 验证与真实 smoke — `TODO`
 
