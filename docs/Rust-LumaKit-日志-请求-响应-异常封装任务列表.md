@@ -111,7 +111,15 @@ L1–L5 记录（2026-11-09）：
 
 按 TraceId、`ME`、`Layer`、`EV` 过滤；复制 TraceId；按时间显示同一 trace 的事件和 `RT`；默认显示 INFO 及以上。解析规则以设计 §4 为准。
 
-Native 进度：按 TraceId 的文本筛选和逐行复制 TraceId 已可用；生命周期行显示 `EV`、`RT`、`Error`/`Reason`。未完成：`EV`/`Layer` 专用筛选；复制按钮的位置（目前每行一个，同一 trace 重复出现）待确认；失败提示中显示可复制的 TraceId。LumaDesk 日志页尚未开始。
+Native 进度（`f92555c`）：
+
+- 每行显示 TraceId 前 8 位，做成链接按钮。点击后把完整 TraceId 填入筛选框，只显示这条链路；再点一次取消筛选。
+- 只在 ENTRY 行放「复制」按钮，复制完整 TraceId。生命周期行显示 `EV`、`RT` 和 `Error`/`Reason`。
+- 实窗验证：点 `8300bcec` 后列表从 93 条减到 2 条（ENTRY、EXIT 1ms）；点「复制」后剪贴板内容为 `8300bcec198dff6e223aa6d44ba6e7f8`；再点一次恢复 93 条。
+- 键盘与可访问性：用 Tab 能聚焦到标签，聚焦环可见；按空格可触发筛选，按回车无效（gpui 按钮的统一行为）。UIA 角色为 Hyperlink，可访问名称为「只看 Trace xxxxxxxx… 的日志；再点一次取消筛选」或「复制」。
+- `logs.rs` 共 473 行，超过 300 行评审线，未超过 500 行。
+
+未完成：`EV`/`Layer` 专用筛选；失败提示中显示可复制的 TraceId；LumaDesk 日志页尚未开始（LumaDesk 设置页目前没有日志页，`LogHandle` 只在启动时初始化）。
 
 ### L11. Workspace 验证与真实 smoke — `TODO`
 
