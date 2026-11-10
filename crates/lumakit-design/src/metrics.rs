@@ -44,6 +44,10 @@ pub mod size {
     pub const CONTENT_MAX: Pixels = px(760.);
     /// Below this window width, side-by-side layouts stack.
     pub const NARROW: Pixels = px(700.);
+    /// Compact provider/key manager dialog width, matching the reference surface.
+    pub const SETTINGS_DIALOG: Pixels = px(520.);
+    /// Optional user label beside a credential value.
+    pub const KEY_LABEL: Pixels = px(120.);
 }
 
 pub mod radius {

@@ -105,11 +105,18 @@ impl ModelCatalog {
         if entry.settings.model_type != crate::model_config::ModelType::Chat {
             return Err("所选模型不是聊天类型，请使用对应业务接口".into());
         }
-        let key = endpoint
-            .selected_key
-            .as_ref()
-            .and_then(|id| endpoint.keys.iter().find(|k| &k.id == id))
-            .or_else(|| endpoint.keys.first());
+        let key = if endpoint.keys.is_empty() {
+            None
+        } else {
+            Some(
+                endpoint
+                    .selected_key
+                    .as_ref()
+                    .and_then(|id| endpoint.keys.iter().find(|k| k.enabled && &k.id == id))
+                    .or_else(|| endpoint.keys.iter().find(|k| k.enabled))
+                    .ok_or("所选线路没有启用的密钥")?,
+            )
+        };
         let settings = entry.effective_settings(endpoint.protocol);
         Ok(AiConnection {
             base_url: validate_url(&endpoint.base_url)?,
@@ -148,11 +155,18 @@ impl ModelCatalog {
         if entry.settings.model_type != expected {
             return Err("所选模型类型与当前业务不匹配".into());
         }
-        let key = endpoint
-            .selected_key
-            .as_ref()
-            .and_then(|id| endpoint.keys.iter().find(|k| &k.id == id))
-            .or_else(|| endpoint.keys.first());
+        let key = if endpoint.keys.is_empty() {
+            None
+        } else {
+            Some(
+                endpoint
+                    .selected_key
+                    .as_ref()
+                    .and_then(|id| endpoint.keys.iter().find(|k| k.enabled && &k.id == id))
+                    .or_else(|| endpoint.keys.iter().find(|k| k.enabled))
+                    .ok_or("所选线路没有启用的密钥")?,
+            )
+        };
         let settings = entry.effective_settings(endpoint.protocol);
         Ok(AiConnection {
             base_url: validate_url(&endpoint.base_url)?,
@@ -376,6 +390,72 @@ mod model_settings_tests {
             connection.settings,
             catalog.providers()[0].endpoints[0].models[0].effective_settings(model.protocol)
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolvers_skip_disabled_selected_keys_and_reject_all_disabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::model_config::ModelType;
+        let model = ModelRef {
+            provider: "p".into(),
+            endpoint: "e".into(),
+            model: "m".into(),
+            protocol: Protocol::OpenAiChat,
+        };
+        let enabled = SavedKey::new("enabled-runtime-secret")?;
+        let mut provider = ProviderEntry {
+            id: "p".into(),
+            name: "p".into(),
+            enabled: true,
+            endpoints: vec![EndpointEntry {
+                id: "e".into(),
+                name: "e".into(),
+                base_url: "https://example.com/v1".into(),
+                protocol: Protocol::OpenAiChat,
+                keys: vec![
+                    SavedKey {
+                        id: "disabled".into(),
+                        label: None,
+                        enabled: false,
+                        masked: "••••••••".into(),
+                        ciphertext: vec![0, 1, 2],
+                    },
+                    enabled,
+                ],
+                models: vec![ModelEntry {
+                    id: "m".into(),
+                    capabilities: ModelCapabilities::default(),
+                    manual: true,
+                    settings: Default::default(),
+                }],
+                selected_key: Some("disabled".into()),
+                selected_model: None,
+            }],
+        };
+        for kind in [ModelType::Chat, ModelType::Image] {
+            provider.endpoints[0].models[0].settings.model_type = kind;
+            let catalog = ModelCatalog::new(vec![provider.clone()]);
+            let resolved = if kind == ModelType::Chat {
+                catalog.resolve(&model)?
+            } else {
+                catalog.resolve_for(&model, kind)?
+            };
+            assert_eq!(
+                resolved.api_key.as_deref().map(String::as_str),
+                Some("enabled-runtime-secret")
+            );
+            let mut disabled = provider.clone();
+            disabled.endpoints[0].keys[1].enabled = false;
+            let catalog = ModelCatalog::new(vec![disabled]);
+            let rejected = if kind == ModelType::Chat {
+                catalog.resolve(&model)
+            } else {
+                catalog.resolve_for(&model, kind)
+            };
+            assert!(rejected.is_err());
+        }
         Ok(())
     }
 }

@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["chat"]
+chat = ["dep:lumakit-ai", "dep:lumakit-model-picker", "dep:lumakit-usage-status", "dep:pulldown-cmark", "dep:image"]
+
 [dependencies]
 gpui-kit = "=0.9.0"
-lumakit-ai = { path = "../lumakit-ai" }
+lumakit-ai = { path = "../lumakit-ai", optional = true }
 lumakit-design = { path = "../lumakit-design" }
-lumakit-model-picker = { path = "../lumakit-model-picker" }
-lumakit-usage-status = { path = "../lumakit-usage-status" }
-pulldown-cmark = { version = "0.13", default-features = false }
-image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+lumakit-model-picker = { path = "../lumakit-model-picker", optional = true }
+lumakit-usage-status = { path = "../lumakit-usage-status", optional = true }
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }

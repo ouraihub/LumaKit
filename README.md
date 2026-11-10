@@ -12,7 +12,7 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 | `lumakit-observability` | 结构化 tracing、文件日志、运行时改级别、状态、读尾部、滚动 | 全部 |
 | `lumakit-design` | GPUI 设计系统：主题、令牌、字体、图标、组件、外观偏好与外观页 | GPUI 宿主 |
 | `lumakit-ai` | AI 协议、会话、目录、搜索、MCP、技能；聊天动作 `chat::{ChatAction, ModelOption}` | AI 宿主 |
-| `lumakit-gpui` | GPUI 聊天面板 | LumaDesk |
+| `lumakit-gpui` | GPUI 聊天面板与共享模型服务 UI；`default-features = false` 只引入服务商展示组件，不引入聊天后端 | LumaDesk、ThinkRail Native |
 | `lumakit-model-picker` | 独立 GPUI 模型／推理强度选择器，仅依赖 gpui-kit；读取宿主主题，不含网络或存储 | LumaDesk、ThinkRail Native |
 | `lumakit-usage-status` | 受控上下文占用／累计 token／费用状态与系统图标，仅依赖 gpui-kit | LumaDesk、ThinkRail Native |
 | `lumakit-egui` | egui 聊天面板，`examples/chat-host` 独立宿主 | LumaDesk 旧 egui 版（标签 `legacy-egui`）；GPUI 版已合入 `main`，待删除 |
@@ -24,6 +24,7 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 - [`docs/Rust-LumaKit-日志-请求-响应-异常封装设计.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装设计.md)：日志级别、grep 格式契约（`TraceId:…|Layer:…|ME:…|EV:…|RT:…`）、`TraceContext`/`OperationGuard` API、脱敏、错误与响应边界、消费者迁移。
 - [`docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md`](docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md)：按 LumaKit、LumaDesk、ThinkRail Native 分阶段跟进的任务、依赖和验收。
 - [`docs/traceable-logging-requirement.md`](docs/traceable-logging-requirement.md)：可复制给其他项目大模型的通用可追踪日志需求模板。
+- [`docs/shared-provider-settings.md`](docs/shared-provider-settings.md)：两个宿主共用的模型服务 UI、业务/密钥边界、迁移步骤与验收记录。
 
 ## lumakit-design
 
@@ -36,6 +37,10 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 - `appearance`：外观偏好 `Preferences`（主题 id、跟随系统的浅/深主题对、强调色、密度）、切换规则与 `apply`，以及无状态外观页 `AppearancePage`。序列化字段名是稳定 schema；持久化与旧格式迁移由宿主负责。
 
 宿主启动顺序：注册 `UiAssets`、调用 `fonts::register_bundled`，再 `Preferences::apply`（或 `LumaTheme::install`）。
+
+`KeyRow` / `KeyManager` 可通过 `.roles(host_roles)` 使用宿主语义色，不要求安装第二套 `LumaTheme`；`KeyRow::hover_actions` 保留键盘可达的悬停动作。`lumakit-gpui::providers` 组合服务商栏、详情、密钥、线路、模型列表与编辑表单；它只接收显示内容及用户意图回调，不访问网络、数据库或凭据存储。默认 `chat` feature 保留聊天 API；Native 关闭默认 feature，仅消费共享模型服务 UI。
+
+多密钥标签通过 `SavedKey::label` 保存；`normalize_key_label` / `set_label` 统一可选标签校验。模型目录 schema 3 追加 nullable `endpoint_keys.label`，schema 4 追加默认启用的 `enabled`；旧数据库/JSON 未命名密钥保持原 ID 和密文。修改标签或启用状态不解密或重新加密；停用密钥不参与连接解析或检测，存有密钥但全部停用时明确拒绝而非匿名请求。服务商密钥管理共用紧凑 `key_entry`（标签、密钥、提交同一行）、`KeyRow::trailing` 内嵌启用 Switch 及内容自适应短弹层。
 
 ## lumakit-ai
 

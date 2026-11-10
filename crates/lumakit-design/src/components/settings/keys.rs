@@ -4,8 +4,8 @@
 //! callback. All actions are Kit buttons, so they take keyboard focus and expose names and roles.
 
 use gpui_kit::{
-    App, ClickEvent, IntoElement, ParentElement as _, RenderOnce, SharedString, Styled as _,
-    Window,
+    App, ClickEvent, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce,
+    SharedString, Styled as _, Window,
     assets::IconName,
     base::{h_flex, v_flex},
     component::{
@@ -25,23 +25,27 @@ use crate::{
 
 /// One saved key: its masked (or explicitly revealed) value in a bordered box with icon actions.
 ///
-/// The eye is always shown; copy, edit and delete appear once revealed or with
-/// [`KeyRow::all_actions`]. An action without a handler is not drawn. `id` prefixes the ids of
-/// the row's buttons, so it must be unique on the page.
+/// Only actions with handlers are drawn. Copy/edit can appear on action-cluster hover or keyboard
+/// focus; a manager can keep them visible with [`KeyRow::all_actions`]. Reveal is optional and
+/// [`KeyRow::trailing`] embeds the host's real enabled Switch. `id` uniquely prefixes all actions.
 #[derive(IntoElement)]
 pub struct KeyRow {
     id: SharedString,
     value: SharedString,
+    label: Option<SharedString>,
     revealed: bool,
     more: usize,
     all_actions: bool,
+    hover_actions: bool,
     selected: Option<bool>,
     disabled: bool,
+    roles: Option<crate::Roles>,
     on_reveal: Option<Handler>,
     on_copy: Option<Handler>,
     on_edit: Option<Handler>,
     on_delete: Option<Handler>,
     on_select: Option<Handler>,
+    trailing: Option<gpui_kit::AnyElement>,
 }
 
 impl KeyRow {
@@ -54,17 +58,39 @@ impl KeyRow {
         Self {
             id: id.into(),
             value: value.into(),
+            label: None,
             revealed,
             more: 0,
             all_actions: false,
+            hover_actions: false,
             selected: None,
             disabled: false,
+            roles: None,
             on_reveal: None,
             on_copy: None,
             on_edit: None,
             on_delete: None,
             on_select: None,
+            trailing: None,
         }
+    }
+
+    /// An optional user-facing name, displayed separately from the masked value.
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Uses the host's semantic colors without requiring an installed LumaTheme.
+    pub fn roles(mut self, roles: crate::Roles) -> Self {
+        self.roles = Some(roles);
+        self
+    }
+
+    /// Keeps auxiliary actions keyboard-reachable and shows them on action-cluster hover or focus.
+    pub fn hover_actions(mut self, enabled: bool) -> Self {
+        self.hover_actions = enabled;
+        self
     }
 
     /// How many other keys exist; shown as `+N` after the value when non-zero.
@@ -117,6 +143,12 @@ impl KeyRow {
         self
     }
 
+    /// A host-owned control such as the actual per-key enabled Switch, inside the value border.
+    pub fn trailing(mut self, control: impl IntoElement) -> Self {
+        self.trailing = Some(control.into_any_element());
+        self
+    }
+
     /// Adds the 使用此密钥 toggle, checked when `selected` is the preferred key.
     pub fn on_select(
         mut self,
@@ -141,23 +173,65 @@ fn action(id: SharedString, icon: IconName, name: &'static str, handler: Handler
 
 impl RenderOnce for KeyRow {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let r = roles(cx);
+        let r = self.roles.unwrap_or_else(|| roles(cx));
         let Self {
             id,
             value,
+            label: key_label,
             revealed,
             more,
             all_actions,
+            hover_actions,
             selected,
             disabled,
             on_reveal,
+            roles: _,
             on_copy,
             on_edit,
             on_delete,
             on_select,
+            trailing,
         } = self;
         let child_id = |suffix: &str| SharedString::from(format!("{id}-{suffix}"));
-        let mut actions = h_flex().flex_none().gap(space::S2);
+        let hover_group = SharedString::from(format!("{id}-hover"));
+        let auxiliary = |button: Button| {
+            if hover_actions && !revealed && !all_actions {
+                gpui_kit::div().child(
+                    button
+                        .opacity(0.)
+                        .group_hover(hover_group.clone(), |s| s.opacity(1.))
+                        .focus_visible(|s| s.opacity(1.)),
+                )
+            } else {
+                gpui_kit::div().child(button)
+            }
+        };
+        let mut actions = h_flex()
+            .flex_none()
+            .gap(space::S2)
+            .group(hover_group.clone());
+        if revealed || all_actions || hover_actions {
+            if let Some(handler) = on_copy {
+                actions = actions.child(auxiliary(action(
+                    child_id("copy"),
+                    IconName::Copy,
+                    "复制密钥",
+                    handler,
+                )));
+            }
+            if let Some(handler) = on_edit {
+                actions = actions.child(auxiliary(
+                    action(child_id("edit"), IconName::Pencil, "修改密钥", handler)
+                        .disabled(disabled),
+                ));
+            }
+            if let Some(handler) = on_delete {
+                actions = actions.child(auxiliary(
+                    action(child_id("delete"), IconName::Trash, "删除密钥…", handler)
+                        .disabled(disabled),
+                ));
+            }
+        }
         if let Some(handler) = on_reveal {
             let (icon, name) = if revealed {
                 (IconName::EyeOff, "隐藏密钥")
@@ -166,47 +240,38 @@ impl RenderOnce for KeyRow {
             };
             actions = actions.child(action(child_id("reveal"), icon, name, handler));
         }
-        if revealed || all_actions {
-            if let Some(handler) = on_copy {
-                actions = actions.child(action(
-                    child_id("copy"),
-                    IconName::Copy,
-                    "复制密钥",
-                    handler,
-                ));
-            }
-            if let Some(handler) = on_edit {
-                actions = actions.child(
-                    action(child_id("edit"), IconName::Pencil, "修改密钥", handler)
-                        .disabled(disabled),
-                );
-            }
-            if let Some(handler) = on_delete {
-                actions = actions.child(
-                    action(child_id("delete"), IconName::Trash, "删除密钥…", handler)
-                        .disabled(disabled),
-                );
-            }
-        }
         h_flex()
+            .group(SharedString::from(format!("{id}-row")))
             .flex_1()
             .min_w(px(0.))
-            .h(size::SETTINGS_ROW)
+            .min_h(size::SETTINGS_ROW)
+            .flex_wrap()
             .px(space::S8)
             .gap(space::S8)
             .rounded(radius::MD)
             .border_1()
             .border_color(r.border_default)
+            .when_some(key_label, |d, name| {
+                d.child(
+                    label(text::UI, name)
+                        .text_color(r.text_muted)
+                        .when(all_actions, |d| d.w(size::KEY_LABEL))
+                        .when(!all_actions, |d| d.max_w(size::KEY_LABEL))
+                        .min_w(px(0.))
+                        .truncate(),
+                )
+            })
             .child(
                 label(text::CODE_TEXT, value)
                     .flex_1()
-                    .min_w(px(0.))
+                    .min_w(size::SETTINGS_ROW)
                     .truncate(),
             )
             .when(more > 0, |d| {
                 d.child(label(text::METADATA, format!("+{more}")).text_color(r.text_subtle))
             })
             .child(actions)
+            .children(trailing)
             .when_some(selected.zip(on_select), |d, (selected, handler)| {
                 d.child(
                     Button::new(child_id("select"))
@@ -233,6 +298,7 @@ pub struct KeyManager {
     can_save: bool,
     on_save: Option<Handler>,
     on_cancel_edit: Option<Handler>,
+    roles: Option<crate::Roles>,
 }
 
 impl KeyManager {
@@ -246,7 +312,14 @@ impl KeyManager {
             can_save: true,
             on_save: None,
             on_cancel_edit: None,
+            roles: None,
         }
+    }
+
+    /// Uses explicit host colors; no second theme global is installed.
+    pub fn roles(mut self, roles: crate::Roles) -> Self {
+        self.roles = Some(roles);
+        self
     }
 
     pub fn note(mut self, note: impl Into<SharedString>) -> Self {
@@ -291,7 +364,7 @@ impl KeyManager {
 
 impl RenderOnce for KeyManager {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let r = roles(cx);
+        let r = self.roles.unwrap_or_else(|| roles(cx));
         let editing = self.editing;
         let mut actions = h_flex().justify_end().gap(space::S8);
         if editing && let Some(handler) = self.on_cancel_edit {
