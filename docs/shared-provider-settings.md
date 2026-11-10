@@ -41,7 +41,7 @@
 
 定向编译与现有密钥保存/失败回滚/启用独立/检测同步测试；新增回归仅覆盖保存目标和异步失败草稿恢复等真实边界。真实两个宿主用隔离数据和本地回环服务验证：未配置/已保存、保存失败重试、检测成功/失败/取消、弹层取消与保存、服务商线路切换、键盘和焦点。覆盖 320/375/414/768 逻辑宽度并保存实窗证据；未观察不得标通过。最后更新实现记录并正式打包 LumaDesk。
 
-状态：共享组件、两宿主接入、标签及逐密钥启用已实现并通过行为/实窗；最终依赖发布与打包验收进行中。
+状态：完成。共享代码已推送，Native固定依赖验证通过；LumaDesk正式构建、测试、发布及哈希校验完成，发布EXE已实窗确认标签和Switch。
 
 ### 已运行证据
 
@@ -52,6 +52,8 @@
 - LumaDesk 本轮证据位于 `C:/Users/Administrator/AppData/Local/Temp/provider-label-final-7ey4rrsm/`；原 Native 对照位于 `C:/Users/Administrator/AppData/Local/Temp/shared-provider-ui-cda1gesx/native-reference-*.png`。均为隔离假密钥和本地回环，不是生产凭据。
 - Switch 最终验证：LumaDesk 模型设置17项通过，Kit catalog筛选14项及相关集成、secrets4项通过。实窗 schema3→4 默认启用；逐项停用显示0/2、启用一项显示1/2，全部停用检测未收到任何回环请求。SQLite trigger拒写时开关恢复，重启后0/1状态、标签、ID和密文字节均保持。最终截图 `desk-key-switches-wide.png`、`desk-switch-manager-final-{320,375,414,768}.png`、`desk-switch-save-failure.png`、`desk-switch-restart.png`。
 - Native 使用原后端真实启用状态；最终 `KeyRow::trailing` 将 Switch 放在同一边框内。实窗添加/标签修改/密钥替换/重启、Switch切换0/1→1/1、320/375/414/768已观察。证据 `C:/Users/Administrator/AppData/Local/Temp/native-keys-finish-l9kw_acv/screenshots/key-manager-bordered-switch-{320,wide}.png` 及 `*-final-{320,375,414,768}.png`。原本污染的中间 corrected截图不作为证据。Native workspace严格clippy及全部测试通过（16个既有外部依赖ignored保持不变）。
+- 共享实现发布提交 `f263608cdc5efcb107ab7d3d060a9caba85d0afa`；Native所有LumaKit依赖固定同一rev，新增 `lumakit-gpui` 关闭chat默认feature。远程来源all-targets check、严格宿主clippy、提供方5项回归通过；workspace实测337项通过、16项既有ignored（使用同份本地共享源联调阶段）。无关 codespan 的unicode-width锁定关系保持原样，未升级外部依赖。
+- 正式发布 `scripts/build-app.bat` 完成，宿主release43项、Kit release全套通过；构建标识 `0.1.0-0a0f40c28e5647f7ad7a6e2abc781005`，EXE SHA-256 `5529ac2f8348734338619dbcf6877d2eb44b1e7c145798f93d4bcb3a26e6d3b2`。发布EXE实际打开密钥管理确认标签、Switch和计数；EXE/ZIP/包内EXE校验通过。生产配置未改写。
 
 ### 模块规模与职责
 
