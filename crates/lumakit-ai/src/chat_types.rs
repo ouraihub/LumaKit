@@ -51,6 +51,9 @@ pub struct Attempt {
     pub status: TurnStatus,
     /// 失败、取消或中断的说明。
     pub error: Option<String>,
+    /// 真实请求入口的诊断链路；旧历史或未建立链路的尝试为空。
+    #[serde(default)]
+    pub trace_id: Option<String>,
     /// 每轮响应保存的用量、计费快照；旧历史为空。
     #[serde(default)]
     pub rounds: Vec<crate::RoundUsage>,

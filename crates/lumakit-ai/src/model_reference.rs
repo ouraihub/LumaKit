@@ -96,16 +96,16 @@ pub fn effective_settings(id: &str, protocol: Protocol, settings: &ModelSettings
         // off, minimal, low, medium, high. Keep the request vocabulary aligned
         // with that host contract instead of exposing the public catalog's
         // xhigh/max tiers on this route.
-        if id == "gpt-6.1-sol" && effective.reasoning.is_some() {
-            if let Some(reasoning) = &mut effective.reasoning {
-                reasoning.efforts = vec![
-                    ReasoningEffort::None,
-                    ReasoningEffort::Minimal,
-                    ReasoningEffort::Low,
-                    ReasoningEffort::Medium,
-                    ReasoningEffort::High,
-                ];
-            }
+        if id == "gpt-6.1-sol"
+            && let Some(reasoning) = &mut effective.reasoning
+        {
+            reasoning.efforts = vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ];
         }
     }
     if effective.reasoning_override == Some(false) {
@@ -121,14 +121,24 @@ mod tests {
     use crate::model_config::{CostSource, PriceTier, RoundUsage, TokenUsage};
 
     #[test]
-    fn exact_canonical_identity_and_prefix_share_public_metadata() {
-        let reference = resolve("gpt-5.4").unwrap();
+    fn exact_canonical_identity_and_prefix_share_public_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let reference = resolve("gpt-5.4").ok_or("reference model missing")?;
         assert_eq!(reference.context_window, Some(1_000_000));
         assert_eq!(reference.max_output, Some(128_000));
-        assert_eq!(reference.pricing.as_ref().unwrap().tiers[0].input, 2.5);
+        assert_eq!(
+            reference
+                .pricing
+                .as_ref()
+                .ok_or("reference pricing missing")?
+                .tiers[0]
+                .input,
+            2.5
+        );
         assert_eq!(resolve("openai/gpt-5.4"), Some(reference));
         // Canonical API metadata wins over a subscription relay's smaller cap.
         assert_ne!(reference.context_window, Some(272_000));
+        Ok(())
     }
 
     #[test]
@@ -202,7 +212,8 @@ mod tests {
     }
 
     #[test]
-    fn exact_capabilities_fill_unknown_without_overriding_manual_choices() {
+    fn exact_capabilities_fill_unknown_without_overriding_manual_choices()
+    -> Result<(), Box<dyn std::error::Error>> {
         let saved = ModelSettings::default();
         for id in [
             "gpt-6-sol",
@@ -210,7 +221,7 @@ mod tests {
             "gpt-6-astra",
             "openai/gpt-6.1-sol",
         ] {
-            let reference = resolve(id).unwrap();
+            let reference = resolve(id).ok_or("reference model missing")?;
             assert_eq!(reference.supports_vision, Some(true));
             assert_eq!(reference.supports_tools, Some(true));
             let effective = effective_settings(id, Protocol::OpenAiChat, &saved);
@@ -245,7 +256,7 @@ mod tests {
         assert!(!effective.supports_vision);
         assert_eq!(effective.supports_tools, Some(false));
         assert!(disabled.supports_vision);
-        let legacy: ModelSettings = serde_json::from_str(r#"{"supports_vision":true}"#).unwrap();
+        let legacy: ModelSettings = serde_json::from_str(r#"{"supports_vision":true}"#)?;
         assert_eq!(legacy.vision_override, None);
         assert!(effective_settings("unknown", Protocol::OpenAiChat, &legacy).supports_vision);
         let explicit = ModelSettings {
@@ -253,30 +264,42 @@ mod tests {
             ..Default::default()
         };
         assert!(effective_settings("unknown", Protocol::OpenAiChat, &explicit).supports_vision);
-        let restored: ModelSettings =
-            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        let restored: ModelSettings = serde_json::from_str(&serde_json::to_string(&disabled)?)?;
         assert_eq!(restored.vision_override, Some(false));
         assert_eq!(saved, ModelSettings::default());
+        Ok(())
     }
 
     #[test]
-    fn reasoning_preserves_source_efforts_and_respects_protocol_and_explicit_disable() {
+    fn reasoning_preserves_source_efforts_and_respects_protocol_and_explicit_disable()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::model_config::ReasoningEffort::{
             High, Low, Max, Medium, Minimal, None as Off, Xhigh,
         };
         let _ = Off;
         let saved = ModelSettings::default();
-        let reference = resolve("gpt-6.1-sol").unwrap().reasoning.as_ref().unwrap();
+        let reference = resolve("gpt-6.1-sol")
+            .ok_or("reference model missing")?
+            .reasoning
+            .as_ref()
+            .ok_or("reference reasoning missing")?;
         assert_eq!(reference.dialect, ReasoningDialect::OpenAi);
         assert_eq!(reference.efforts, vec![Low, Medium, High, Xhigh, Max]);
         assert_eq!(
-            resolve("openai/gpt-6.1-sol").unwrap().reasoning.as_ref(),
+            resolve("openai/gpt-6.1-sol")
+                .ok_or("reference alias missing")?
+                .reasoning
+                .as_ref(),
             Some(reference)
         );
         for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
             let effective = effective_settings("gpt-6.1-sol", protocol, &saved);
             assert_eq!(
-                effective.reasoning.as_ref().unwrap().efforts,
+                effective
+                    .reasoning
+                    .as_ref()
+                    .ok_or("effective reasoning missing")?
+                    .efforts,
                 vec![Off, Minimal, Low, Medium, High]
             );
             assert!(effective.validate(protocol).is_ok());
@@ -293,11 +316,19 @@ mod tests {
         );
         let adaptive = effective_settings("claude-opus-5-5", Protocol::AnthropicMessages, &saved);
         assert_eq!(
-            adaptive.reasoning.as_ref().unwrap().dialect,
+            adaptive
+                .reasoning
+                .as_ref()
+                .ok_or("adaptive reasoning missing")?
+                .dialect,
             ReasoningDialect::AnthropicAdaptive
         );
         assert_eq!(
-            adaptive.reasoning.as_ref().unwrap().efforts,
+            adaptive
+                .reasoning
+                .as_ref()
+                .ok_or("adaptive reasoning missing")?
+                .efforts,
             reference.efforts
         );
         assert!(
@@ -337,23 +368,31 @@ mod tests {
             explicit.reasoning
         );
         assert_eq!(saved, ModelSettings::default());
+        Ok(())
     }
 
     #[test]
-    fn scheduled_and_unpriced_tariffs_remain_unknown() {
-        let scheduled = resolve("deepseek-flash").unwrap();
+    fn scheduled_and_unpriced_tariffs_remain_unknown() -> Result<(), Box<dyn std::error::Error>> {
+        let scheduled = resolve("deepseek-flash").ok_or("scheduled model missing")?;
         assert!(scheduled.context_window.is_some());
         assert!(scheduled.pricing.is_none());
-        assert!(resolve("gpt-image-1").unwrap().pricing.is_none());
+        assert!(
+            resolve("gpt-image-1")
+                .ok_or("image model missing")?
+                .pricing
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]
-    fn long_context_threshold_preserves_exclusive_boundary_and_cache_prices() {
+    fn long_context_threshold_preserves_exclusive_boundary_and_cache_prices()
+    -> Result<(), Box<dyn std::error::Error>> {
         let pricing = resolve("claude-haiku-5-5")
-            .unwrap()
+            .ok_or("reference model missing")?
             .pricing
             .as_ref()
-            .unwrap();
+            .ok_or("reference pricing missing")?;
         assert_eq!(pricing.tiers[1].min_input_tokens, 100_001);
         assert_eq!(pricing.tiers[1].cache_read, Some(0.05));
         assert_eq!(pricing.tiers[1].cache_write, Some(0.625));
@@ -367,6 +406,7 @@ mod tests {
         };
         assert_eq!(pricing.cost(&base), Some(0.01));
         assert_eq!(pricing.cost(&premium), Some(0.0500005));
+        Ok(())
     }
 
     #[test]

@@ -7,6 +7,9 @@ impl ChatSession {
         self.phase
     }
     /// Closes the session after pending work reaches its terminal event.
+    ///
+    /// # Errors
+    /// Returns an error while a request is stopping or history cannot be saved.
     pub fn close(&mut self) -> Result<(), String> {
         if self.phase == ChatPhase::Closed {
             return Ok(());
@@ -25,19 +28,21 @@ impl ChatSession {
     pub fn busy(&self) -> bool {
         matches!(self.phase, ChatPhase::Running | ChatPhase::Waiting)
     }
-    pub(super) fn event_channel(&mut self) -> (EventSender, mpsc::Receiver<Envelope>) {
+    pub(super) fn event_channel(
+        &mut self,
+    ) -> Result<(EventSender, mpsc::Receiver<Envelope>), String> {
         self.generation = self
             .generation
             .checked_add(1)
-            .expect("chat generation exhausted");
+            .ok_or("聊天请求代次已耗尽，请重启应用。")?;
         let (tx, rx) = mpsc::sync_channel(64);
-        (
+        Ok((
             EventSender {
                 generation: self.generation,
                 tx,
             },
             rx,
-        )
+        ))
     }
     pub(super) fn restore_draft(&mut self, ci: usize, ti: usize, draft: Option<String>) {
         let Some(draft) = draft else {
@@ -184,15 +189,14 @@ impl ChatSession {
                                 }
                             }
                         }
-                        if let (Some(job), Some(attempt_id)) = (&self.job, attempt_id) {
-                            if let Some(turn) = self
+                        if let (Some(job), Some(attempt_id)) = (&self.job, attempt_id)
+                            && let Some(turn) = self
                                 .history
                                 .conversations
                                 .get_mut(job.conversation)
                                 .and_then(|conversation| conversation.turns.get_mut(job.turn))
-                            {
-                                turn.selected_attempt = Some(attempt_id);
-                            }
+                        {
+                            turn.selected_attempt = Some(attempt_id);
                         }
                         if let Some(job) = &mut self.job {
                             job.terminal = true;

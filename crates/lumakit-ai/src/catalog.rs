@@ -83,6 +83,7 @@ impl ModelCatalog {
     }
     /// 校验模型引用和线路地址，并解封选中凭据以构造连接。
     ///
+    /// # Errors
     /// 服务商停用、线路或模型不匹配、地址无效或凭据解封失败时返回错误。
     pub fn resolve(&self, model: &ModelRef) -> Result<AiConnection, String> {
         let provider = self
@@ -119,6 +120,10 @@ impl ModelCatalog {
         })
     }
     /// Resolves a saved model while requiring a specific non-chat consumer type.
+    ///
+    /// # Errors
+    /// Returns an error for a disabled/missing provider, changed endpoint or model,
+    /// invalid settings or URL, a mismatched model type, or credentials that cannot be opened.
     pub fn resolve_for(
         &self,
         model: &ModelRef,
@@ -162,6 +167,10 @@ impl ModelCatalog {
 /// 校验基础地址并移除末尾斜杠；仅允许 HTTPS 或回环主机的 HTTP。
 ///
 /// 拒绝超过 4096 字节、缺少主机名或含凭据、查询参数、片段的地址。
+///
+/// # Errors
+/// Returns an error if parsing fails or the URL violates the length, host,
+/// credential, query, fragment, or HTTPS/loopback policy.
 pub fn validate_url(raw: &str) -> Result<String, String> {
     if raw.len() > 4096 {
         return Err("基础地址过长，最多 4096 字节".into());
@@ -191,7 +200,8 @@ pub fn validate_url(raw: &str) -> Result<String, String> {
 mod model_settings_tests {
     use super::*;
     #[test]
-    fn resolver_preserves_unknown_tools_and_rejects_non_chat() {
+    fn resolver_preserves_unknown_tools_and_rejects_non_chat()
+    -> Result<(), Box<dyn std::error::Error>> {
         let model = ModelRef {
             provider: "p".into(),
             endpoint: "e".into(),
@@ -221,8 +231,7 @@ mod model_settings_tests {
         }];
         assert_eq!(
             ModelCatalog::new(providers.clone())
-                .resolve(&model)
-                .unwrap()
+                .resolve(&model)?
                 .settings
                 .supports_tools,
             None
@@ -231,15 +240,13 @@ mod model_settings_tests {
         providers[0].endpoints[0].models[0].capabilities.vision = true;
         assert!(
             ModelCatalog::new(providers.clone())
-                .resolve(&model)
-                .unwrap()
+                .resolve(&model)?
                 .settings
                 .supports_vision
         );
         assert_eq!(
             ModelCatalog::new(providers.clone())
-                .resolve(&model)
-                .unwrap()
+                .resolve(&model)?
                 .settings
                 .supports_tools,
             Some(true)
@@ -247,8 +254,7 @@ mod model_settings_tests {
         providers[0].endpoints[0].models[0].settings.supports_tools = Some(false);
         assert_eq!(
             ModelCatalog::new(providers.clone())
-                .resolve(&model)
-                .unwrap()
+                .resolve(&model)?
                 .settings
                 .supports_tools,
             Some(false)
@@ -256,8 +262,7 @@ mod model_settings_tests {
         providers[0].endpoints[0].models[0].settings.vision_override = Some(false);
         assert!(
             !ModelCatalog::new(providers.clone())
-                .resolve(&model)
-                .unwrap()
+                .resolve(&model)?
                 .settings
                 .supports_vision
         );
@@ -267,17 +272,19 @@ mod model_settings_tests {
         assert!(
             ModelCatalog::new(providers.clone())
                 .resolve(&model)
-                .unwrap_err()
+                .err()
+                .ok_or("non-chat model unexpectedly resolved")?
                 .contains("不是聊天类型")
         );
         let non_chat = ModelCatalog::new(providers)
-            .resolve_for(&model, crate::model_config::ModelType::Embedding)
-            .unwrap();
+            .resolve_for(&model, crate::model_config::ModelType::Embedding)?;
         assert!(non_chat.settings.supports_tools.is_none());
+        Ok(())
     }
 
     #[test]
-    fn resolution_inherits_reference_without_saving_overrides() {
+    fn resolution_inherits_reference_without_saving_overrides()
+    -> Result<(), Box<dyn std::error::Error>> {
         let model = ModelRef {
             provider: "p".into(),
             endpoint: "e".into(),
@@ -305,7 +312,7 @@ mod model_settings_tests {
                 selected_model: None,
             }],
         }]);
-        let settings = catalog.resolve(&model).unwrap().settings;
+        let settings = catalog.resolve(&model)?.settings;
         assert_eq!(settings.context_window, Some(1_000_000));
         assert!(settings.supports_vision);
         assert_eq!(settings.supports_tools, Some(true));
@@ -317,15 +324,16 @@ mod model_settings_tests {
         );
         assert_eq!(
             catalog
-                .resolve_for(&model, crate::model_config::ModelType::Chat)
-                .unwrap()
+                .resolve_for(&model, crate::model_config::ModelType::Chat)?
                 .settings,
             settings
         );
+        Ok(())
     }
 
     #[test]
-    fn exact_reference_and_legacy_capabilities_respect_explicit_false_at_runtime() {
+    fn exact_reference_and_legacy_capabilities_respect_explicit_false_at_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
         let model = ModelRef {
             provider: "p".into(),
             endpoint: "e".into(),
@@ -361,12 +369,13 @@ mod model_settings_tests {
                 selected_model: None,
             }],
         }]);
-        let connection = catalog.resolve(&model).unwrap();
+        let connection = catalog.resolve(&model)?;
         assert!(!connection.settings.supports_vision);
         assert_eq!(connection.settings.supports_tools, Some(false));
         assert_eq!(
             connection.settings,
             catalog.providers()[0].endpoints[0].models[0].effective_settings(model.protocol)
         );
+        Ok(())
     }
 }

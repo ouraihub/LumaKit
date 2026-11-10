@@ -76,7 +76,7 @@ mod tests {
     use egui::{Context, Event, Key, Modifiers, PointerButton, RawInput, Rect};
 
     #[test]
-    fn pointer_keyboard_disabled_and_accessible_state() {
+    fn pointer_keyboard_disabled_and_accessible_state() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = Context::default();
         ctx.enable_accesskit();
         let mut checked = false;
@@ -99,23 +99,23 @@ mod tests {
                 },
             );
             output.textures_delta.clear();
-            (
-                response.expect("开关响应"),
+            Ok::<_, Box<dyn std::error::Error>>((
+                response.ok_or("开关响应缺失")?,
                 checked,
                 output.platform_output.accesskit_update,
-            )
+            ))
         };
-        let (response, state, update) = draw(vec![], true);
+        let (response, state, update) = draw(vec![], true)?;
         assert!(!state);
         assert!(response.rect.height() >= 24.0);
         let semantics = |update: Option<egui::accesskit::TreeUpdate>, checked, disabled| {
-            let update = update.expect("无障碍树");
+            let update = update.ok_or("无障碍树缺失")?;
             let node = update
                 .nodes
                 .iter()
                 .map(|(_, node)| node)
                 .find(|node| node.role() == egui::accesskit::Role::Switch)
-                .expect("开关节点");
+                .ok_or("开关节点缺失")?;
             assert_eq!(node.label(), Some("启用"));
             assert_eq!(
                 node.toggled(),
@@ -126,8 +126,9 @@ mod tests {
                 })
             );
             assert_eq!(node.is_disabled(), disabled);
+            Ok::<(), Box<dyn std::error::Error>>(())
         };
-        semantics(update, false, false);
+        semantics(update, false, false)?;
         ctx.memory_mut(|memory| memory.request_focus(response.id));
         let key = |key, pressed| Event::Key {
             key,
@@ -137,20 +138,20 @@ mod tests {
             modifiers: Modifiers::NONE,
         };
         let id = response.id;
-        let (response, state, update) = draw(vec![key(Key::Space, true)], true);
+        let (response, state, update) = draw(vec![key(Key::Space, true)], true)?;
         assert!(state && response.changed());
         assert_eq!(response.id, id);
-        semantics(update, true, false);
-        let (response, state, _) = draw(vec![key(Key::Space, false)], true);
+        semantics(update, true, false)?;
+        let (response, state, _) = draw(vec![key(Key::Space, false)], true)?;
         assert!(state && !response.changed());
-        let (response, state, _) = draw(vec![key(Key::Enter, true)], true);
+        let (response, state, _) = draw(vec![key(Key::Enter, true)], true)?;
         assert!(!state && response.changed());
-        let (response, state, _) = draw(vec![key(Key::Enter, false)], true);
+        let (response, state, _) = draw(vec![key(Key::Enter, false)], true)?;
         assert!(!state && !response.changed());
-        let (response, state, update) = draw(vec![key(Key::Space, true)], false);
+        let (response, state, update) = draw(vec![key(Key::Space, true)], false)?;
         assert!(!state && !response.changed() && !response.enabled());
-        semantics(update, false, true);
-        draw(vec![key(Key::Space, false)], true);
+        semantics(update, false, true)?;
+        draw(vec![key(Key::Space, false)], true)?;
         // 点击标签区域，而非仅验证胶囊本体可点击。
         let pos = pos2(response.rect.right() - 2.0, response.rect.center().y);
         let pointer = |pressed| Event::PointerButton {
@@ -159,14 +160,15 @@ mod tests {
             pressed,
             modifiers: Modifiers::NONE,
         };
-        draw(vec![Event::PointerMoved(pos), pointer(true)], true);
-        let (response, state, _) = draw(vec![pointer(false)], true);
+        draw(vec![Event::PointerMoved(pos), pointer(true)], true)?;
+        let (response, state, _) = draw(vec![pointer(false)], true)?;
         assert!(state && response.changed());
-        draw(vec![pointer(true)], false);
-        let (response, state, _) = draw(vec![pointer(false)], false);
+        draw(vec![pointer(true)], false)?;
+        let (response, state, _) = draw(vec![pointer(false)], false)?;
         assert!(state && !response.changed());
         ctx.memory_mut(|memory| memory.request_focus(response.id));
-        let (response, state, _) = draw(vec![key(Key::Space, true), key(Key::Enter, true)], true);
+        let (response, state, _) = draw(vec![key(Key::Space, true), key(Key::Enter, true)], true)?;
         assert!(!state && response.changed());
+        Ok(())
     }
 }

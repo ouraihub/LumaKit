@@ -29,6 +29,7 @@ use std::{
     rc::Rc,
 };
 
+mod diagnostics;
 mod model_picker;
 mod overlays;
 mod toolbar;
@@ -76,6 +77,13 @@ struct Edit {
     turn: String,
     attempt: String,
     expected: SharedString,
+}
+struct AnswerContext<'a> {
+    session: &'a ChatSession,
+    conversation: &'a str,
+    turn: &'a str,
+    options: &'a [ModelOption],
+    image_options: &'a [ModelOption],
 }
 /// Last laid-out bounds of each menu trigger, written during prepaint so a menu opens beside its button.
 type Anchors = Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>;
@@ -465,28 +473,32 @@ impl ChatPanel {
                         if self.details.contains(&key) {
                             for attempt in previous {
                                 group = group.child(self.answer(
-                                    session,
-                                    &conversation.id,
-                                    &turn.id,
+                                    AnswerContext {
+                                        session,
+                                        conversation: &conversation.id,
+                                        turn: &turn.id,
+                                        options,
+                                        image_options,
+                                    },
                                     attempt,
                                     turn.selected_attempt.as_deref() == Some(attempt.id.as_str()),
                                     false,
-                                    options,
-                                    image_options,
                                     cx,
                                 ));
                             }
                         }
                     }
                     group = group.child(self.answer(
-                        session,
-                        &conversation.id,
-                        &turn.id,
+                        AnswerContext {
+                            session,
+                            conversation: &conversation.id,
+                            turn: &turn.id,
+                            options,
+                            image_options,
+                        },
                         last,
                         turn.selected_attempt.as_deref().unwrap_or(&last.id) == last.id,
                         index + 1 == conversation.turns.len(),
-                        options,
-                        image_options,
                         cx,
                     ));
                 }
@@ -746,11 +758,13 @@ impl ChatPanel {
         if let Some(overlay) = self.overlay.clone() {
             root = root.child(self.render_overlay(
                 overlay,
-                session,
-                options,
-                image_options,
-                model_settings,
-                valid_chat && tools_supported,
+                overlays::OverlayContext {
+                    session,
+                    options,
+                    image_options,
+                    settings: model_settings,
+                    can_image: valid_chat && tools_supported,
+                },
                 window,
                 cx,
             ));
@@ -760,16 +774,19 @@ impl ChatPanel {
 
     fn answer(
         &mut self,
-        session: &ChatSession,
-        conversation: &str,
-        turn: &str,
+        context: AnswerContext<'_>,
         attempt: &Attempt,
         chosen: bool,
         retry: bool,
-        options: &[ModelOption],
-        image_options: &[ModelOption],
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let AnswerContext {
+            session,
+            conversation,
+            turn,
+            options,
+            image_options,
+        } = context;
         let r = LumaTheme::global(cx).roles;
         // The chosen attempt keeps a stronger outline; the selected-context button carries the state.
         // READING on the card is what the Markdown answer inherits; other children set their own style.
@@ -951,35 +968,7 @@ impl ChatPanel {
         if !attempt.text.is_empty() {
             body = body.child(text_view);
         }
-        let status = match attempt.status {
-            TurnStatus::Running if attempt.text.is_empty() => "正在等待回复…",
-            TurnStatus::Running => "正在生成…",
-            TurnStatus::Cancelled => "已停止，保留部分回答",
-            TurnStatus::Failed => "回答失败，请重试或更换模型",
-            _ => "",
-        };
-        if !status.is_empty() {
-            body = body.child(
-                div()
-                    .text_style(text::METADATA)
-                    .text_color(r.text_muted)
-                    .child(status),
-            );
-        }
-        if let Some(error) = &attempt.error {
-            let key = format!("error:{}", attempt.id);
-            body = body.child(self.disclosure(key.clone(), "诊断详情", cx));
-            if self.details.contains(&key) {
-                body = body.child(
-                    div()
-                        .id(SharedString::from(key))
-                        .max_h(DETAIL_MAX)
-                        .overflow_y_scroll()
-                        .text_style(text::METADATA)
-                        .child(error.clone()),
-                );
-            }
-        }
+        body = body.child(self.diagnostics(attempt, cx));
         let key = format!("usage:{}", attempt.id);
         body = body.child(self.disclosure(key.clone(), "用量详情", cx));
         if self.details.contains(&key) {

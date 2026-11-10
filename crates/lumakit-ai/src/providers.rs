@@ -178,6 +178,9 @@ impl ProviderStore {
         Self::default()
     }
     /// 从 JSON 文件加载配置；文件不存在时创建绑定该路径的空存储。
+    ///
+    /// # Errors
+    /// Returns an error if an existing file cannot be read or decoded as provider JSON.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ProviderError> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
@@ -198,6 +201,9 @@ impl ProviderStore {
         &self.providers
     }
     /// 校验并规范化所有线路地址，按服务商标识插入或替换；不自动保存。
+    ///
+    /// # Errors
+    /// Returns an error if any endpoint URL cannot be parsed or is not HTTP(S) with a host.
     pub fn upsert(&mut self, mut provider: Provider) -> Result<(), ProviderError> {
         for endpoint in &mut provider.endpoints {
             endpoint.base_url = normalize_url(&endpoint.base_url)?;
@@ -220,6 +226,9 @@ impl ProviderStore {
             .unwrap_or(false)
     }
     /// 通过临时文件写入并重命名至加载路径；无路径时返回错误。
+    ///
+    /// # Errors
+    /// Returns an error if the store has no path, serialization fails, or writing/renaming fails.
     pub fn save(&self) -> Result<(), ProviderError> {
         let path = self
             .path
@@ -234,6 +243,9 @@ impl ProviderStore {
         Ok(())
     }
     /// 从首条包含模型的线路构造连接；仅复制内存明文凭据，不解封密钥。
+    ///
+    /// # Errors
+    /// Returns an error if the provider or requested model does not exist.
     pub fn resolve(&self, provider: &str, model: &str) -> Result<AiConnection, ProviderError> {
         let p = self
             .providers
@@ -265,6 +277,9 @@ impl ProviderStore {
         })
     }
     /// 返回指定服务商中首个匹配模型的能力；找不到时返回错误。
+    ///
+    /// # Errors
+    /// Returns an error if the provider or requested model does not exist.
     pub fn capabilities(
         &self,
         provider: &str,
@@ -285,6 +300,9 @@ impl ProviderStore {
 }
 
 /// 校验 HTTP 或 HTTPS 地址，去掉首尾空白、片段及末尾斜杠。
+///
+/// # Errors
+/// Returns an error if parsing fails, the scheme is not HTTP(S), or the host is missing.
 pub fn normalize_url(raw: &str) -> Result<String, ProviderError> {
     let mut u =
         reqwest::Url::parse(raw.trim()).map_err(|e| ProviderError::InvalidUrl(e.to_string()))?;
@@ -324,9 +342,9 @@ pub fn key_mask(key: &KeyState) -> String {
 mod tests {
     use super::*;
     #[test]
-    fn url_and_resolve() {
+    fn url_and_resolve() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
-            normalize_url(" https://example.com/api/// ").unwrap(),
+            normalize_url(" https://example.com/api/// ")?,
             "https://example.com/api"
         );
         let mut s = ProviderStore::new();
@@ -346,10 +364,9 @@ mod tests {
                     },
                 }],
             }],
-        })
-        .unwrap();
-        assert_eq!(s.resolve("p", "m").unwrap().base_url, "https://x");
-        let connection = s.resolve("p", "m").unwrap();
+        })?;
+        assert_eq!(s.resolve("p", "m")?.base_url, "https://x");
+        let connection = s.resolve("p", "m")?;
         assert_eq!(connection.settings.supports_tools, Some(true));
         assert!(connection.settings.supports_streaming);
         s.providers[0].endpoints[0].models[0].capabilities = ModelCapabilities {
@@ -357,10 +374,11 @@ mod tests {
             tools: false,
             vision: true,
         };
-        let connection = s.resolve("p", "m").unwrap();
+        let connection = s.resolve("p", "m")?;
         assert!(!connection.settings.supports_streaming);
         assert_eq!(connection.settings.supports_tools, None);
         assert!(connection.settings.supports_vision);
+        Ok(())
     }
     #[test]
     fn key_never_outputs_full_secret() {

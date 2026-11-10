@@ -34,12 +34,14 @@ enum End<'a> {
 ///
 /// 跨线程或进入 async 任务时，先在目标处进入上层 guard 的 [`OperationGuard::span`]，
 /// 子操作才能记录 `ParentSpanId`；TraceId 由 `trace` 保证，不依赖当前 span。
+#[track_caller]
 pub fn operation(
     trace: &TraceContext,
     operation: &'static str,
     layer: &'static str,
 ) -> OperationGuard {
-    start(trace, operation, layer, false)
+    let caller = std::panic::Location::caller();
+    start(trace, operation, layer, false, caller.file(), caller.line())
 }
 
 pub(crate) fn start(
@@ -47,14 +49,16 @@ pub(crate) fn start(
     operation: &'static str,
     layer: &'static str,
     root: bool,
+    source_file: &'static str,
+    source_line: u32,
 ) -> OperationGuard {
     // span 取 ERROR 级别只为在任何过滤级别下都存在，内部普通日志因而继承 TraceId；span 本身不输出行。
     let span = if root {
         tracing::span!(target: TARGET, parent: None, Level::ERROR, SPAN,
-            trace_id = %trace.trace_id(), layer, operation)
+            trace_id = %trace.trace_id(), layer, operation, source_file, source_line)
     } else {
         tracing::span!(target: TARGET, Level::ERROR, SPAN,
-     trace_id = %trace.trace_id(), layer, operation)
+            trace_id = %trace.trace_id(), layer, operation, source_file, source_line)
     };
     let guard = OperationGuard {
         root,

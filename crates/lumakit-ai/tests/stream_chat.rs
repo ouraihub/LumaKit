@@ -12,6 +12,8 @@ use zeroize::Zeroizing;
 
 const KEY: &str = "test-secret-not-for-display";
 
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 fn history() -> Vec<ChatMessage> {
     vec![
         ChatMessage::User("之前的问题".into()),
@@ -60,7 +62,7 @@ fn server(
     body: String,
     hold: bool,
     ready: Option<tokio::sync::oneshot::Sender<()>>,
-) -> (String, thread::JoinHandle<()>) {
+) -> TestResult<(String, thread::JoinHandle<TestResult>)> {
     server_with_reasoning(protocol, status, body, hold, ready, "loopback-model", None)
 }
 
@@ -72,21 +74,17 @@ fn server_with_reasoning(
     ready: Option<tokio::sync::oneshot::Sender<()>>,
     expected_model: &'static str,
     expected_effort: Option<&'static str>,
-) -> (String, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let worker = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        socket
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+) -> TestResult<(String, thread::JoinHandle<TestResult>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let worker = thread::spawn(move || -> TestResult {
+        let (mut socket, _) = listener.accept()?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut request = Vec::new();
         let (header_end, length) = loop {
             let mut chunk = [0; 4096];
-            let count = socket.read(&mut chunk).unwrap();
+            let count = socket.read(&mut chunk)?;
             assert_ne!(count, 0);
             request.extend_from_slice(&chunk[..count]);
             if let Some(offset) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -96,9 +94,9 @@ fn server_with_reasoning(
                     .find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
+                            .then(|| value.trim().parse::<usize>())
                     })
-                    .unwrap();
+                    .ok_or("content-length header missing")??;
                 let path = match protocol {
                     Protocol::AnthropicMessages => "messages",
                     Protocol::OpenAiChat => "chat/completions",
@@ -118,12 +116,11 @@ fn server_with_reasoning(
         };
         while request.len() < header_end + length {
             let mut chunk = [0; 4096];
-            let count = socket.read(&mut chunk).unwrap();
+            let count = socket.read(&mut chunk)?;
             assert_ne!(count, 0);
             request.extend_from_slice(&chunk[..count]);
         }
-        let payload: Value =
-            serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+        let payload: Value = serde_json::from_slice(&request[header_end..header_end + length])?;
         assert_eq!(payload["model"], expected_model);
         let json_response = body.starts_with('{');
         if let Some(effort) = expected_effort {
@@ -188,7 +185,13 @@ fn server_with_reasoning(
         } else {
             &payload["messages"]
         };
-        assert_eq!(messages.as_array().unwrap().len(), 3);
+        assert_eq!(
+            messages
+                .as_array()
+                .ok_or("request messages are not an array")?
+                .len(),
+            3
+        );
         assert_eq!(messages[0], json!({"role":"user","content":"之前的问题"}));
         assert_eq!(messages[2], json!({"role":"user","content":"现在的问题"}));
         assert_eq!(messages[1]["role"], "assistant");
@@ -207,7 +210,11 @@ fn server_with_reasoning(
             } else {
                 "text/event-stream"
             };
-            write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nx-request-id: req-test-{KEY}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len() + usize::from(hold) * 100).unwrap();
+            write!(
+                socket,
+                "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nx-request-id: req-test-{KEY}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len() + usize::from(hold) * 100
+            )?;
             let chunk_size = if body.len() > 8192 { 4096 } else { 1 };
             for chunk in body.as_bytes().chunks(chunk_size) {
                 if socket.write_all(chunk).is_err() {
@@ -221,13 +228,14 @@ fn server_with_reasoning(
         if hold {
             let _ = socket.read_to_end(&mut Vec::new());
         }
+        Ok(())
     });
-    (format!("http://{address}/v1"), worker)
+    Ok((format!("http://{address}/v1"), worker))
 }
 
-async fn exercise(protocol: Protocol) {
+async fn exercise(protocol: Protocol) -> TestResult {
     let body = delta(protocol, "你好") + &delta(protocol, "，世界🌏") + &done(protocol);
-    let (url, worker) = server(protocol, 200, body, false, None);
+    let (url, worker) = server(protocol, 200, body, false, None)?;
     let mut deltas = Vec::new();
     let text = stream_chat(
         connection(url, protocol),
@@ -235,13 +243,12 @@ async fn exercise(protocol: Protocol) {
         CancellationToken::new(),
         |delta| deltas.push(delta),
     )
-    .await
-    .unwrap();
+    .await?;
     assert_eq!(text, "你好，世界🌏");
     assert_eq!(deltas, ["你好", "，世界🌏"]);
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
-    let (url, worker) = server(protocol, 200, delta(protocol, "未完成"), false, None);
+    let (url, worker) = server(protocol, 200, delta(protocol, "未完成"), false, None)?;
     let error = stream_chat(
         connection(url, protocol),
         history(),
@@ -249,9 +256,10 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err();
+    .err()
+    .ok_or("incomplete stream unexpectedly succeeded")?;
     assert!(error.to_string().contains("stream ended before completion"));
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
     let tools = match protocol {
         Protocol::AnthropicMessages => event(
@@ -264,7 +272,7 @@ async fn exercise(protocol: Protocol) {
             json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item","call_id":"call","name":"unexpected"}}),
         ),
     };
-    let (url, worker) = server(protocol, 200, tools + &done(protocol), false, None);
+    let (url, worker) = server(protocol, 200, tools + &done(protocol), false, None)?;
     let error = stream_chat(
         connection(url, protocol),
         history(),
@@ -272,9 +280,10 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err();
+    .err()
+    .ok_or("unexpected tool calls were accepted")?;
     assert!(error.to_string().contains("unexpected tool calls"));
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
     // 连接等待响应头、读取 SSE、读取错误正文，都必须可取消。
     for (status, body) in [
@@ -283,27 +292,28 @@ async fn exercise(protocol: Protocol) {
         (401, String::new()),
     ] {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let (url, worker) = server(protocol, status, body, true, Some(ready_tx));
+        let (url, worker) = server(protocol, status, body, true, Some(ready_tx))?;
         let cancel = CancellationToken::new();
         let cancelling = cancel.clone();
         let cancel_worker = tokio::spawn(async move {
-            ready_rx.await.unwrap();
+            ready_rx.await?;
             tokio::time::sleep(Duration::from_millis(20)).await;
             cancelling.cancel();
+            Ok::<(), tokio::sync::oneshot::error::RecvError>(())
         });
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             stream_chat(connection(url, protocol), history(), cancel, |_| {}),
         )
-        .await
-        .unwrap()
-        .unwrap_err();
+        .await?
+        .err()
+        .ok_or("cancelled request unexpectedly succeeded")?;
         assert!(matches!(error, AiError::Cancelled));
-        cancel_worker.await.unwrap();
-        worker.join().unwrap();
+        cancel_worker.await??;
+        worker.join().map_err(|_| "HTTP fixture panicked")??;
     }
 
-    let (url, worker) = server(protocol, 401, format!("rejected {KEY}"), false, None);
+    let (url, worker) = server(protocol, 401, format!("rejected {KEY}"), false, None)?;
     let error = stream_chat(
         connection(url, protocol),
         history(),
@@ -311,7 +321,8 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err();
+    .err()
+    .ok_or("HTTP rejection unexpectedly succeeded")?;
     match &error {
         AiError::Http {
             status,
@@ -322,10 +333,10 @@ async fn exercise(protocol: Protocol) {
             assert_eq!(request_id, "x-request-id=req-test-***");
             assert_eq!(body, "rejected ***");
         }
-        other => panic!("上游 HTTP 错误丢失类型和请求标识：{other}"),
+        other => return Err(format!("上游 HTTP 错误丢失类型和请求标识：{other}").into()),
     }
     assert!(!error.to_string().contains(KEY));
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
     let upstream_error = match protocol {
         Protocol::AnthropicMessages => json!({"type":"error","error":{"message":KEY}}),
@@ -334,7 +345,7 @@ async fn exercise(protocol: Protocol) {
             json!({"type":"response.failed","response":{"error":{"message":KEY}}})
         }
     };
-    let (url, worker) = server(protocol, 200, event(upstream_error), false, None);
+    let (url, worker) = server(protocol, 200, event(upstream_error), false, None)?;
     let error = stream_chat(
         connection(url, protocol),
         history(),
@@ -342,13 +353,14 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err()
+    .err()
+    .ok_or("upstream error unexpectedly succeeded")?
     .to_string();
     assert!(!error.contains(KEY));
     assert!(error.contains("***"));
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
-    let (url, worker) = server(protocol, 401, "x".repeat(16384), false, None);
+    let (url, worker) = server(protocol, 401, "x".repeat(16384), false, None)?;
     let error = stream_chat(
         connection(url, protocol),
         history(),
@@ -356,13 +368,14 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err()
+    .err()
+    .ok_or("oversized error body unexpectedly succeeded")?
     .to_string();
     assert!(error.contains("exceeds 8192 bytes"));
     assert!(error.len() < 200);
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
-    let (url, worker) = server(protocol, 200, "x".repeat(4 * 1024 * 1024 + 1), false, None);
+    let (url, worker) = server(protocol, 200, "x".repeat(4 * 1024 * 1024 + 1), false, None)?;
     let error = stream_chat(
         connection(url, protocol),
         history(),
@@ -370,10 +383,11 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err()
+    .err()
+    .ok_or("oversized stream unexpectedly succeeded")?
     .to_string();
     assert!(error.contains("stream exceeds 4 MiB"));
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
 
     // 校验发生在联网之前，不能将不完整角色序列或超限内容发送出去。
     let invalid = [
@@ -404,7 +418,8 @@ async fn exercise(protocol: Protocol) {
             |_| {},
         )
         .await
-        .unwrap_err();
+        .err()
+        .ok_or("invalid messages unexpectedly succeeded")?;
         assert!(!error.to_string().contains("network request"));
     }
     let cancel = CancellationToken::new();
@@ -420,8 +435,8 @@ async fn exercise(protocol: Protocol) {
         Err(AiError::Cancelled)
     ));
 
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
     drop(listener);
     let error = stream_chat(
         connection(format!("http://{address}/{KEY}"), protocol),
@@ -430,32 +445,34 @@ async fn exercise(protocol: Protocol) {
         |_| {},
     )
     .await
-    .unwrap_err()
+    .err()
+    .ok_or("closed endpoint unexpectedly succeeded")?
     .to_string();
     assert!(
         !error.contains(KEY) && !error.contains(&address.to_string()) && !error.contains("http://")
     );
+    Ok(())
 }
 
 #[tokio::test]
-async fn anthropic_text_chat_loopback() {
-    exercise(Protocol::AnthropicMessages).await;
+async fn anthropic_text_chat_loopback() -> TestResult {
+    exercise(Protocol::AnthropicMessages).await
 }
 
 #[tokio::test]
-async fn openai_chat_text_chat_loopback() {
-    exercise(Protocol::OpenAiChat).await;
+async fn openai_chat_text_chat_loopback() -> TestResult {
+    exercise(Protocol::OpenAiChat).await
 }
 
 #[tokio::test]
-async fn openai_responses_text_chat_loopback() {
-    exercise(Protocol::OpenAiResponses).await;
+async fn openai_responses_text_chat_loopback() -> TestResult {
+    exercise(Protocol::OpenAiResponses).await?;
     let protocol = Protocol::OpenAiResponses;
     let body = delta(protocol, "被截断的回复")
         + &event(
             json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
         );
-    let (url, worker) = server(protocol, 200, body, false, None);
+    let (url, worker) = server(protocol, 200, body, false, None)?;
     let mut partial = String::new();
     let error = stream_chat(
         connection(url, protocol),
@@ -464,14 +481,16 @@ async fn openai_responses_text_chat_loopback() {
         |text| partial.push_str(&text),
     )
     .await
-    .unwrap_err();
+    .err()
+    .ok_or("incomplete response unexpectedly succeeded")?;
     assert_eq!(partial, "被截断的回复");
     assert!(error.to_string().contains("provider response incomplete"));
-    worker.join().unwrap();
+    worker.join().map_err(|_| "HTTP fixture panicked")??;
+    Ok(())
 }
 
 #[tokio::test]
-async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
+async fn configured_json_roundtrip_snapshots_real_usage_and_prices() -> TestResult {
     use lumakit_ai::{model_config::*, stream_chat_with_usage};
     for protocol in [
         Protocol::OpenAiChat,
@@ -484,7 +503,7 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
             Protocol::OpenAiResponses => json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"完成"}]}],"usage":{"input_tokens":200,"output_tokens":20,"input_tokens_details":{"cached_tokens":50}}}),
             Protocol::AnthropicMessages => json!({"stop_reason":"end_turn","content":[{"type":"text","text":"完成"}],"usage":{"input_tokens":150,"output_tokens":20,"cache_read_input_tokens":50}}),
         }.to_string();
-        let (url, worker) = server(protocol, 200, body, false, None);
+        let (url, worker) = server(protocol, 200, body, false, None)?;
         let pricing = ModelPricing {
             currency: "CNY".into(),
             tiers: vec![
@@ -526,14 +545,13 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
             pricing: Some(pricing.clone()),
             ..Default::default()
         };
-        c = c.with_reasoning_effort(ReasoningEffort::High).unwrap();
+        c = c.with_reasoning_effort(ReasoningEffort::High)?;
         let mut deltas = Vec::new();
         let run = stream_chat_with_usage(c, history(), CancellationToken::new(), |text| {
             deltas.push(text)
         })
-        .await
-        .unwrap();
-        worker.join().unwrap();
+        .await?;
+        worker.join().map_err(|_| "HTTP fixture panicked")??;
         assert_eq!(run.text, "完成");
         assert_eq!(deltas, ["完成"]);
         assert_eq!(run.rounds.len(), 1);
@@ -549,7 +567,7 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
             })
         );
         assert_eq!(round.pricing, Some(pricing));
-        assert!((round.cost.unwrap() - 0.000405).abs() < 1e-12);
+        assert!((round.cost.ok_or("usage cost missing")? - 0.000405).abs() < 1e-12);
         assert!(!round.request_id.is_empty());
         assert!(round.started_at_ms.is_some());
         assert!(round.duration_ms.is_some());
@@ -560,10 +578,11 @@ async fn configured_json_roundtrip_snapshots_real_usage_and_prices() {
         );
         assert!(run.tool_calls.is_empty());
     }
+    Ok(())
 }
 
 #[tokio::test]
-async fn catalog_reasoning_is_explicit_in_real_http_requests() {
+async fn catalog_reasoning_is_explicit_in_real_http_requests() -> TestResult {
     use lumakit_ai::model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort};
     for (protocol, model) in [
         (Protocol::OpenAiChat, "openai/gpt-6.1-sol"),
@@ -583,21 +602,19 @@ async fn catalog_reasoning_is_explicit_in_real_http_requests() {
                 None,
                 model,
                 expected,
-            );
+            )?;
             let mut c = connection(url, protocol);
             c.model = model.into();
             c.settings.reasoning_disabled = disabled;
             assert!(c.settings.reasoning.is_none());
             if let Some(effort) = selected {
-                c = c.with_reasoning_effort(effort).unwrap();
+                c = c.with_reasoning_effort(effort)?;
             }
             assert_eq!(
-                stream_chat(c, history(), CancellationToken::new(), |_| {})
-                    .await
-                    .unwrap(),
+                stream_chat(c, history(), CancellationToken::new(), |_| {}).await?,
                 "完成"
             );
-            worker.join().unwrap();
+            worker.join().map_err(|_| "HTTP fixture panicked")??;
         }
         let (url, worker) = server_with_reasoning(
             protocol,
@@ -607,7 +624,7 @@ async fn catalog_reasoning_is_explicit_in_real_http_requests() {
             None,
             model,
             Some("none"),
-        );
+        )?;
         let mut c = connection(url, protocol);
         c.model = model.into();
         assert!(
@@ -625,13 +642,12 @@ async fn catalog_reasoning_is_explicit_in_real_http_requests() {
             budget_tokens: None,
         });
         c.settings.reasoning_disabled = true; // Existing explicit metadata still takes precedence.
-        let c = c.with_reasoning_effort(ReasoningEffort::None).unwrap();
+        let c = c.with_reasoning_effort(ReasoningEffort::None)?;
         assert_eq!(
-            stream_chat(c, history(), CancellationToken::new(), |_| {})
-                .await
-                .unwrap(),
+            stream_chat(c, history(), CancellationToken::new(), |_| {}).await?,
             "完成"
         );
-        worker.join().unwrap();
+        worker.join().map_err(|_| "HTTP fixture panicked")??;
     }
+    Ok(())
 }

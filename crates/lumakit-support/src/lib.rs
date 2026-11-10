@@ -203,19 +203,21 @@ mod tests {
         assert_eq!(mask_secret("sk-live-0123456789"), "sk-l**********6789");
     }
     #[test]
-    fn versioned_settings_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
+    fn versioned_settings_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("settings.json");
-        save_versioned(&path, 1, &serde_json::json!({"enabled": true})).unwrap();
-        let loaded: Option<(u32, serde_json::Value)> = load_versioned(&path, 1).unwrap();
-        assert_eq!(loaded.unwrap().0, 1);
+        save_versioned(&path, 1, &serde_json::json!({"enabled": true}))?;
+        let loaded: Option<(u32, serde_json::Value)> = load_versioned(&path, 1)?;
+        assert_eq!(loaded.ok_or("settings were not loaded")?.0, 1);
+        Ok(())
     }
     #[test]
-    fn failed_write_keeps_previous_bytes_and_lock_releases() {
-        let dir = tempfile::tempdir().unwrap();
+    fn failed_write_keeps_previous_bytes_and_lock_releases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
         let path = dir.path().join("settings.json");
-        save_versioned(&path, 1, &vec!["original"]).unwrap();
-        let original = fs::read(&path).unwrap();
+        save_versioned(&path, 1, &vec!["original"])?;
+        let original = fs::read(&path)?;
         assert!(
             atomic_write(&path, |writer| {
                 writer.write_all(b"partial")?;
@@ -223,16 +225,17 @@ mod tests {
             })
             .is_err()
         );
-        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&path)?, original);
         let lock_path = dir.path().join("writer.lock");
-        let lock = FileLock::acquire(&lock_path).unwrap();
+        let lock = FileLock::acquire(&lock_path)?;
         assert!(FileLock::acquire(&lock_path).is_err());
         drop(lock);
         assert!(FileLock::acquire(&lock_path).is_ok());
-        fs::write(&path, br#"{"schemaVersion":99,"value":"not-an-array"}"#).unwrap();
+        fs::write(&path, br#"{"schemaVersion":99,"value":"not-an-array"}"#)?;
         assert!(matches!(
             load_versioned::<Vec<String>>(&path, 1),
             Err(SupportError::FutureVersion(99))
         ));
+        Ok(())
     }
 }

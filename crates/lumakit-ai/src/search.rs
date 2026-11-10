@@ -119,6 +119,10 @@ pub fn native_search_decision(
 }
 
 /// Validate an outbound search/read URL: HTTPS is allowed; HTTP is loopback-only.
+///
+/// # Errors
+/// Returns an error for an unparseable URL, missing host, embedded credentials,
+/// or a scheme other than HTTPS or loopback HTTP.
 pub fn validate_search_url(raw: &str) -> Result<Url, AiError> {
     let url = Url::parse(raw).map_err(|_| AiError::Provider("invalid search URL".into()))?;
     if !url.username().is_empty() || url.password().is_some() || url.host_str().is_none() {
@@ -234,12 +238,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blacklist_matches_domains_and_globs() {
-        let url = Url::parse("https://news.example.com/a").unwrap();
+    fn blacklist_matches_domains_and_globs() -> Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("https://news.example.com/a")?;
         assert!(is_blacklisted(&url, &["example.com".into()]));
         assert!(is_blacklisted(&url, &["n?ws.example.com".into()]));
         assert!(!is_blacklisted(&url, &["other.example.com".into()]));
         assert!(is_blacklisted(&url, &["https://*.example.com/*".into()]));
+        Ok(())
     }
 
     #[test]

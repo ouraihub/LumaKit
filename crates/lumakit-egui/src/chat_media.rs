@@ -50,9 +50,7 @@ impl MediaPreview {
         let gap = ui.spacing().item_spacing.x;
         let width = ui.available_width().max(1.0);
         let columns = ((width + gap) / (200.0 + gap)).floor().max(1.0) as usize;
-        let tile_width = ((width - gap * (columns - 1) as f32) / columns as f32)
-            .min(280.0)
-            .max(1.0);
+        let tile_width = ((width - gap * (columns - 1) as f32) / columns as f32).clamp(1.0, 280.0);
         for row in images.chunks(columns) {
             ui.horizontal_top(|ui| {
                 for image in row {
@@ -198,33 +196,30 @@ mod tests {
     use image::ImageEncoder;
 
     #[test]
-    fn preview_decode_boundary() {
+    fn preview_decode_boundary() -> Result<(), Box<dyn std::error::Error>> {
         let mut png = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(
-                &[255, 0, 0, 255, 0, 255, 0, 255],
-                2,
-                1,
-                image::ExtendedColorType::Rgba8,
-            )
-            .unwrap();
-        let preview = decode_thumbnail(&png).unwrap();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(
+            &[255, 0, 0, 255, 0, 255, 0, 255],
+            2,
+            1,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        let preview = decode_thumbnail(&png)?;
         assert_eq!(preview.size, [2, 1]);
         assert_eq!(preview.pixels[0], egui::Color32::RED);
         assert!(decode_thumbnail(b"not an image").is_err());
         assert!(decode_thumbnail(&vec![0; MAX_INPUT + 1]).is_err());
         let mut wide = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut wide)
-            .write_image(
-                &vec![0; (MAX_DIMENSION as usize + 1) * 4],
-                MAX_DIMENSION + 1,
-                1,
-                image::ExtendedColorType::Rgba8,
-            )
-            .unwrap();
+        image::codecs::png::PngEncoder::new(&mut wide).write_image(
+            &vec![0; (MAX_DIMENSION as usize + 1) * 4],
+            MAX_DIMENSION + 1,
+            1,
+            image::ExtendedColorType::Rgba8,
+        )?;
         assert!(decode_thumbnail(&wide).is_err());
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         assert!(read_thumbnail(&temp.path().join("missing.png")).is_err());
         assert!(read_thumbnail(temp.path()).is_err());
+        Ok(())
     }
 }

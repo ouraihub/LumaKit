@@ -123,6 +123,10 @@ pub enum ChatMessage {
 /// 流式发送纯文本会话（正文合计最多 1 MiB，单次请求最多 120 秒）。
 ///
 /// 返回完整回复和逐请求usage/价格快照；取消、上游错误、未完成的流或意外工具调用均返回错误。
+///
+/// # Errors
+/// Returns an error for invalid input/settings, cancellation, upstream/network failures,
+/// incomplete responses, or unexpected tool calls.
 pub async fn stream_chat_with_usage<F>(
     mut connection: AiConnection,
     messages: Vec<ChatMessage>,
@@ -162,7 +166,7 @@ fn validated_messages(
     messages: Vec<ChatMessage>,
     cancel: &CancellationToken,
 ) -> Result<Vec<Message>, AiError> {
-    if messages.is_empty() || messages.len() % 2 == 0 {
+    if messages.is_empty() || messages.len().is_multiple_of(2) {
         return Err(AiError::Provider(
             "chat must start and end with a user message".into(),
         ));
@@ -404,8 +408,14 @@ pub type ToolFuture = Pin<Box<dyn Future<Output = Result<ToolOutput, AiError>> +
 /// 为运行时提供模型配置、工具实现和授权决策的宿主。
 pub trait AiHost: Send + Sync {
     /// 根据请求选择模型，无法选择时返回错误。
+    ///
+    /// # Errors
+    /// Returns the host's configuration or model-selection failure.
     fn select_model(&self, request: &RunRequest) -> Result<ModelRef, AiError>;
     /// 返回可选系统提示词或构造提示词的错误。
+    ///
+    /// # Errors
+    /// Returns the host's prompt-construction or configuration failure.
     fn system_prompt(&self, request: &RunRequest) -> Result<Option<String>, AiError>;
     /// 返回本次请求向模型公开的工具。
     fn tools(&self, request: &RunRequest) -> Vec<ToolSpec>;
@@ -418,6 +428,9 @@ pub trait AiHost: Send + Sync {
     /// 执行已获准的工具调用；宿主负责处理取消信号。
     fn call_tool(&self, call: ToolCall, cancel: CancellationToken) -> ToolFuture;
     /// 将所选模型解析为实际连接，失败时返回错误。
+    ///
+    /// # Errors
+    /// Returns the host's model-resolution, configuration, or credential-access failure.
     fn connection(&self, model: &ModelRef) -> Result<AiConnection, AiError>;
 }
 
@@ -429,6 +442,9 @@ pub struct AiRuntime<H: AiHost> {
 }
 impl<H: AiHost> AiRuntime<H> {
     /// 创建禁止自动重定向的 HTTP 客户端，创建失败时返回错误。
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP client cannot be constructed.
     pub fn new(host: Arc<H>) -> Result<Self, AiError> {
         let http = http_client()?;
         Ok(Self { host, http })
@@ -1065,7 +1081,8 @@ async fn provider_response(
 mod model_runtime_tests {
     use super::*;
     #[tokio::test]
-    async fn context_and_type_gates_reject_before_network() {
+    async fn context_and_type_gates_reject_before_network() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut c = AiConnection {
             base_url: "https://invalid.invalid".into(),
             protocol: Protocol::OpenAiChat,
@@ -1106,7 +1123,7 @@ mod model_runtime_tests {
         let mut ignore = |_: String| {};
         let error = round(
             None,
-            &http_client().unwrap(),
+            &http_client()?,
             &c,
             None,
             &[Message::User {
@@ -1117,9 +1134,10 @@ mod model_runtime_tests {
             &CancellationToken::new(),
             &mut ignore,
         )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("不是聊天类型"));
+        .await;
+        assert!(
+            matches!(error, Err(AiError::Provider(message)) if message.contains("不是聊天类型"))
+        );
         c.settings.model_type = model_config::ModelType::Chat;
         c.settings.supports_tools = Some(false);
         let tools = [ToolSpec {
@@ -1131,7 +1149,7 @@ mod model_runtime_tests {
         }];
         let error = round(
             None,
-            &http_client().unwrap(),
+            &http_client()?,
             &c,
             None,
             &[Message::User {
@@ -1142,9 +1160,8 @@ mod model_runtime_tests {
             &CancellationToken::new(),
             &mut ignore,
         )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("不支持工具"));
+        .await;
+        assert!(matches!(error, Err(AiError::Provider(message)) if message.contains("不支持工具")));
         c.settings.pricing = Some(model_config::ModelPricing {
             currency: "USD".into(),
             tiers: vec![model_config::PriceTier {
@@ -1186,5 +1203,6 @@ mod model_runtime_tests {
         );
         c.settings.max_input = Some(1001);
         assert!(c.settings.validate(c.protocol).is_err());
+        Ok(())
     }
 }

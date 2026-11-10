@@ -84,6 +84,9 @@ impl fmt::Debug for SearchHttpAdapter {
 
 impl SearchHttpAdapter {
     /// Build an adapter after validating its endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the endpoint violates the search URL policy or client creation fails.
     pub fn new(config: SearchAdapterConfig) -> Result<Self, AiError> {
         search::validate_search_url(&config.endpoint)?;
         let client = reqwest::Client::builder()
@@ -96,6 +99,9 @@ impl SearchHttpAdapter {
     }
 
     /// Construct an adapter with a caller-owned client, useful for loopback tests.
+    ///
+    /// # Errors
+    /// Returns an error if the endpoint violates the search URL policy.
     pub fn with_client(
         config: SearchAdapterConfig,
         client: reqwest::Client,

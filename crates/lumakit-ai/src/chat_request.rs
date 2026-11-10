@@ -1,130 +1,12 @@
-//! 请求准备、输入快照、翻译与后台任务启动。
+//! 请求准备、输入快照与后台任务启动。
+use super::worker::run_session_worker;
 use super::*;
 
 impl ChatSession {
-    /// 将已完成回答翻译为新候选；源回答不变。
-    pub fn translate(
-        &mut self,
-        conversation_id: &str,
-        turn_id: &str,
-        attempt_id: &str,
-        language: &str,
-        connection: AiConnection,
-    ) -> Result<(), String> {
-        if !self.mutable() {
-            return Err("当前聊天不可修改。".into());
-        }
-        if language.trim().is_empty()
-            || language.chars().count() > 80
-            || language.chars().any(char::is_control)
-        {
-            return Err("目标语言无效。".into());
-        }
-        let source = self
-            .history
-            .conversations
-            .iter()
-            .find(|conversation| conversation.id == conversation_id)
-            .and_then(|conversation| conversation.turns.iter().find(|turn| turn.id == turn_id))
-            .and_then(|turn| {
-                turn.attempts
-                    .iter()
-                    .find(|attempt| attempt.id == attempt_id)
-            })
-            .ok_or("回答不存在。")?;
-        if source.status != TurnStatus::Completed {
-            return Err("只能翻译已完成的回答。".into());
-        }
-        if connection.protocol != source.model.protocol {
-            return Err("翻译连接协议不匹配。".into());
-        }
-        let messages = vec![ChatMessage::User(format!(
-            "请将以下内容翻译为 {language}，只返回译文：\n\n{}",
-            source.text
-        ))];
-        let model = ModelRef {
-            provider: source.model.provider.clone(),
-            endpoint: source.model.endpoint.clone(),
-            model: connection.model.clone(),
-            protocol: connection.protocol,
-        };
-        let attempt = Attempt {
-            id: new_id().map_err(|_| "无法生成翻译回答标识。")?,
-            model,
-            text: String::new(),
-            status: TurnStatus::Running,
-            error: None,
-            rounds: Vec::new(),
-            reasoning: Vec::new(),
-            kind: AttemptKind::Translation,
-            source_attempt_id: Some(attempt_id.into()),
-            parent_attempt_id: Some(attempt_id.into()),
-            search: SearchState::default(),
-            tool_events: Vec::new(),
-            generated: Vec::new(),
-        };
-        let ci = self
-            .history
-            .conversations
-            .iter()
-            .position(|conversation| conversation.id == conversation_id)
-            .unwrap();
-        let ti = self.history.conversations[ci]
-            .turns
-            .iter()
-            .position(|turn| turn.id == turn_id)
-            .unwrap();
-        let ai = self.history.conversations[ci].turns[ti].attempts.len();
-        self.history.conversations[ci].turns[ti]
-            .attempts
-            .push(attempt);
-        if !self.save() {
-            self.history.conversations[ci].turns[ti].attempts.pop();
-            return Err(self.notice.clone());
-        }
-        let cancel = CancellationToken::new();
-        let worker_cancel = cancel.clone();
-        let wake = self.wake.clone();
-        let (tx, rx) = self.event_channel();
-        let worker = match thread::Builder::new()
-            .name("lumakit-translate".into())
-            .spawn(move || {
-                let result = run_worker(connection, messages, worker_cancel, &tx, &wake);
-                let _ = tx.send(Event::End(result));
-                wake();
-            }) {
-            Ok(worker) => worker,
-            Err(_) => {
-                let attempt = &mut self.history.conversations[ci].turns[ti].attempts[ai];
-                attempt.status = TurnStatus::Failed;
-                attempt.error = Some("无法启动翻译线程。".into());
-                self.save();
-                return Err("无法启动翻译线程。".into());
-            }
-        };
-        self.job = Some(Job {
-            conversation: ci,
-            turn: ti,
-            attempt: ai,
-            identity: EventIdentity {
-                conversation_id: conversation_id.into(),
-                turn_id: turn_id.into(),
-                attempt_id: self.history.conversations[ci].turns[ti].attempts[ai]
-                    .id
-                    .clone(),
-            },
-            generation: self.generation,
-            terminal: false,
-            cancel,
-            rx,
-            thread: worker,
-            draft: None,
-            context: None,
-        });
-        self.phase = ChatPhase::Running;
-        Ok(())
-    }
     /// 普通重试锁定末次尝试的来源，不受当前模型下拉选择影响。
+    ///
+    /// # Errors
+    /// Returns unavailable session, conversation, retry source or selected model errors.
     pub fn request_model(&self, retry: bool) -> Result<ModelRef, String> {
         if self.busy() {
             return Err("请先等待当前请求结束。".into());
@@ -148,6 +30,9 @@ impl ChatSession {
         }
     }
     /// 新请求读取草稿，重试锁定原问题的绘图开关与模型；旧直接绘图记录沿用原来源。
+    ///
+    /// # Errors
+    /// Returns unavailable request sources or a missing configured painting model.
     pub fn request_painting_model(&self, retry: bool) -> Result<Option<ModelRef>, String> {
         self.request_model(retry)?;
         let conversation = self.selected().ok_or("请先新建对话。")?;
@@ -312,6 +197,7 @@ impl ChatSession {
                 text: String::new(),
                 status: TurnStatus::Running,
                 error: None,
+                trace_id: None,
                 rounds: Vec::new(),
                 reasoning: Vec::new(),
                 kind: AttemptKind::Reply,
@@ -330,13 +216,22 @@ impl ChatSession {
                 ci, ti, input, messages, attempt, turn_id, snapshot, connection,
             ))
         })();
-        let (ci, ti, input, messages, attempt, turn_id, snapshot, connection) = match prepared {
+        let (ci, ti, input, messages, mut attempt, turn_id, snapshot, connection) = match prepared {
             Ok(value) => value,
             Err(error) => {
                 self.notice = error;
                 return;
             }
         };
+        let (tx, rx) = match self.event_channel() {
+            Ok(channel) => channel,
+            Err(error) => {
+                self.notice = error;
+                return;
+            }
+        };
+        let (trace, root) = lumakit_observability::TraceContext::root("ai.request", "service");
+        attempt.trace_id = Some(trace.trace_id().to_owned());
         let previous_composer = self.composer_data.clone();
         let image_mode = snapshot.settings.image_mode;
         let painting_model = snapshot.settings.image_model.clone();
@@ -372,14 +267,13 @@ impl ChatSession {
             self.history.conversations[ci].turns[ti].id.clone(),
             snapshot,
         );
-        if !retry {
-            if let Some(draft) = self
+        if !retry
+            && let Some(draft) = self
                 .composer_data
                 .drafts
                 .get_mut(&self.history.conversations[ci].id)
-            {
-                draft.attachments.clear();
-            }
+        {
+            draft.attachments.clear();
         }
         // 接受请求前必须落盘；失败时完整撤销新增记录，不能留下重复问题或 Running。
         if !self.save() {
@@ -396,6 +290,7 @@ impl ChatSession {
                 conversation.draft = draft;
             }
             self.composer_data = previous_composer;
+            root.fail("CHAT_SAVE_FAILED");
             return;
         }
         let cancel = CancellationToken::new();
@@ -408,7 +303,6 @@ impl ChatSession {
                 .id
                 .clone(),
         };
-        let (tx, rx) = self.event_channel();
         let media_root = self.media_root.clone();
         let context = (!image_mode).then(|| {
             usage::context_anchor(
@@ -417,11 +311,19 @@ impl ChatSession {
                 connection.settings.native_web_search,
             )
         });
-        let (trace, root) = lumakit_observability::TraceContext::root("ai.request", "service");
         let span = tracing::info_span!(parent: root.span(), "ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, model = %connection.model, protocol = ?connection.protocol, image_mode);
+        let pending_root = super::worker::PendingRoot::new(root);
         let worker = thread::Builder::new()
             .name("lumakit-chat".into())
             .spawn(move || {
+                let root = match pending_root.take() {
+                    Ok(root) => root,
+                    Err(error) => {
+                        let _ = tx.send(Event::End(Err((TurnStatus::Failed, error.into()))));
+                        wake();
+                        return;
+                    }
+                };
                 // worker 独占同步运行时；span 仅在线程入口进入，不跨异步任务持有 guard。
                 let _entered = span.enter();
                 let result = run_session_worker(
@@ -429,7 +331,7 @@ impl ChatSession {
                     painting,
                     painting_model,
                     messages,
-                    Some((&trace, root)),
+                    (&trace, root),
                     worker_cancel,
                     &tx,
                     &wake,
@@ -462,215 +364,6 @@ impl ChatSession {
                 self.restore_draft(ci, ti, draft);
                 self.save();
             }
-        }
-    }
-}
-fn run_worker(
-    connection: AiConnection,
-    messages: Vec<ChatMessage>,
-    cancel: CancellationToken,
-    tx: &EventSender,
-    wake: &Arc<dyn Fn() + Send + Sync>,
-) -> Result<crate::AiRun, (TurnStatus, String)> {
-    run_session_worker(
-        connection,
-        None,
-        None,
-        messages,
-        None,
-        cancel,
-        tx,
-        wake,
-        PathBuf::new(),
-    )
-}
-
-/// 运行一次聊天请求；传入链路时由这里按实际结果结束入口操作，失败写稳定错误码，不写正文。
-#[allow(
-    clippy::too_many_arguments,
-    reason = "私有 worker 入口，参数来自同一次请求快照"
-)]
-fn run_session_worker(
-    connection: AiConnection,
-    painting: Option<AiConnection>,
-    painting_model: Option<ModelRef>,
-    messages: Vec<ChatMessage>,
-    trace: Option<(
-        &lumakit_observability::TraceContext,
-        lumakit_observability::OperationGuard,
-    )>,
-    cancel: CancellationToken,
-    tx: &EventSender,
-    wake: &Arc<dyn Fn() + Send + Sync>,
-    media_root: PathBuf,
-) -> Result<crate::AiRun, (TurnStatus, String)> {
-    let (context, root) = trace.unzip();
-    let (result, code) = session_result(
-        connection,
-        painting,
-        painting_model,
-        messages,
-        context,
-        cancel,
-        tx,
-        wake,
-        media_root,
-    );
-    if let Some(root) = root {
-        match (&result, code) {
-            (Ok(_), _) => root.finish("SUCCESS"),
-            (Err(_), Some(Ok(limit_ms))) => root.timeout(limit_ms),
-            (Err((TurnStatus::Cancelled, _)), _) => root.cancel("user_cancelled"),
-            (Err(_), Some(Err(code))) => root.fail(code),
-            (Err(_), None) => root.fail("AI_REQUEST_FAILED"),
-        }
-    }
-    result
-}
-
-/// 结果与日志结论：`Some(Ok(limit_ms))` 为超时，`Some(Err(code))` 为稳定错误码。
-type Outcome = (
-    Result<crate::AiRun, (TurnStatus, String)>,
-    Option<Result<u64, &'static str>>,
-);
-
-#[allow(
-    clippy::too_many_arguments,
-    reason = "私有 worker 入口，参数来自同一次请求快照"
-)]
-fn session_result(
-    connection: AiConnection,
-    painting: Option<AiConnection>,
-    painting_model: Option<ModelRef>,
-    messages: Vec<ChatMessage>,
-    trace: Option<&lumakit_observability::TraceContext>,
-    cancel: CancellationToken,
-    tx: &EventSender,
-    wake: &Arc<dyn Fn() + Send + Sync>,
-    media_root: PathBuf,
-) -> Outcome {
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(_) => {
-            return (
-                Err((
-                    TurnStatus::Failed,
-                    "无法启动聊天网络运行时，请重试。".into(),
-                )),
-                Some(Err("AI_RUNTIME_UNAVAILABLE")),
-            );
-        }
-    };
-    let mut bytes = 0usize;
-    let mut overflow = false;
-    let host = generation::PaintingHost {
-        model: ModelRef {
-            provider: "snapshot".into(),
-            endpoint: "snapshot".into(),
-            model: connection.model.clone(),
-            protocol: connection.protocol,
-        },
-        chat: connection,
-        painting,
-        painting_model,
-        root: media_root,
-        tx: tx.clone(),
-        wake: wake.clone(),
-        executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        trace: trace.cloned(),
-    };
-    let engine = match crate::AiRuntime::new(Arc::new(host)) {
-        Ok(engine) => engine,
-        Err(error) => {
-            return (
-                Err((TurnStatus::Failed, error.to_string())),
-                Some(Err(error.code())),
-            );
-        }
-    };
-    let result = runtime.block_on(engine.run_with_history(
-        crate::RunRequest {
-            input: String::new(),
-            model: None,
-            purpose: "chat".into(),
-        },
-        messages,
-        trace,
-        cancel.clone(),
-        |text| {
-            if overflow {
-                return;
-            }
-            if text.len() > MAX_TEXT.saturating_sub(bytes) {
-                overflow = true;
-                cancel.cancel();
-                return;
-            }
-            bytes += text.len();
-            let mut remaining = text.as_str();
-            while !remaining.is_empty() {
-                let mut end = remaining.len().min(16 * 1024);
-                while !remaining.is_char_boundary(end) {
-                    end -= 1;
-                }
-                // 有界背压不丢字；Drop 会继续排空，因此取消后也不会卡在 join。
-                if tx.send(Event::Delta(remaining[..end].to_owned())).is_err() {
-                    cancel.cancel();
-                    return;
-                }
-                wake();
-                remaining = &remaining[end..];
-            }
-        },
-        |event| {
-            if tx.send(Event::Runtime(event)).is_err() {
-                cancel.cancel();
-            }
-            wake();
-        },
-    ));
-    if overflow {
-        return (
-            Err((
-                TurnStatus::Failed,
-                "回答超过 1 MiB，已停止；保留已有内容。".into(),
-            )),
-            Some(Err("AI_REPLY_TOO_LARGE")),
-        );
-    }
-    match result {
-        Ok(result) if result.text.trim().is_empty() => (
-            Err((
-                TurnStatus::Failed,
-                "服务返回了空回答，请重试；空回答不会用于后续上下文。".into(),
-            )),
-            Some(Err("AI_EMPTY_REPLY")),
-        ),
-        Ok(result) if result.text.len() <= MAX_TEXT => (Ok(result), None),
-        Ok(_) => (
-            Err((TurnStatus::Failed, "回答超过 1 MiB，已停止。".into())),
-            Some(Err("AI_REPLY_TOO_LARGE")),
-        ),
-        Err(AiError::Cancelled) => (
-            Err((
-                TurnStatus::Cancelled,
-                "已停止；部分回答不会用于后续上下文。".into(),
-            )),
-            None,
-        ),
-        Err(error @ AiError::Timeout { limit_ms, .. }) => (
-            Err((TurnStatus::Failed, format!("请求失败：{error}"))),
-            Some(Ok(limit_ms)),
-        ),
-        Err(error) => {
-            let code = error.code();
-            (
-                Err((TurnStatus::Failed, format!("请求失败：{error}"))),
-                Some(Err(code)),
-            )
         }
     }
 }

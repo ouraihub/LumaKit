@@ -205,7 +205,7 @@ async fn generate(
     for item in data {
         let bytes = if let Some(encoded) = item.get("b64_json").and_then(serde_json::Value::as_str)
         {
-            if encoded.len() > (images::MAX_IMAGE_BYTES + 2) / 3 * 4 {
+            if encoded.len() > images::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
                 return Err(error("生成图片超过 4 MiB。"));
             }
             STANDARD
@@ -383,12 +383,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_arguments_are_typed_unicode_bounded_and_square_by_default() {
+    fn image_arguments_are_typed_unicode_bounded_and_square_by_default()
+    -> Result<(), Box<dyn std::error::Error>> {
         let request =
-            ImageRequest::parse(serde_json::json!({"prompt":format!(" {} ", "🙂".repeat(4000))}))
-                .unwrap();
+            ImageRequest::parse(serde_json::json!({"prompt":format!(" {} ", "🙂".repeat(4000))}))?;
         assert_eq!(request.prompt.chars().count(), 4000);
-        assert_eq!(serde_json::to_value(request).unwrap()["size"], "1024x1024");
+        assert_eq!(serde_json::to_value(request)?["size"], "1024x1024");
         for args in [
             serde_json::json!({"prompt":"🙂".repeat(4001)}),
             serde_json::json!({"prompt":" \n "}),
@@ -399,5 +399,6 @@ mod tests {
         ] {
             assert!(ImageRequest::parse(args).is_err());
         }
+        Ok(())
     }
 }

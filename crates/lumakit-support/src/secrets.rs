@@ -79,21 +79,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encrypted_key_round_trip_and_failed_replacement_preserve_identity() {
-        let mut key = SavedKey::new("  测试-key-123456789  ").unwrap();
+    fn encrypted_key_round_trip_and_failed_replacement_preserve_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut key = SavedKey::new("  测试-key-123456789  ")?;
         let id = key.id.clone();
-        let encoded = serde_json::to_string(&key).unwrap();
+        let encoded = serde_json::to_string(&key)?;
         assert!(!encoded.contains("测试-key"));
-        let restored: SavedKey = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(restored.open().unwrap().as_str(), "测试-key-123456789");
+        let restored: SavedKey = serde_json::from_str(&encoded)?;
+        assert_eq!(restored.open()?.as_str(), "测试-key-123456789");
         assert!(key.replace(" ").is_err());
         assert_eq!(key.id, id);
-        assert_eq!(key.open().unwrap().as_str(), "测试-key-123456789");
-        key.replace("replacement-key").unwrap();
+        assert_eq!(key.open()?.as_str(), "测试-key-123456789");
+        key.replace("replacement-key")?;
         assert_eq!(key.id, id);
-        assert_eq!(key.open().unwrap().as_str(), "replacement-key");
+        assert_eq!(key.open()?.as_str(), "replacement-key");
         let mut damaged = key.clone();
         damaged.ciphertext[0] ^= 1;
         assert!(damaged.open().is_err());
+        Ok(())
     }
 }

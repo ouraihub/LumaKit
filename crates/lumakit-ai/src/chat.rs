@@ -31,10 +31,14 @@ pub(crate) mod store;
 #[cfg(test)]
 #[path = "chat_tests.rs"]
 mod tests;
+#[path = "chat_translation.rs"]
+mod translation;
 #[path = "chat_types.rs"]
 mod types;
 #[path = "chat_usage.rs"]
 mod usage;
+#[path = "chat_worker.rs"]
+mod worker;
 pub use action::{ChatAction, ModelOption};
 pub use composer::{Attachment, ComposerSettings, ToolbarTool};
 pub use model_picker::{ModelPair, ModelPickerPreferences};
@@ -65,11 +69,13 @@ struct EventSender {
     tx: mpsc::SyncSender<Envelope>,
 }
 impl EventSender {
-    fn send(&self, event: Event) -> Result<(), mpsc::SendError<Envelope>> {
-        self.tx.send(Envelope {
-            generation: self.generation,
-            event,
-        })
+    fn send(&self, event: Event) -> Result<(), mpsc::SendError<()>> {
+        self.tx
+            .send(Envelope {
+                generation: self.generation,
+                event,
+            })
+            .map_err(|_| mpsc::SendError(()))
     }
 }
 struct Job {
@@ -118,6 +124,9 @@ pub struct ChatSession {
 impl ChatSession {
     /// path 是完整的 chat.db 路径；首次打开导入同目录 chat-history.json，旧文件仅作备份。
     /// 同目录独占锁持有到 session 释放；SQLite 是唯一读写数据源。
+    ///
+    /// # Errors
+    /// Returns lock, migration, history validation or persistence errors without replacing existing data.
     pub fn open(path: &Path, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let lock = FileLock::acquire(&path.with_file_name("chat-history.lock")).map_err(|_| {
             "无法独占聊天记录；请关闭其它使用此数据目录的实例，并检查目录权限。".to_owned()
@@ -146,16 +155,15 @@ impl ChatSession {
                 turn.attempts
                     .last()
                     .is_some_and(|attempt| attempt.status == TurnStatus::Running)
-            }) {
-                if let Some(snapshot) = session.composer_data.turns.get(&turn.id).cloned() {
-                    if conversation.draft.is_empty() {
-                        conversation.draft = turn.input.clone();
-                    }
-                    session
-                        .composer_data
-                        .drafts
-                        .insert(conversation.id.clone(), snapshot);
+            }) && let Some(snapshot) = session.composer_data.turns.get(&turn.id).cloned()
+            {
+                if conversation.draft.is_empty() {
+                    conversation.draft = turn.input.clone();
                 }
+                session
+                    .composer_data
+                    .drafts
+                    .insert(conversation.id.clone(), snapshot);
             }
         }
         let recovered = recover(&mut session.history);

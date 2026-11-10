@@ -37,6 +37,9 @@ pub enum ImageError {
 }
 
 /// 校验数量、MIME 声明、Base64 编码、文件签名及单图解码大小，返回首个错误。
+///
+/// # Errors
+/// Returns the first count, MIME, Base64, decoded-size, or file-signature error.
 pub fn validate(images: &[ImagePart]) -> Result<(), ImageError> {
     if images.len() > MAX_IMAGES {
         return Err(ImageError::Count);
@@ -69,6 +72,9 @@ pub fn validate(images: &[ImagePart]) -> Result<(), ImageError> {
 }
 
 /// 将已验证的图片字节编码为内嵌图片。
+///
+/// # Errors
+/// Returns an error if the MIME, byte size, or file signature fails [`validate`].
 pub fn from_bytes(mime: impl Into<String>, bytes: &[u8]) -> Result<ImagePart, ImageError> {
     let image = ImagePart {
         mime: mime.into(),

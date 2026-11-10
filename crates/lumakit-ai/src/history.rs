@@ -176,6 +176,10 @@ impl HistoryStore {
     /// 打开实际数据库路径，并将未完成轮次标为中断。
     /// 首次成功打开时导入同名 `.json` 的旧裸历史；导入及标记在同一事务提交。
     /// 同目录聊天锁阻止另一个写实例；之后即使历史为空也不会重新导入。
+    ///
+    /// # Errors
+    /// Returns an error if the writer lock cannot be acquired, database migration/read/write
+    /// fails, or legacy/stored history is malformed or violates history invariants.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HistoryError> {
         let path = path.as_ref();
         let lock = FileLock::acquire(&path.with_file_name("chat-history.lock"))?;
@@ -222,11 +226,18 @@ impl HistoryStore {
     }
 
     /// Alias for [`HistoryStore::open`].
+    ///
+    /// # Errors
+    /// Returns the same locking, storage, and history-validation errors as [`Self::open`].
     pub fn new(path: impl AsRef<Path>) -> Result<Self, HistoryError> {
         Self::open(path)
     }
 
     /// Starts and durably records a new running turn.
+    ///
+    /// # Errors
+    /// Returns an error if an ID cannot be generated or validated history cannot be persisted.
+    /// Failed persistence restores the previous in-memory history.
     pub fn begin(
         &mut self,
         conversation_id: impl Into<String>,
@@ -276,6 +287,10 @@ impl HistoryStore {
     }
 
     /// Replaces a running turn with its final, atomically persisted result.
+    ///
+    /// # Errors
+    /// Returns an error if the conversation/turn is missing or validated history cannot be
+    /// persisted. Failed persistence restores the previous in-memory history.
     pub fn finish(&mut self, mut turn: Turn) -> Result<(), HistoryError> {
         if turn.finished_at.is_none() {
             turn.finished_at = Some(now());
@@ -471,12 +486,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn timestamp_storage_rejects_overflow_and_negative_values() {
-        assert_eq!(timestamp_to_sql(0).unwrap(), 0);
-        assert_eq!(timestamp_from_sql(0).unwrap(), 0);
-        let maximum = u64::try_from(i64::MAX).unwrap();
-        assert_eq!(timestamp_to_sql(maximum).unwrap(), i64::MAX);
-        assert_eq!(timestamp_from_sql(i64::MAX).unwrap(), maximum);
+    fn timestamp_storage_rejects_overflow_and_negative_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(timestamp_to_sql(0)?, 0);
+        assert_eq!(timestamp_from_sql(0)?, 0);
+        let maximum = u64::try_from(i64::MAX)?;
+        assert_eq!(timestamp_to_sql(maximum)?, i64::MAX);
+        assert_eq!(timestamp_from_sql(i64::MAX)?, maximum);
         assert!(matches!(
             timestamp_to_sql(maximum + 1),
             Err(HistoryError::InvalidData(_))
@@ -489,40 +505,45 @@ mod tests {
             timestamp_from_sql(-1),
             Err(HistoryError::InvalidData(_))
         ));
+        Ok(())
     }
 
-    fn temp_path(name: &str) -> PathBuf {
+    fn temp_path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let root = std::env::temp_dir().join(format!(
             "lumakit-history-{name}-{}",
-            lumakit_support::new_id().unwrap()
+            lumakit_support::new_id()?
         ));
-        fs::create_dir_all(&root).unwrap();
-        root.join("history.db")
+        fs::create_dir_all(&root)?;
+        Ok(root.join("history.db"))
     }
 
     #[test]
-    fn running_turn_is_recovered_as_interrupted() {
-        let path = temp_path("recovery");
-        let mut store = HistoryStore::open(&path).expect("open");
-        let turn = store.begin("conversation", "model").expect("begin");
+    fn running_turn_is_recovered_as_interrupted() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_path("recovery")?;
+        let mut store = HistoryStore::open(&path)?;
+        let turn = store.begin("conversation", "model")?;
         drop(store);
-        let store = HistoryStore::open(&path).expect("reopen");
-        let recovered = store.load("conversation", &turn.id).expect("turn");
+        let store = HistoryStore::open(&path)?;
+        let recovered = store
+            .load("conversation", &turn.id)
+            .ok_or("recovered turn missing")?;
         assert_eq!(recovered.status, TurnStatus::Failed);
         assert_eq!(recovered.error.as_deref(), Some("interrupted"));
         drop(store);
-        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let _ = fs::remove_dir_all(path.parent().ok_or("history parent missing")?);
+        Ok(())
     }
 
     #[test]
-    fn legacy_empty_duplicate_and_mismatched_ids_are_rejected_before_import() {
-        let source_path = temp_path("validation-source");
-        let mut source = HistoryStore::open(&source_path).unwrap();
-        source.begin("conversation", "model").unwrap();
+    fn legacy_empty_duplicate_and_mismatched_ids_are_rejected_before_import()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let source_path = temp_path("validation-source")?;
+        let mut source = HistoryStore::open(&source_path)?;
+        source.begin("conversation", "model")?;
         let data = source.data.clone();
         drop(source);
         for kind in 0..6 {
-            let path = temp_path("validation-target");
+            let path = temp_path("validation-target")?;
             let mut invalid = data.clone();
             match kind {
                 0 => invalid.conversations[0].id.clear(),
@@ -535,33 +556,34 @@ mod tests {
                 4 => invalid.conversations[0].turns[0].conversation_id = "missing".into(),
                 _ => invalid.conversations[0].turns[0].attempt = 0,
             }
-            let bytes = serde_json::to_vec(&invalid).unwrap();
+            let bytes = serde_json::to_vec(&invalid)?;
             let legacy = path.with_extension("json");
-            fs::write(&legacy, &bytes).unwrap();
+            fs::write(&legacy, &bytes)?;
             assert!(HistoryStore::open(&path).is_err(), "case {kind}");
-            let database = Connection::open(&path).unwrap();
+            let database = Connection::open(&path)?;
             for table in ["legacy_meta", "legacy_conversations", "legacy_turns"] {
                 assert_eq!(
                     database
                         .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
-                            .get::<_, i64>(0))
-                        .unwrap(),
+                            .get::<_, i64>(0))?,
                     0
                 );
             }
-            assert_eq!(fs::read(&legacy).unwrap(), bytes);
+            assert_eq!(fs::read(&legacy)?, bytes);
             drop(database);
-            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            fs::remove_dir_all(path.parent().ok_or("history parent missing")?)?;
         }
-        fs::remove_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::remove_dir_all(source_path.parent().ok_or("history parent missing")?)?;
+        Ok(())
     }
 
     #[test]
-    fn legacy_import_failure_is_atomic_and_backup_is_never_reimported() {
-        let path = temp_path("migration");
+    fn legacy_import_failure_is_atomic_and_backup_is_never_reimported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_path("migration")?;
         let legacy = path.with_extension("json");
-        let mut source = HistoryStore::open(&path).unwrap();
-        let turn = source.begin("conversation", "model").unwrap();
+        let mut source = HistoryStore::open(&path)?;
+        let turn = source.begin("conversation", "model")?;
         let mut finished = turn.clone();
         finished.status = TurnStatus::Completed;
         finished.messages.push(MessageRecord {
@@ -569,81 +591,75 @@ mod tests {
             content: "保留回答".into(),
             images: Vec::new(),
         });
-        source.finish(finished).unwrap();
-        let bytes = serde_json::to_vec(&source.data).unwrap();
+        source.finish(finished)?;
+        let bytes = serde_json::to_vec(&source.data)?;
         drop(source);
-        fs::write(&legacy, &bytes).unwrap();
-        let database = Connection::open(&path).unwrap();
-        database.execute_batch("DELETE FROM legacy_turns; DELETE FROM legacy_conversations; DELETE FROM legacy_meta; CREATE TRIGGER reject_import BEFORE INSERT ON legacy_turns BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        fs::write(&legacy, &bytes)?;
+        let database = Connection::open(&path)?;
+        database.execute_batch("DELETE FROM legacy_turns; DELETE FROM legacy_conversations; DELETE FROM legacy_meta; CREATE TRIGGER reject_import BEFORE INSERT ON legacy_turns BEGIN SELECT RAISE(ABORT,'injected failure'); END;")?;
         assert!(HistoryStore::open(&path).is_err());
         assert_eq!(
-            database
-                .query_row("SELECT count(*) FROM legacy_meta", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
+            database.query_row("SELECT count(*) FROM legacy_meta", [], |row| row
+                .get::<_, i64>(0))?,
             0
         );
         assert_eq!(
-            database
-                .query_row("SELECT count(*) FROM legacy_conversations", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .unwrap(),
+            database.query_row("SELECT count(*) FROM legacy_conversations", [], |row| row
+                .get::<_, i64>(
+                0
+            ))?,
             0
         );
-        assert_eq!(fs::read(&legacy).unwrap(), bytes);
-        database
-            .execute_batch("DROP TRIGGER reject_import;")
-            .unwrap();
-        let mut store = HistoryStore::open(&path).unwrap();
+        assert_eq!(fs::read(&legacy)?, bytes);
+        database.execute_batch("DROP TRIGGER reject_import;")?;
+        let mut store = HistoryStore::open(&path)?;
         assert_eq!(
-            store.load("conversation", &turn.id).unwrap().messages[0].content,
+            store
+                .load("conversation", &turn.id)
+                .ok_or("imported turn missing")?
+                .messages[0]
+                .content,
             "保留回答"
         );
         assert!(HistoryStore::open(&path).is_err());
-        database.execute_batch("CREATE TRIGGER reject_finish BEFORE INSERT ON legacy_turns BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        database.execute_batch("CREATE TRIGGER reject_finish BEFORE INSERT ON legacy_turns BEGIN SELECT RAISE(ABORT,'injected failure'); END;")?;
         let before = store.conversations();
         assert!(store.begin("new", "model").is_err());
         assert_eq!(store.conversations(), before);
-        let mut changed = store.load("conversation", &turn.id).unwrap();
+        let mut changed = store
+            .load("conversation", &turn.id)
+            .ok_or("stored turn missing")?;
         changed.messages[0].content = "不应保存".into();
         assert!(store.finish(changed).is_err());
         assert_eq!(store.conversations(), before);
-        database
-            .execute_batch("DROP TRIGGER reject_finish;")
-            .unwrap();
+        database.execute_batch("DROP TRIGGER reject_finish;")?;
         store.data.conversations.clear();
-        store.persist().unwrap();
+        store.persist()?;
         drop(store);
-        fs::write(&legacy, b"broken JSON backup").unwrap();
-        assert!(
-            HistoryStore::open(&path)
-                .unwrap()
-                .conversations()
-                .is_empty()
-        );
+        fs::write(&legacy, b"broken JSON backup")?;
+        assert!(HistoryStore::open(&path)?.conversations().is_empty());
         drop(database);
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        fs::remove_dir_all(path.parent().ok_or("history parent missing")?)?;
+        Ok(())
     }
 
     #[test]
-    fn malformed_legacy_history_is_not_replaced_with_empty_data() {
-        let path = temp_path("malformed");
+    fn malformed_legacy_history_is_not_replaced_with_empty_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_path("malformed")?;
         let legacy = path.with_extension("json");
-        fs::write(&legacy, b"invalid JSON").unwrap();
+        fs::write(&legacy, b"invalid JSON")?;
         assert!(HistoryStore::open(&path).is_err());
-        let connection = Connection::open(&path).unwrap();
+        let connection = Connection::open(&path)?;
         assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM legacy_meta", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
+            connection.query_row("SELECT count(*) FROM legacy_meta", [], |row| row
+                .get::<_, i64>(0))?,
             0
         );
-        assert_eq!(fs::read(&legacy).unwrap(), b"invalid JSON");
+        assert_eq!(fs::read(&legacy)?, b"invalid JSON");
         drop(connection);
-        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        fs::remove_dir_all(path.parent().ok_or("history parent missing")?)?;
+        Ok(())
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub struct CatalogStore {
 
 impl CatalogStore {
     /// Opens (and, when needed, migrates) the provider database under `root`.
+    ///
+    /// # Errors
+    /// Returns an error for directory/database I/O, migration or initialization failures,
+    /// or invalid legacy configuration that cannot be imported atomically.
     pub fn open(root: &Path) -> Result<Self, String> {
         std::fs::create_dir_all(root).map_err(|e| format!("无法创建模型数据目录: {e}"))?;
         let path = root.join(DB_FILE);
@@ -100,6 +104,10 @@ impl CatalogStore {
     }
 
     /// Loads the saved catalog in stable UI order and the preset initialization flag.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid initialization marker, database read failures,
+    /// or malformed/invalid saved provider, endpoint, key, or model metadata.
     pub fn load(&self) -> Result<(Vec<ProviderEntry>, bool), String> {
         self.require_initialized()?;
         let mut providers = Vec::new();
@@ -216,6 +224,10 @@ impl CatalogStore {
     }
 
     /// Saves only changed providers and removes deleted providers in one transaction.
+    ///
+    /// # Errors
+    /// Returns an error for invalid catalog data, failure to load existing data,
+    /// or a database transaction failure; changes are committed together.
     pub fn save(
         &mut self,
         providers: &[ProviderEntry],
@@ -255,6 +267,10 @@ impl CatalogStore {
     }
 
     /// Saves only an endpoint's keys and selection; endpoint draft fields are untouched.
+    ///
+    /// # Errors
+    /// Returns an error for invalid key metadata/selection, a missing endpoint,
+    /// or a database transaction failure.
     pub fn save_keys(
         &mut self,
         endpoint_id: &str,
@@ -312,6 +328,9 @@ impl CatalogStore {
     }
 
     /// Updates only one provider's enabled state, leaving all other drafts untouched.
+    ///
+    /// # Errors
+    /// Returns an error if the provider no longer exists or the database update fails.
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<(), String> {
         let changed = self
             .conn
@@ -540,7 +559,7 @@ fn parse_protocol(s: &str) -> Result<Protocol, String> {
     }
 }
 fn placeholders(n: usize) -> String {
-    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 fn sql(e: rusqlite::Error) -> String {
     format!("SQLite操作失败: {e}")
@@ -551,14 +570,11 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn root(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+    fn root(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = std::env::temp_dir().join(format!("lumakit-catalog-{name}-{stamp}"));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 
     fn provider(id: &str, key: Option<SavedKey>) -> ProviderEntry {
@@ -581,34 +597,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_database_does_not_resurrect_json_after_marker() {
-        let path = root("empty");
+    fn empty_database_does_not_resurrect_json_after_marker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = root("empty")?;
         let json = serde_json::json!({"providers": [{"id":"old","name":"Old","enabled":true,"endpoints":[]}]});
-        lumakit_support::save_versioned(&path.join(LEGACY_FILE), 1, &json).unwrap();
-        let store = CatalogStore::open(&path).unwrap();
-        assert_eq!(store.load().unwrap().0.len(), 1);
+        lumakit_support::save_versioned(&path.join(LEGACY_FILE), 1, &json)?;
+        let store = CatalogStore::open(&path)?;
+        assert_eq!(store.load()?.0.len(), 1);
         drop(store);
-        std::fs::remove_file(path.join(LEGACY_FILE)).unwrap();
-        let mut store = CatalogStore::open(&path).unwrap();
-        store.save(&[], false).unwrap();
+        std::fs::remove_file(path.join(LEGACY_FILE))?;
+        let mut store = CatalogStore::open(&path)?;
+        store.save(&[], false)?;
         drop(store);
         let json = serde_json::json!({"providers": [{"id":"new-old","name":"Old","enabled":true,"endpoints":[]}]});
-        lumakit_support::save_versioned(&path.join(LEGACY_FILE), 1, &json).unwrap();
-        let store = CatalogStore::open(&path).unwrap();
-        assert!(store.load().unwrap().0.is_empty());
+        lumakit_support::save_versioned(&path.join(LEGACY_FILE), 1, &json)?;
+        let store = CatalogStore::open(&path)?;
+        assert!(store.load()?.0.is_empty());
         let _ = std::fs::remove_dir_all(path);
+        Ok(())
     }
 
     #[test]
-    fn import_failure_does_not_write_marker_or_partial_rows() {
-        let path = root("bad-import");
+    fn import_failure_does_not_write_marker_or_partial_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = root("bad-import")?;
         let json = serde_json::json!({"providers": [{"id":"bad","name":"Bad","enabled":true,"endpoints":[{"id":"e","name":"E","base_url":"http://not-loopback","protocol":"OpenAiChat","keys":[],"models":[],"selected_key":null,"selected_model":null}]}]});
-        lumakit_support::save_versioned(&path.join(LEGACY_FILE), 1, &json).unwrap();
+        lumakit_support::save_versioned(&path.join(LEGACY_FILE), 1, &json)?;
         assert!(CatalogStore::open(&path).is_err());
-        let conn = Connection::open(path.join(DB_FILE)).unwrap();
+        let conn = Connection::open(path.join(DB_FILE))?;
         assert_eq!(
-            conn.query_row("SELECT count(*) FROM providers", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
+            conn.query_row("SELECT count(*) FROM providers", [], |r| r.get::<_, i64>(0))?,
             0
         );
         assert_eq!(
@@ -617,53 +635,54 @@ mod tests {
                 [],
                 |r| r.get::<_, String>(0)
             )
-            .optional()
-            .unwrap()
+            .optional()?
             .as_deref(),
             Some("0")
         );
         let _ = std::fs::remove_dir_all(path);
+        Ok(())
     }
 
     #[test]
-    fn future_version_and_malformed_json_are_rejected() {
-        let future = root("future");
+    fn future_version_and_malformed_json_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let future = root("future")?;
         lumakit_support::save_versioned(
             &future.join(LEGACY_FILE),
             2,
             &serde_json::json!({"providers":[]}),
-        )
-        .unwrap();
+        )?;
         assert!(CatalogStore::open(&future).is_err());
-        let malformed = root("malformed");
-        std::fs::write(malformed.join(LEGACY_FILE), b"not-json").unwrap();
+        let malformed = root("malformed")?;
+        std::fs::write(malformed.join(LEGACY_FILE), b"not-json")?;
         assert!(CatalogStore::open(&malformed).is_err());
         let _ = std::fs::remove_dir_all(future);
         let _ = std::fs::remove_dir_all(malformed);
+        Ok(())
     }
 
     #[test]
-    fn ciphertext_round_trip_and_save_rollback() {
-        let path = root("cipher");
+    fn ciphertext_round_trip_and_save_rollback() -> Result<(), Box<dyn std::error::Error>> {
+        let path = root("cipher")?;
         let key = SavedKey {
             id: "key-1".into(),
             masked: "••••••••".into(),
             ciphertext: vec![0, 1, 2, 255],
         };
-        let mut store = CatalogStore::open(&path).unwrap();
+        let mut store = CatalogStore::open(&path)?;
         let before = provider("p", Some(key.clone()));
-        store.save(std::slice::from_ref(&before), false).unwrap();
+        store.save(std::slice::from_ref(&before), false)?;
         assert_eq!(
-            store.load().unwrap().0[0].endpoints[0].keys[0].ciphertext,
+            store.load()?.0[0].endpoints[0].keys[0].ciphertext,
             key.ciphertext
         );
         let mut invalid = before.clone();
         invalid.endpoints[0].base_url = "http://not-loopback".into();
         assert!(store.save(&[invalid], false).is_err());
         assert_eq!(
-            store.load().unwrap().0[0].endpoints[0].keys[0].ciphertext,
+            store.load()?.0[0].endpoints[0].keys[0].ciphertext,
             key.ciphertext
         );
         let _ = std::fs::remove_dir_all(path);
+        Ok(())
     }
 }

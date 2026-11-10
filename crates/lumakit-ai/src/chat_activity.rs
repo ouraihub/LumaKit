@@ -3,6 +3,9 @@ use super::*;
 
 impl ChatSession {
     /// 标记指定回答开始联网搜索。
+    ///
+    /// # Errors
+    /// Returns invalid query/provider, missing attempt, busy session or persistence errors.
     pub fn search_start(
         &mut self,
         conversation_id: &str,
@@ -35,6 +38,9 @@ impl ChatSession {
     }
 
     /// 持久化搜索结果；来源保持在正文之外。
+    ///
+    /// # Errors
+    /// Returns invalid search results, missing attempt, busy session or persistence errors.
     pub fn search_result(
         &mut self,
         conversation_id: &str,
@@ -69,6 +75,9 @@ impl ChatSession {
     }
 
     /// 记录搜索失败，不伪装成无结果。
+    ///
+    /// # Errors
+    /// Returns missing attempt, busy session or persistence errors.
     pub fn search_failed(
         &mut self,
         conversation_id: &str,
@@ -86,6 +95,9 @@ impl ChatSession {
     }
 
     /// 记录搜索取消，不伪装成无结果。
+    ///
+    /// # Errors
+    /// Returns missing attempt, busy session or persistence errors.
     pub fn search_cancelled(
         &mut self,
         conversation_id: &str,
@@ -124,6 +136,9 @@ impl ChatSession {
         }
     }
     /// 记录模型发起的工具调用；调用状态与回答正文分开保存。
+    ///
+    /// # Errors
+    /// Returns invalid tool identity/arguments, missing attempt, busy session or persistence errors.
     pub fn tool_start(
         &mut self,
         conversation_id: &str,
@@ -159,6 +174,9 @@ impl ChatSession {
         }
     }
     /// 保存工具授权决定。
+    ///
+    /// # Errors
+    /// Returns missing tool/attempt, busy session or persistence errors.
     pub fn tool_approval(
         &mut self,
         conversation_id: &str,
@@ -172,6 +190,9 @@ impl ChatSession {
         })
     }
     /// 保存工具输出，包括工具自身报告的业务错误。
+    ///
+    /// # Errors
+    /// Returns missing tool/attempt, busy session or persistence errors.
     pub fn tool_result(
         &mut self,
         conversation_id: &str,
@@ -187,6 +208,9 @@ impl ChatSession {
         })
     }
     /// 保存未知工具、拒绝或执行失败的错误，不伪装成成功结果。
+    ///
+    /// # Errors
+    /// Returns missing tool/attempt, busy session or persistence errors.
     pub fn tool_error(
         &mut self,
         conversation_id: &str,

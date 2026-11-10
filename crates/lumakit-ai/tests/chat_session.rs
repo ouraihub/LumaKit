@@ -17,12 +17,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+
+type TestServer = (
+    String,
+    mpsc::Receiver<Value>,
+    thread::JoinHandle<Result<(), TestError>>,
+);
+
 struct Directory(PathBuf);
 impl Directory {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("lumakit-chat-{}", new_id().unwrap()));
-        fs::create_dir_all(&root).unwrap();
-        Self(root)
+    fn new() -> Result<Self, TestError> {
+        let root = std::env::temp_dir().join(format!("lumakit-chat-{}", new_id()?));
+        fs::create_dir_all(&root)?;
+        Ok(Self(root))
     }
     fn path(&self) -> PathBuf {
         self.0.join("chat.db")
@@ -33,8 +41,8 @@ impl Drop for Directory {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn open(path: &Path) -> ChatSession {
-    ChatSession::open(path, Arc::new(|| {})).unwrap()
+fn open(path: &Path) -> Result<ChatSession, TestError> {
+    Ok(ChatSession::open(path, Arc::new(|| {}))?)
 }
 fn model(name: &str) -> ModelRef {
     ModelRef {
@@ -53,18 +61,21 @@ fn connection(url: &str, name: &str) -> AiConnection {
         settings: Default::default(),
     }
 }
-fn setup(path: &Path) -> ChatSession {
-    let mut session = open(path);
+fn setup(path: &Path) -> Result<ChatSession, TestError> {
+    let mut session = open(path)?;
     session.new_conversation();
     session.select_model(model("source"));
-    session
+    Ok(session)
 }
-fn wait_until(session: &mut ChatSession, condition: impl Fn(&ChatSession) -> bool) {
+fn wait_until(
+    session: &mut ChatSession,
+    condition: impl Fn(&ChatSession) -> Result<bool, TestError>,
+) -> Result<(), TestError> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         session.poll();
-        if condition(session) {
-            return;
+        if condition(session)? {
+            return Ok(());
         }
         assert!(
             Instant::now() < deadline,
@@ -74,8 +85,8 @@ fn wait_until(session: &mut ChatSession, condition: impl Fn(&ChatSession) -> boo
         thread::sleep(Duration::from_millis(2));
     }
 }
-fn complete(session: &mut ChatSession) {
-    wait_until(session, |session| !session.busy());
+fn complete(session: &mut ChatSession) -> Result<(), TestError> {
+    wait_until(session, |session| Ok(!session.busy()))
 }
 fn delta(text: &str) -> String {
     format!(
@@ -83,34 +94,40 @@ fn delta(text: &str) -> String {
         json!({"choices":[{"delta":{"content":text}}]})
     )
 }
+fn worker_panic(payload: Box<dyn std::any::Any + Send>) -> std::io::Error {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string worker panic payload");
+    std::io::Error::other(format!("HTTP fixture worker panicked: {message}"))
+}
 fn response(text: &str) -> String {
     format!("{}data: [DONE]\n\n", delta(text))
 }
 
-fn block_writes(path: &Path) {
-    Connection::open(path).unwrap().execute_batch("CREATE TRIGGER reject_attempt BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;").unwrap();
+fn block_writes(path: &Path) -> Result<(), TestError> {
+    Connection::open(path)?.execute_batch("CREATE TRIGGER reject_attempt BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;")?;
+    Ok(())
 }
-fn restore_writes(path: &Path) {
-    Connection::open(path)
-        .unwrap()
-        .execute_batch("DROP TRIGGER reject_attempt;")
-        .unwrap();
+fn restore_writes(path: &Path) -> Result<(), TestError> {
+    Connection::open(path)?.execute_batch("DROP TRIGGER reject_attempt;")?;
+    Ok(())
 }
-fn count(path: &Path, table: &str) -> i64 {
-    Connection::open(path)
-        .unwrap()
-        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+fn count(path: &Path, table: &str) -> Result<i64, TestError> {
+    Ok(
+        Connection::open(path)?.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
             row.get(0)
-        })
-        .unwrap()
+        })?,
+    )
 }
 
 #[test]
-fn toolbar_preferences_are_global_compatible_and_atomic() {
+fn toolbar_preferences_are_global_compatible_and_atomic() -> Result<(), TestError> {
     use lumakit_ai::chat::ToolbarTool::{Attachment, GenerateImage, NewConversation, WebSearch};
-    let root = Directory::new();
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = open(&path);
+    let mut session = open(&path)?;
     assert_eq!(session.toolbar(), &[NewConversation, WebSearch]);
     session.set_toolbar(vec![GenerateImage, Attachment, GenerateImage]);
     assert!(session.history().conversations.is_empty());
@@ -118,66 +135,84 @@ fn toolbar_preferences_are_global_compatible_and_atomic() {
     assert!(!session.composer().web_search && !session.composer().image_mode);
     session.new_conversation();
     session.set_draft("保留草稿".into());
-    let first = session.selected().unwrap().id.clone();
+    let first = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
     session.new_conversation();
     session.select_conversation(&first);
     assert_eq!(session.toolbar(), &[GenerateImage, Attachment]);
     drop(session);
-    let mut session = open(&path);
+    let mut session = open(&path)?;
     assert_eq!(session.toolbar(), &[GenerateImage, Attachment]);
-    assert_eq!(session.selected().unwrap().draft, "保留草稿");
-    let db = Connection::open(&path).unwrap();
-    db.execute_batch("CREATE TRIGGER reject_toolbar BEFORE UPDATE ON chat_meta WHEN NEW.key='composer' BEGIN SELECT RAISE(ABORT, 'injected toolbar failure'); END;").unwrap();
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "保留草稿"
+    );
+    let db = Connection::open(&path)?;
+    db.execute_batch("CREATE TRIGGER reject_toolbar BEFORE UPDATE ON chat_meta WHEN NEW.key='composer' BEGIN SELECT RAISE(ABORT, 'injected toolbar failure'); END;")?;
     session.set_toolbar(vec![]);
     assert!(session.save_failed());
     assert_eq!(session.toolbar(), &[GenerateImage, Attachment]);
-    db.execute_batch("DROP TRIGGER reject_toolbar;").unwrap();
+    db.execute_batch("DROP TRIGGER reject_toolbar;")?;
     session.retry_save();
     drop(session);
-    let mut composer: Value = serde_json::from_str(
-        &db.query_row::<String, _, _>(
-            "SELECT value FROM chat_meta WHERE key='composer'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    composer.as_object_mut().unwrap().remove("toolbar");
+    let mut composer: Value = serde_json::from_str(&db.query_row::<String, _, _>(
+        "SELECT value FROM chat_meta WHERE key='composer'",
+        [],
+        |row| row.get(0),
+    )?)?;
+    composer
+        .as_object_mut()
+        .ok_or("expected JSON object")?
+        .remove("toolbar");
     db.execute(
         "UPDATE chat_meta SET value=?1 WHERE key='composer'",
         [composer.to_string()],
-    )
-    .unwrap();
-    let session = open(&path);
+    )?;
+    let session = open(&path)?;
     assert_eq!(session.toolbar(), &[NewConversation, WebSearch]);
-    assert_eq!(session.selected().unwrap().draft, "保留草稿");
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "保留草稿"
+    );
     drop(session);
     composer["toolbar"] = json!(["FutureTool", "GenerateImage", "Attachment", "GenerateImage"]);
     db.execute(
         "UPDATE chat_meta SET value=?1 WHERE key='composer'",
         [composer.to_string()],
-    )
-    .unwrap();
-    let mut session = open(&path);
+    )?;
+    let mut session = open(&path)?;
     assert_eq!(session.toolbar(), &[GenerateImage, Attachment]);
-    assert_eq!(session.selected().unwrap().draft, "保留草稿");
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "保留草稿"
+    );
     session.set_toolbar(vec![]);
     drop(session);
-    assert!(open(&path).toolbar().is_empty());
+    assert!(open(&path)?.toolbar().is_empty());
+    Ok(())
 }
 
 // 真 HTTP 回环：读取宿主实际发送的正文，保持响应可覆盖停止和缺失结束帧。
-fn server(
-    responses: Vec<(String, bool)>,
-) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+fn server(responses: Vec<(String, bool)>) -> Result<TestServer, TestError> {
     server_path(responses, "/v1/chat/completions")
 }
 
 fn server_path(
     responses: Vec<(String, bool)>,
     path: &'static str,
-) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+) -> Result<TestServer, TestError> {
     server_steps(
         responses
             .into_iter()
@@ -188,12 +223,12 @@ fn server_path(
 
 fn server_steps(
     responses: Vec<(&'static str, u16, String, bool)>,
-) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let address = listener.local_addr().unwrap();
+) -> Result<TestServer, TestError> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
     let (tx, rx) = mpsc::channel();
-    let worker = thread::spawn(move || {
+    let worker = thread::spawn(move || -> Result<(), TestError> {
         for (path, status, body, hold) in responses {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
@@ -203,20 +238,16 @@ fn server_steps(
                         assert!(Instant::now() < deadline, "没有收到预期 HTTP 请求");
                         thread::sleep(Duration::from_millis(2));
                     }
-                    Err(error) => panic!("HTTP accept: {error}"),
+                    Err(error) => return Err(error.into()),
                 }
             };
-            socket.set_nonblocking(false).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            socket
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            socket.set_nonblocking(false)?;
+            socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(5)))?;
             let mut request = Vec::new();
             let (start, length) = loop {
                 let mut bytes = [0; 4096];
-                let count = socket.read(&mut bytes).unwrap();
+                let count = socket.read(&mut bytes)?;
                 assert_ne!(count, 0);
                 request.extend_from_slice(&bytes[..count]);
                 if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -232,20 +263,19 @@ fn server_steps(
                         .find_map(|line| {
                             let (name, value) = line.split_once(':')?;
                             name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().unwrap())
+                                .then(|| value.trim().parse::<usize>())
                         })
-                        .unwrap();
+                        .ok_or("missing content-length")??;
                     break (end + 4, length);
                 }
             };
             while request.len() < start + length {
                 let mut bytes = [0; 4096];
-                let count = socket.read(&mut bytes).unwrap();
+                let count = socket.read(&mut bytes)?;
                 assert_ne!(count, 0);
                 request.extend_from_slice(&bytes[..count]);
             }
-            tx.send(serde_json::from_slice(&request[start..start + length]).unwrap())
-                .unwrap();
+            tx.send(serde_json::from_slice(&request[start..start + length])?)?;
             let header = format!(
                 "HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len() + if hold { 100 } else { 0 }
@@ -258,39 +288,37 @@ fn server_steps(
                 let _ = socket.read(&mut byte);
             }
         }
+        Ok(())
     });
-    (format!("http://{address}/v1"), rx, worker)
+    Ok((format!("http://{address}/v1"), rx, worker))
 }
 
 #[test]
-fn composer_attachments_restart_retry_and_wire_controls() {
+fn composer_attachments_restart_retry_and_wire_controls() -> Result<(), TestError> {
     use lumakit_ai::{
         chat::ComposerSettings,
         model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort},
     };
-    let root = Directory::new();
+    let root = Directory::new()?;
     let path = root.path();
     let text = root.0.join("source.rs");
     let image = root.0.join("reference.png");
-    fs::write(&text, "fn attached() { /* 实际附件内容 */ }").unwrap();
-    fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-    let mut session = setup(&path);
+    fs::write(&text, "fn attached() { /* 实际附件内容 */ }")?;
+    fs::write(&image, b"\x89PNG\r\n\x1a\n")?;
+    let mut session = setup(&path)?;
     session.set_draft("比较附件".into());
-    session.add_attachment(&text).unwrap();
-    session.add_attachment(&image).unwrap();
+    session.add_attachment(&text)?;
+    session.add_attachment(&image)?;
     let attachment_id = session.draft_attachments()[1].id.clone();
     assert_eq!(
-        fs::read(session.media_path(&attachment_id).unwrap()).unwrap(),
+        fs::read(session.media_path(&attachment_id)?)?,
         b"\x89PNG\r\n\x1a\n"
     );
-    let metadata: String = Connection::open(&path)
-        .unwrap()
-        .query_row(
-            "SELECT value FROM chat_meta WHERE key='composer'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let metadata: String = Connection::open(&path)?.query_row(
+        "SELECT value FROM chat_meta WHERE key='composer'",
+        [],
+        |row| row.get(0),
+    )?;
     assert!(!metadata.contains("iVBORw0KGgo="));
     assert!(metadata.contains("storage_key"));
     session.set_composer(ComposerSettings {
@@ -298,19 +326,25 @@ fn composer_attachments_restart_retry_and_wire_controls() {
         ..Default::default()
     });
     drop(session);
-    fs::remove_file(text).unwrap();
-    fs::remove_file(image).unwrap();
-    let mut session = open(&path);
+    fs::remove_file(text)?;
+    fs::remove_file(image)?;
+    let mut session = open(&path)?;
     assert_eq!(session.draft_attachments().len(), 2);
-    assert_eq!(session.selected().unwrap().draft, "比较附件");
-    let media = session.media_path(&attachment_id).unwrap();
-    fs::write(&media, b"invalid!").unwrap();
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "比较附件"
+    );
+    let media = session.media_path(&attachment_id)?;
+    fs::write(&media, b"invalid!")?;
     assert!(session.media_path(&attachment_id).is_err());
-    fs::write(&media, b"\x89PNG\r\n\x1a\n").unwrap();
+    fs::write(&media, b"\x89PNG\r\n\x1a\n")?;
     let (url, requests, worker) = server(vec![
         (response("回答"), false),
         (response("重试回答"), false),
-    ]);
+    ])?;
     let connect = || {
         let mut c = connection(&url, "source");
         c.settings.supports_vision = true;
@@ -325,45 +359,60 @@ fn composer_attachments_restart_retry_and_wire_controls() {
     assert!(!session.busy());
     assert_eq!(session.draft_attachments().len(), 2);
     session.send(connect());
-    complete(&mut session);
-    let first = requests.recv().unwrap();
+    complete(&mut session)?;
+    let first = requests.recv()?;
     assert_eq!(first["reasoning_effort"], "high");
     assert!(
         first["messages"][0]["content"][0]["text"]
             .as_str()
-            .unwrap()
+            .ok_or("expected JSON string")?
             .contains("实际附件内容")
     );
     assert!(
         first["messages"][0]["content"][1]["image_url"]["url"]
             .as_str()
-            .unwrap()
+            .ok_or("expected JSON string")?
             .starts_with("data:image/png;base64,")
     );
-    let turn_id = session.selected().unwrap().turns[0].id.clone();
+    let turn_id = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .id
+        .clone();
     assert_eq!(session.turn_attachments(&turn_id).len(), 2);
-    assert!(session.media_path(&attachment_id).unwrap().is_file());
-    let copy = session
-        .copy_conversation(&session.selected().unwrap().id.clone())
-        .unwrap();
+    assert!(session.media_path(&attachment_id)?.is_file());
+    let copy = session.copy_conversation(
+        &session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .id
+            .clone(),
+    )?;
     assert_eq!(
         session
-            .turn_attachments(&session.selected().unwrap().turns[0].id)
+            .turn_attachments(
+                &session
+                    .selected()
+                    .ok_or("missing selected conversation")?
+                    .turns[0]
+                    .id
+            )
             .len(),
         2
     );
     session.delete_conversation(&copy);
     drop(session);
-    let mut session = open(&path);
+    let mut session = open(&path)?;
     session.set_composer(ComposerSettings::default());
     session.retry(connect());
-    complete(&mut session);
-    let retry = requests.recv().unwrap();
+    complete(&mut session)?;
+    let retry = requests.recv()?;
     assert_eq!(retry["messages"], first["messages"]);
     assert_eq!(retry["reasoning_effort"], "high");
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
 
-    let (url, requests, worker) = server_path(vec![("data: {\"type\":\"response.output_text.delta\",\"delta\":\"联网回答\"}\n\ndata: {\"type\":\"response.completed\"}\n\n".into(), false)], "/v1/responses");
+    let (url, requests, worker) = server_path(vec![("data: {\"type\":\"response.output_text.delta\",\"delta\":\"联网回答\"}\n\ndata: {\"type\":\"response.completed\"}\n\n".into(), false)], "/v1/responses")?;
     session.new_conversation();
     session.select_model(ModelRef {
         protocol: Protocol::OpenAiResponses,
@@ -377,9 +426,10 @@ fn composer_attachments_restart_retry_and_wire_controls() {
     let mut c = connection(&url, "search");
     c.protocol = Protocol::OpenAiResponses;
     session.send(c);
-    complete(&mut session);
-    assert_eq!(requests.recv().unwrap()["tools"][0]["type"], "web_search");
-    worker.join().unwrap();
+    complete(&mut session)?;
+    assert_eq!(requests.recv()?["tools"][0]["type"], "web_search");
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 fn painting_connection(url: &str, name: &str) -> AiConnection {
@@ -400,14 +450,14 @@ fn image_response() -> String {
 }
 
 #[test]
-fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
+fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() -> Result<(), TestError> {
     use lumakit_ai::{
         chat::ComposerSettings,
         model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort},
     };
-    let root = Directory::new();
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
+    let mut session = setup(&path)?;
     let (url, requests, worker) = server_steps(vec![
         ("/v1/chat/completions", 200, response("之前的回答"), false),
         (
@@ -430,11 +480,11 @@ fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/chat/completions", 200, response("重新生成完成"), false),
         ("/v1/chat/completions", 200, response("继续对话"), false),
-    ]);
+    ])?;
     session.set_draft("之前的问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    requests.recv().unwrap();
+    complete(&mut session)?;
+    requests.recv()?;
     session.set_composer(ComposerSettings {
         image_mode: true,
         image_model: Some(model("painting-original")),
@@ -442,7 +492,7 @@ fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
         ..Default::default()
     });
     session.set_draft("画一张图".into());
-    assert_eq!(session.request_model(false).unwrap().model, "source");
+    assert_eq!(session.request_model(false)?.model, "source");
     session.send(connection(&url, "source"));
     assert!(!session.busy());
     assert!(session.notice().contains("send_with_painting"));
@@ -456,10 +506,10 @@ fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
         c
     };
     session.send_with_painting(chat(), painting_connection(&url, "painting-original"));
-    complete(&mut session);
-    let first = requests.recv().unwrap();
-    let painted = requests.recv().unwrap();
-    let continuation = requests.recv().unwrap();
+    complete(&mut session)?;
+    let first = requests.recv()?;
+    let painted = requests.recv()?;
+    let continuation = requests.recv()?;
     assert_eq!(
         first["messages"],
         json!([{"role":"user","content":"之前的问题"},{"role":"assistant","content":"之前的回答"},{"role":"user","content":"画一张图"}])
@@ -475,10 +525,14 @@ fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
     assert!(
         continuation["messages"][4]["content"]
             .as_str()
-            .unwrap()
+            .ok_or("expected JSON string")?
             .contains("Generated 1 image(s).")
     );
-    let attempt = &session.selected().unwrap().turns[1].attempts[0];
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[1]
+        .attempts[0];
     assert_eq!(attempt.model.model, "source");
     assert_eq!(attempt.text, "已生成图片");
     assert_eq!(
@@ -488,60 +542,67 @@ fn painting_tool_chain_preserves_history_wire_and_restart_retry_sources() {
     assert!(!attempt.tool_events[0].is_error);
     assert_eq!(attempt.rounds.len(), 3);
     let id = attempt.generated[0].id.clone();
-    assert_eq!(
-        fs::read(session.media_path(&id).unwrap()).unwrap(),
-        b"\x89PNG\r\n\x1a\n"
-    );
+    assert_eq!(fs::read(session.media_path(&id)?)?, b"\x89PNG\r\n\x1a\n");
     drop(session);
-    let mut session = open(&path);
-    assert!(session.media_path(&id).unwrap().is_file());
+    let mut session = open(&path)?;
+    assert!(session.media_path(&id)?.is_file());
     session.select_model(model("different-chat"));
     session.set_composer(ComposerSettings {
         image_model: Some(model("different-painting")),
         ..Default::default()
     });
-    assert_eq!(session.request_model(true).unwrap().model, "source");
+    assert_eq!(session.request_model(true)?.model, "source");
     assert_eq!(
-        session.request_painting_model(true).unwrap().unwrap().model,
+        session
+            .request_painting_model(true)?
+            .ok_or("missing painting model")?
+            .model,
         "painting-original"
     );
     session.retry_with_painting(chat(), painting_connection(&url, "painting-original"));
-    complete(&mut session);
-    let retry = requests.recv().unwrap();
+    complete(&mut session)?;
+    let retry = requests.recv()?;
     assert_eq!(retry["messages"], first["messages"]);
     assert_eq!(retry["reasoning_effort"], "high");
-    assert_eq!(requests.recv().unwrap()["size"], "1024x1024");
-    requests.recv().unwrap();
+    assert_eq!(requests.recv()?["size"], "1024x1024");
+    requests.recv()?;
     session.set_draft("继续".into());
     session.send(connection(&url, "different-chat"));
-    complete(&mut session);
-    let next = requests.recv().unwrap();
+    complete(&mut session)?;
+    let next = requests.recv()?;
     assert_eq!(next["messages"][3]["content"], "重新生成完成");
-    assert!(session.media_path(&id).unwrap().is_file());
-    worker.join().unwrap();
+    assert!(session.media_path(&id)?.is_file());
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn attachment_limits_and_save_failure_preserve_draft() {
-    let root = Directory::new();
+fn attachment_limits_and_save_failure_preserve_draft() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let attachment = root.0.join("note.txt");
-    fs::write(&attachment, "正文").unwrap();
-    let mut session = setup(&path);
+    fs::write(&attachment, "正文")?;
+    let mut session = setup(&path)?;
     session.set_draft("草稿".into());
-    session.add_attachment(&attachment).unwrap();
-    fs::write(&attachment, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    session.add_attachment(&attachment)?;
+    fs::write(&attachment, vec![b'x'; 1024 * 1024 + 1])?;
     assert!(session.add_attachment(&attachment).is_err());
-    block_writes(&path);
+    block_writes(&path)?;
     session.send(connection("http://127.0.0.1:1/v1", "source"));
     assert!(session.save_failed());
     assert!(!session.busy());
-    assert_eq!(session.selected().unwrap().draft, "草稿");
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "草稿"
+    );
     assert_eq!(session.draft_attachments().len(), 1);
-    restore_writes(&path);
+    restore_writes(&path)?;
     session.retry_save();
     let original = session.composer().web_search;
-    Connection::open(&path).unwrap().execute_batch("CREATE TRIGGER reject_composer BEFORE UPDATE ON chat_meta WHEN NEW.key='composer' BEGIN SELECT RAISE(ABORT, 'injected composer failure'); END;").unwrap();
+    Connection::open(&path)?.execute_batch("CREATE TRIGGER reject_composer BEFORE UPDATE ON chat_meta WHEN NEW.key='composer' BEGIN SELECT RAISE(ABORT, 'injected composer failure'); END;")?;
     session.set_composer(lumakit_ai::chat::ComposerSettings {
         web_search: !original,
         ..Default::default()
@@ -549,10 +610,7 @@ fn attachment_limits_and_save_failure_preserve_draft() {
     assert!(session.save_failed());
     assert_eq!(session.composer().web_search, original);
     assert_eq!(session.draft_attachments().len(), 1);
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch("DROP TRIGGER reject_composer;")
-        .unwrap();
+    Connection::open(&path)?.execute_batch("DROP TRIGGER reject_composer;")?;
     session.retry_save();
     session.set_composer(lumakit_ai::chat::ComposerSettings {
         web_search: true,
@@ -562,13 +620,14 @@ fn attachment_limits_and_save_failure_preserve_draft() {
     assert!(!session.busy());
     assert!(session.notice().contains("不支持原生联网搜索"));
     assert_eq!(session.draft_attachments().len(), 1);
+    Ok(())
 }
 
 #[test]
-fn painting_invalid_failed_duplicate_and_cap_results_never_fake_success() {
+fn painting_invalid_failed_duplicate_and_cap_results_never_fake_success() -> Result<(), TestError> {
     use lumakit_ai::chat::ComposerSettings;
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     session.set_composer(ComposerSettings {
         image_mode: true,
         image_model: Some(model("image")),
@@ -606,24 +665,36 @@ fn painting_invalid_failed_duplicate_and_cap_results_never_fake_success() {
             response("生成失败，未产生图片"),
             false,
         ),
-    ]);
+    ])?;
     session.send_with_painting(
         connection(&url, "source"),
         painting_connection(&url, "image"),
     );
-    complete(&mut session);
-    let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
+    complete(&mut session)?;
+    let sent: Vec<_> = (0..4).map(|_| requests.recv()).collect::<Result<_, _>>()?;
     assert_eq!(sent[1]["prompt"], "画面");
-    let results = sent[2]["messages"].as_array().unwrap();
-    assert!(results[2]["content"].as_str().unwrap().contains("参数无效"));
-    assert!(results[3]["content"].as_str().unwrap().contains("HTTP 400"));
+    let results = sent[2]["messages"]
+        .as_array()
+        .ok_or("expected JSON array")?;
+    assert!(
+        results[2]["content"]
+            .as_str()
+            .ok_or("expected JSON string")?
+            .contains("参数无效")
+    );
     assert!(
         results[3]["content"]
             .as_str()
-            .unwrap()
+            .ok_or("expected JSON string")?
+            .contains("HTTP 400")
+    );
+    assert!(
+        results[3]["content"]
+            .as_str()
+            .ok_or("expected JSON string")?
             .contains("不要自动重试")
     );
-    let conversation = session.selected().unwrap();
+    let conversation = session.selected().ok_or("missing selected conversation")?;
     let attempt = &conversation.turns[0].attempts[0];
     assert_eq!(attempt.status, TurnStatus::Completed);
     assert!(attempt.generated.is_empty());
@@ -638,15 +709,16 @@ fn painting_invalid_failed_duplicate_and_cap_results_never_fake_success() {
         attempt.tool_events[2]
             .result
             .as_ref()
-            .unwrap()
+            .ok_or("missing expected value")?
             .contains("最多执行两次")
     );
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn old_v1_load_recovery_lock_and_draft_round_trip() {
-    let root = Directory::new();
+fn old_v1_load_recovery_lock_and_draft_round_trip() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let value = json!({"schemaVersion":1,"value":{
         "selected":"old-c","model":{"provider":"old-p","endpoint":"old-e","model":"old-m","protocol":"OpenAiChat"},
@@ -656,111 +728,171 @@ fn old_v1_load_recovery_lock_and_draft_round_trip() {
         }]}]}]
     }});
     let legacy = path.with_file_name("chat-history.json");
-    let bytes = serde_json::to_vec(&value).unwrap();
-    fs::write(&legacy, &bytes).unwrap();
-    let mut session = open(&path);
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    let bytes = serde_json::to_vec(&value)?;
+    fs::write(&legacy, &bytes)?;
+    let mut session = open(&path)?;
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.id, "old-a");
     assert_eq!(attempt.text, "中断内容");
     assert_eq!(attempt.status, TurnStatus::Failed);
-    assert!(session.selected().unwrap().draft.is_empty());
+    assert_eq!(attempt.trace_id, None);
+    assert!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft
+            .is_empty()
+    );
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
     session.set_draft("重启保留草稿".into());
     assert!(session.can_close());
     drop(session);
-    let session = open(&path);
-    assert_eq!(session.selected().unwrap().draft, "重启保留草稿");
-    assert_eq!(session.request_model(true).unwrap().model, "old-m");
-    assert_eq!(fs::read(legacy).unwrap(), bytes);
-    assert_eq!(count(&path, "attempts"), 1);
+    let session = open(&path)?;
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "重启保留草稿"
+    );
+    assert_eq!(session.request_model(true)?.model, "old-m");
+    assert_eq!(fs::read(legacy)?, bytes);
+    assert_eq!(count(&path, "attempts")?, 1);
+    Ok(())
 }
 
 #[test]
-fn unknown_versions_leave_original_bytes_untouched() {
+fn unknown_versions_leave_original_bytes_untouched() -> Result<(), TestError> {
     for version in [0, 2] {
-        let root = Directory::new();
+        let root = Directory::new()?;
         let path = root.path();
         let legacy = path.with_file_name("chat-history.json");
-        let bytes = serde_json::to_vec(&json!({"schemaVersion":version,"value":{"conversations":[],"selected":null,"model":null}})).unwrap();
-        fs::write(&legacy, &bytes).unwrap();
+        let bytes = serde_json::to_vec(
+            &json!({"schemaVersion":version,"value":{"conversations":[],"selected":null,"model":null}}),
+        )?;
+        fs::write(&legacy, &bytes)?;
         assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
-        assert_eq!(fs::read(&legacy).unwrap(), bytes);
-        assert_eq!(count(&path, "chat_meta"), 0);
+        assert_eq!(fs::read(&legacy)?, bytes);
+        assert_eq!(count(&path, "chat_meta")?, 0);
     }
+    Ok(())
 }
 
 #[test]
-fn preflight_save_failure_rolls_back_and_never_sends_or_duplicates() {
-    let root = Directory::new();
+fn preflight_save_failure_rolls_back_and_never_sends_or_duplicates() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
+    let mut session = setup(&path)?;
     session.set_draft("  原始问题\n ".into());
-    block_writes(&path);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
+    block_writes(&path)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
     session.send(connection(
-        &format!("http://{}/v1", listener.local_addr().unwrap()),
+        &format!("http://{}/v1", listener.local_addr()?),
         "source",
     ));
     assert!(session.save_failed());
     assert!(!session.busy());
     assert!(listener.accept().is_err());
-    let conversation = session.selected().unwrap();
+    let conversation = session.selected().ok_or("missing selected conversation")?;
     assert_eq!(conversation.title, "新对话");
     assert_eq!(conversation.draft, "  原始问题\n ");
     assert!(conversation.turns.is_empty());
     session.set_draft("不能覆盖".into());
     session.new_conversation();
     assert_eq!(session.history().conversations.len(), 1);
-    assert_eq!(session.selected().unwrap().draft, "  原始问题\n ");
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "  原始问题\n "
+    );
     assert!(!session.can_close());
-    assert_eq!(count(&path, "turns"), 0);
-    restore_writes(&path);
+    assert_eq!(count(&path, "turns")?, 0);
+    restore_writes(&path)?;
     session.retry_save();
     assert!(!session.save_failed());
-    let (url, requests, worker) = server(vec![(response("回答"), false)]);
+    let (url, requests, worker) = server(vec![(response("回答"), false)])?;
     session.send(connection(&url, "source"));
-    complete(&mut session);
+    complete(&mut session)?;
+    assert_eq!(requests.recv()?["messages"][0]["content"], "原始问题");
     assert_eq!(
-        requests.recv().unwrap()["messages"][0]["content"],
-        "原始问题"
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns
+            .len(),
+        1
     );
-    assert_eq!(session.selected().unwrap().turns.len(), 1);
-    assert_eq!(session.selected().unwrap().turns[0].attempts.len(), 1);
-    worker.join().unwrap();
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts
+            .len(),
+        1
+    );
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn source_retry_override_and_multi_turn_context_use_real_connections() {
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+fn source_retry_override_and_multi_turn_context_use_real_connections() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     let (url, requests, worker) = server(vec![
         (response("旧回答"), false),
         (response("源模型重答"), false),
         (response("换模型重答"), false),
         (response("下一轮"), false),
-    ]);
+    ])?;
     session.set_draft("第一问".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
+    complete(&mut session)?;
     session.select_model(model("override"));
-    assert_eq!(session.request_model(true).unwrap().model, "source");
+    assert_eq!(session.request_model(true)?.model, "source");
     session.retry(connection(&url, "override"));
     assert!(!session.busy());
-    assert_eq!(session.selected().unwrap().turns[0].attempts.len(), 1);
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts
+            .len(),
+        1
+    );
     session.retry(connection(&url, "source"));
-    complete(&mut session);
+    complete(&mut session)?;
     session.retry_with(connection(&url, "override"));
-    complete(&mut session);
+    complete(&mut session)?;
     session.set_draft("第二问".into());
     session.send(connection(&url, "override"));
-    complete(&mut session);
-    let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
+    complete(&mut session)?;
+    let sent: Vec<_> = (0..4).map(|_| requests.recv()).collect::<Result<_, _>>()?;
     assert_eq!(sent[0]["model"], "source");
     assert_eq!(sent[1]["model"], "source");
     assert_eq!(sent[2]["model"], "override");
-    assert_eq!(sent[1]["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(sent[2]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        sent[1]["messages"]
+            .as_array()
+            .ok_or("expected JSON array")?
+            .len(),
+        1
+    );
+    assert_eq!(
+        sent[2]["messages"]
+            .as_array()
+            .ok_or("expected JSON array")?
+            .len(),
+        1
+    );
     assert_eq!(
         sent[3]["messages"],
         json!([
@@ -769,27 +901,44 @@ fn source_retry_override_and_multi_turn_context_use_real_connections() {
             {"role":"user","content":"第二问"},
         ])
     );
-    assert_eq!(session.selected().unwrap().turns[0].attempts.len(), 3);
-    worker.join().unwrap();
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts
+            .len(),
+        3
+    );
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn terminal_save_failure_preserves_answer_and_guards_all_mutations() {
-    let root = Directory::new();
+fn terminal_save_failure_preserves_answer_and_guards_all_mutations() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
-    let (url, requests, worker) = server(vec![(response("完整终态内容"), false)]);
+    let mut session = setup(&path)?;
+    let (url, requests, worker) = server(vec![(response("完整终态内容"), false)])?;
     session.set_draft("问题".into());
     session.send(connection(&url, "source"));
-    requests.recv_timeout(Duration::from_secs(10)).unwrap();
-    block_writes(&path);
-    complete(&mut session);
+    requests.recv_timeout(Duration::from_secs(10))?;
+    block_writes(&path)?;
+    complete(&mut session)?;
     assert!(session.save_failed());
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Completed);
     assert_eq!(attempt.text, "完整终态内容");
-    let snapshot = serde_json::to_value(session.history()).unwrap();
-    let id = session.selected().unwrap().id.clone();
+    let snapshot = serde_json::to_value(session.history())?;
+    let id = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
     session.new_conversation();
     session.delete_conversation(&id);
     session.select_conversation(&id);
@@ -799,95 +948,128 @@ fn terminal_save_failure_preserves_answer_and_guards_all_mutations() {
     session.send(connection(&url, "source"));
     session.retry(connection(&url, "source"));
     session.retry_with(connection(&url, "source"));
-    assert_eq!(serde_json::to_value(session.history()).unwrap(), snapshot);
+    assert_eq!(serde_json::to_value(session.history())?, snapshot);
     assert!(session.notice().contains("保存失败"));
     assert!(!session.can_close());
-    restore_writes(&path);
+    restore_writes(&path)?;
     session.retry_save();
     assert!(!session.save_failed());
-    let database = Connection::open(&path).unwrap();
-    let (text, status): (String, String) = database
-        .query_row("SELECT text,status FROM attempts", [], |row| {
+    let database = Connection::open(&path)?;
+    let (text, status): (String, String) =
+        database.query_row("SELECT text,status FROM attempts", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
-        })
-        .unwrap();
+        })?;
     assert_eq!(text, "完整终态内容");
     assert_eq!(status, "completed");
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn cancelled_and_missing_terminal_attempts_do_not_enter_context() {
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+fn cancelled_and_missing_terminal_attempts_do_not_enter_context() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     let (url, requests, worker) = server(vec![
         (delta("取消前的部分内容"), true),
         (delta("缺少终止帧的内容"), false),
         (response("成功"), false),
-    ]);
+    ])?;
     session.set_draft("取消的问题".into());
     session.send(connection(&url, "source"));
     wait_until(&mut session, |s| {
-        !s.selected().unwrap().turns[0].attempts[0].text.is_empty()
-    });
-    let snapshot = serde_json::to_value(session.history()).unwrap();
+        Ok(
+            !s.selected().ok_or("missing selected conversation")?.turns[0].attempts[0]
+                .text
+                .is_empty(),
+        )
+    })?;
+    let snapshot = serde_json::to_value(session.history())?;
     session.set_draft("busy blocked".into());
     session.select_model(model("blocked"));
-    session.delete_conversation(&session.selected().unwrap().id.clone());
+    session.delete_conversation(
+        &session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .id
+            .clone(),
+    );
     session.new_conversation();
-    assert_eq!(serde_json::to_value(session.history()).unwrap(), snapshot);
+    assert_eq!(serde_json::to_value(session.history())?, snapshot);
     assert!(!session.can_close());
-    complete(&mut session);
+    complete(&mut session)?;
     assert_eq!(
-        session.selected().unwrap().turns[0].attempts[0].status,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0]
+            .status,
         TurnStatus::Cancelled
     );
     assert_eq!(
-        session.selected().unwrap().turns[0].attempts[0].text,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0]
+            .text,
         "取消前的部分内容"
     );
     session.set_draft("失败的问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
+    complete(&mut session)?;
     assert_eq!(
-        session.selected().unwrap().turns[1].attempts[0].status,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[1]
+            .attempts[0]
+            .status,
         TurnStatus::Failed
     );
     session.set_draft("新的问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
+    complete(&mut session)?;
     for _ in 0..3 {
-        let sent = requests.recv().unwrap();
-        assert_eq!(sent["messages"].as_array().unwrap().len(), 1);
+        let sent = requests.recv()?;
+        assert_eq!(
+            sent["messages"]
+                .as_array()
+                .ok_or("expected JSON array")?
+                .len(),
+            1
+        );
     }
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn failed_retry_save_rolls_back_attempt_without_touching_prior_answer() {
-    let root = Directory::new();
+fn failed_retry_save_rolls_back_attempt_without_touching_prior_answer() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
-    let (url, requests, worker) = server(vec![(response("保留的回答"), false)]);
+    let mut session = setup(&path)?;
+    let (url, requests, worker) = server(vec![(response("保留的回答"), false)])?;
     session.set_draft("问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    requests.recv().unwrap();
-    worker.join().unwrap();
+    complete(&mut session)?;
+    requests.recv()?;
+    worker.join().map_err(worker_panic)??;
     session.set_draft("还未发送的草稿".into());
-    let snapshot = serde_json::to_value(session.history()).unwrap();
-    block_writes(&path);
+    let snapshot = serde_json::to_value(session.history())?;
+    block_writes(&path)?;
     session.retry(connection(&url, "source"));
     assert!(session.save_failed());
     assert!(!session.busy());
-    assert_eq!(serde_json::to_value(session.history()).unwrap(), snapshot);
-    restore_writes(&path);
+    assert_eq!(serde_json::to_value(session.history())?, snapshot);
+    restore_writes(&path)?;
     session.retry_save();
+    Ok(())
 }
 
 #[test]
-fn drop_drains_a_full_bounded_queue_and_releases_lock() {
-    let root = Directory::new();
+fn drop_drains_a_full_bounded_queue_and_releases_lock() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let wakes = Arc::new(AtomicUsize::new(0));
     let wake_counter = wakes.clone();
@@ -896,88 +1078,132 @@ fn drop_drains_a_full_bounded_queue_and_releases_lock() {
         Arc::new(move || {
             wake_counter.fetch_add(1, Ordering::Relaxed);
         }),
-    )
-    .unwrap();
+    )?;
     session.new_conversation();
     session.select_model(model("source"));
-    let (url, requests, worker) = server(vec![(response(&"x".repeat(1024 * 1024)), false)]);
+    let (url, requests, worker) = server(vec![(response(&"x".repeat(1024 * 1024)), false)])?;
     session.set_draft("大回答".into());
     session.send(connection(&url, "source"));
-    requests.recv_timeout(Duration::from_secs(10)).unwrap();
+    requests.recv_timeout(Duration::from_secs(10))?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while wakes.load(Ordering::Relaxed) < 64 {
         assert!(Instant::now() < deadline, "worker 未填满队列");
         thread::sleep(Duration::from_millis(2));
     }
     drop(session);
-    worker.join().unwrap();
-    let reopened = open(&path);
-    let attempt = &reopened.selected().unwrap().turns[0].attempts[0];
+    worker.join().map_err(worker_panic)??;
+    let reopened = open(&path)?;
+    let attempt = &reopened
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_ne!(attempt.status, TurnStatus::Running);
     assert_eq!(attempt.text.len(), 1024 * 1024);
+    Ok(())
 }
 
 #[test]
-fn output_limit_preserves_prior_deltas_and_marks_failure() {
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+fn output_limit_preserves_prior_deltas_and_marks_failure() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     let body = format!("{}data: [DONE]\n\n", delta(&"界".repeat(4096)).repeat(86));
-    let (url, requests, worker) = server(vec![(body, false)]);
+    let (url, requests, worker) = server(vec![(body, false)])?;
     session.set_draft("输出边界".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    requests.recv().unwrap();
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    complete(&mut session)?;
+    requests.recv()?;
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Failed);
     assert!(!attempt.text.is_empty());
     assert!(attempt.text.len() <= 1024 * 1024);
-    assert!(attempt.error.as_ref().unwrap().contains("1 MiB"));
-    worker.join().unwrap();
+    assert!(
+        attempt
+            .error
+            .as_ref()
+            .ok_or("missing expected value")?
+            .contains("1 MiB")
+    );
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn mismatched_connection_never_accepts_a_turn() {
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+fn mismatched_connection_never_accepts_a_turn() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     session.set_draft("不应发送".into());
     let mut wrong_protocol = connection("http://127.0.0.1:1/v1", "source");
     wrong_protocol.protocol = Protocol::AnthropicMessages;
     session.send(wrong_protocol);
     assert!(!session.busy());
     assert!(!session.save_failed());
-    assert!(session.selected().unwrap().turns.is_empty());
-    assert_eq!(session.selected().unwrap().draft, "不应发送");
+    assert!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns
+            .is_empty()
+    );
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "不应发送"
+    );
     assert!(session.notice().contains("不匹配"));
+    Ok(())
 }
 
 #[test]
-fn empty_terminal_reply_fails_and_does_not_poison_next_context() {
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+fn empty_terminal_reply_fails_and_does_not_poison_next_context() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     let (url, requests, worker) = server(vec![
         (response(" \n"), false),
         (response("正常回答"), false),
-    ]);
+    ])?;
     session.set_draft("空回答的问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    complete(&mut session)?;
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Failed);
-    assert!(attempt.error.as_ref().unwrap().contains("空回答"));
+    assert!(
+        attempt
+            .error
+            .as_ref()
+            .ok_or("missing expected value")?
+            .contains("空回答")
+    );
     session.set_draft("继续提问".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    requests.recv().unwrap();
-    let second = requests.recv().unwrap();
+    complete(&mut session)?;
+    requests.recv()?;
+    let second = requests.recv()?;
     assert_eq!(
         second["messages"],
         json!([{"role":"user","content":"继续提问"}])
     );
     assert_eq!(
-        session.selected().unwrap().turns[1].attempts[0].status,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[1]
+            .attempts[0]
+            .status,
         TurnStatus::Completed
     );
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 fn legacy_history() -> Value {
@@ -994,13 +1220,13 @@ fn legacy_history() -> Value {
 }
 
 #[test]
-fn migration_preserves_order_and_empty_database_does_not_revive_backup() {
-    let root = Directory::new();
+fn migration_preserves_order_and_empty_database_does_not_revive_backup() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let legacy = path.with_file_name("chat-history.json");
-    let bytes = serde_json::to_vec(&legacy_history()).unwrap();
-    fs::write(&legacy, &bytes).unwrap();
-    let mut session = open(&path);
+    let bytes = serde_json::to_vec(&legacy_history())?;
+    fs::write(&legacy, &bytes)?;
+    let mut session = open(&path)?;
     assert_eq!(
         session
             .history()
@@ -1010,8 +1236,16 @@ fn migration_preserves_order_and_empty_database_does_not_revive_backup() {
             .collect::<Vec<_>>(),
         ["c2", "c1"]
     );
-    assert_eq!(session.history().model.as_ref().unwrap().model, "chosen");
-    let conversation = session.selected().unwrap();
+    assert_eq!(
+        session
+            .history()
+            .model
+            .as_ref()
+            .ok_or("missing expected value")?
+            .model,
+        "chosen"
+    );
+    let conversation = session.selected().ok_or("missing selected conversation")?;
     assert_eq!(
         conversation
             .turns
@@ -1029,100 +1263,95 @@ fn migration_preserves_order_and_empty_database_does_not_revive_backup() {
         ["a2", "a1"]
     );
     assert_eq!(conversation.turns[0].attempts[1].model.model, "other");
-    let database = Connection::open(&path).unwrap();
-    let rowid: i64 = database
-        .query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    database.execute_batch("CREATE TRIGGER no_reinsert BEFORE INSERT ON attempts WHEN NOT EXISTS(SELECT 1 FROM attempts WHERE id=NEW.id) BEGIN SELECT RAISE(ABORT,'unchanged answer was reinserted'); END;").unwrap();
+    let database = Connection::open(&path)?;
+    let rowid: i64 = database.query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| {
+        row.get(0)
+    })?;
+    database.execute_batch("CREATE TRIGGER no_reinsert BEFORE INSERT ON attempts WHEN NOT EXISTS(SELECT 1 FROM attempts WHERE id=NEW.id) BEGIN SELECT RAISE(ABORT,'unchanged answer was reinserted'); END;")?;
     session.set_draft("新草稿".into());
     assert!(session.can_close());
     assert_eq!(
-        database
-            .query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
+        database.query_row("SELECT rowid FROM attempts WHERE id='a2'", [], |row| row
+            .get::<_, i64>(0))?,
         rowid
     );
     session.delete_conversation("c2");
     session.delete_conversation("c1");
-    assert_eq!(count(&path, "attempts"), 0);
-    assert_eq!(count(&path, "turns"), 0);
+    assert_eq!(count(&path, "attempts")?, 0);
+    assert_eq!(count(&path, "turns")?, 0);
     drop(session);
     // 旧文件仍存在且损坏，也不能影响已完成迁移的空数据库。
-    assert_eq!(fs::read(&legacy).unwrap(), bytes);
-    fs::write(&legacy, b"not JSON").unwrap();
-    assert!(open(&path).history().conversations.is_empty());
+    assert_eq!(fs::read(&legacy)?, bytes);
+    fs::write(&legacy, b"not JSON")?;
+    assert!(open(&path)?.history().conversations.is_empty());
+    Ok(())
 }
 
 #[test]
-fn empty_first_open_records_import_decision() {
-    let root = Directory::new();
+fn empty_first_open_records_import_decision() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    drop(open(&path));
+    drop(open(&path)?);
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&legacy_history()).unwrap(),
-    )
-    .unwrap();
-    assert!(open(&path).history().conversations.is_empty());
+        serde_json::to_vec(&legacy_history())?,
+    )?;
+    assert!(open(&path)?.history().conversations.is_empty());
+    Ok(())
 }
 
 #[test]
-fn invalid_import_and_database_write_failure_leave_no_success_marker() {
-    let root = Directory::new();
+fn invalid_import_and_database_write_failure_leave_no_success_marker() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let legacy = path.with_file_name("chat-history.json");
     let mut invalid = legacy_history();
     invalid["value"]["conversations"][1]["id"] = json!("c2");
-    let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
-    fs::write(&legacy, &invalid_bytes).unwrap();
+    let invalid_bytes = serde_json::to_vec(&invalid)?;
+    fs::write(&legacy, &invalid_bytes)?;
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
-    assert_eq!(count(&path, "conversations"), 0);
-    assert_eq!(count(&path, "chat_meta"), 0);
-    assert_eq!(fs::read(&legacy).unwrap(), invalid_bytes);
-    let bytes = serde_json::to_vec(&legacy_history()).unwrap();
-    fs::write(&legacy, &bytes).unwrap();
-    block_writes(&path);
+    assert_eq!(count(&path, "conversations")?, 0);
+    assert_eq!(count(&path, "chat_meta")?, 0);
+    assert_eq!(fs::read(&legacy)?, invalid_bytes);
+    let bytes = serde_json::to_vec(&legacy_history())?;
+    fs::write(&legacy, &bytes)?;
+    block_writes(&path)?;
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
-    assert_eq!(count(&path, "conversations"), 0);
-    assert_eq!(count(&path, "turns"), 0);
-    assert_eq!(count(&path, "chat_meta"), 0);
-    assert_eq!(fs::read(&legacy).unwrap(), bytes);
-    restore_writes(&path);
-    assert_eq!(open(&path).history().conversations.len(), 2);
+    assert_eq!(count(&path, "conversations")?, 0);
+    assert_eq!(count(&path, "turns")?, 0);
+    assert_eq!(count(&path, "chat_meta")?, 0);
+    assert_eq!(fs::read(&legacy)?, bytes);
+    restore_writes(&path)?;
+    assert_eq!(open(&path)?.history().conversations.len(), 2);
+    Ok(())
 }
 
 #[test]
-fn corrupt_legacy_and_future_database_are_not_silently_replaced() {
-    let root = Directory::new();
+fn corrupt_legacy_and_future_database_are_not_silently_replaced() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let legacy = path.with_file_name("chat-history.json");
-    fs::write(&legacy, b"{broken").unwrap();
+    fs::write(&legacy, b"{broken")?;
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
-    assert_eq!(count(&path, "chat_meta"), 0);
-    let database = Connection::open(&path).unwrap();
-    database.execute_batch("PRAGMA user_version=3; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('保留');").unwrap();
+    assert_eq!(count(&path, "chat_meta")?, 0);
+    let database = Connection::open(&path)?;
+    database.execute_batch("PRAGMA user_version=3; CREATE TABLE future_data(value TEXT); INSERT INTO future_data VALUES('保留');")?;
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
     assert_eq!(
-        database
-            .query_row("SELECT value FROM future_data", [], |row| row
-                .get::<_, String>(0))
-            .unwrap(),
+        database.query_row("SELECT value FROM future_data", [], |row| row
+            .get::<_, String>(0))?,
         "保留"
     );
     assert_eq!(
-        database
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
+        database.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
         3
     );
+    Ok(())
 }
 
 #[test]
-fn usage_round_snapshots_survive_database_round_trip() {
-    let root = Directory::new();
+fn usage_round_snapshots_survive_database_round_trip() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let mut history = legacy_history();
     let rounds = json!([
@@ -1133,33 +1362,35 @@ fn usage_round_snapshots_survive_database_round_trip() {
     history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] = rounds.clone();
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&history).unwrap(),
-    )
-    .unwrap();
-    drop(open(&path));
-    let session = open(&path);
-    let stored = &session.selected().unwrap().turns[0].attempts[0].rounds;
+        serde_json::to_vec(&history)?,
+    )?;
+    drop(open(&path)?);
+    let session = open(&path)?;
+    let stored = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .rounds;
     for (index, round) in stored.iter().enumerate() {
         assert_eq!(
             round.usage,
-            serde_json::from_value(rounds[index]["usage"].clone()).unwrap()
+            serde_json::from_value(rounds[index]["usage"].clone())?
         );
         assert_eq!(
-            serde_json::to_value(&round.pricing).unwrap(),
+            serde_json::to_value(&round.pricing)?,
             rounds[index]["pricing"]
         );
-        assert_eq!(
-            serde_json::to_value(&round.cost).unwrap(),
-            rounds[index]["cost"]
-        );
+        assert_eq!(serde_json::to_value(round.cost)?, rounds[index]["cost"]);
         assert_eq!(round.request_id, format!("legacy:a2:{index}"));
         assert!(round.legacy);
         assert_eq!(round.started_at_ms, None);
     }
+    Ok(())
 }
 #[test]
-fn failed_attempt_preserves_prior_rounds_and_reopens_as_failed() {
-    let root = Directory::new();
+fn failed_attempt_preserves_prior_rounds_and_reopens_as_failed() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let mut history = legacy_history();
     history["value"]["conversations"][0]["turns"][0]["attempts"][0]["status"] = json!("running");
@@ -1167,18 +1398,28 @@ fn failed_attempt_preserves_prior_rounds_and_reopens_as_failed() {
         json!([{"usage":null,"pricing":null,"cost":null}]);
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&history).unwrap(),
-    )
-    .unwrap();
-    let session = open(&path);
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+        serde_json::to_vec(&history)?,
+    )?;
+    let session = open(&path)?;
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Failed);
     assert_eq!(attempt.rounds.len(), 1);
-    assert!(attempt.error.as_deref().unwrap().contains("中断"));
+    assert!(
+        attempt
+            .error
+            .as_deref()
+            .ok_or("missing expected text")?
+            .contains("中断")
+    );
+    Ok(())
 }
 
 #[test]
-fn invalid_import_identifiers_and_model_sources_never_commit() {
+fn invalid_import_identifiers_and_model_sources_never_commit() -> Result<(), TestError> {
     let changes = [
         ("/value/conversations/0/id", json!("  ")),
         ("/value/conversations/0/turns/0/id", json!("")),
@@ -1196,50 +1437,59 @@ fn invalid_import_identifiers_and_model_sources_never_commit() {
         ("/value/model/model", json!("")),
     ];
     for (pointer, value) in changes {
-        let root = Directory::new();
+        let root = Directory::new()?;
         let path = root.path();
         let legacy = path.with_file_name("chat-history.json");
         let mut history = legacy_history();
-        *history.pointer_mut(pointer).unwrap() = value;
-        let bytes = serde_json::to_vec(&history).unwrap();
-        fs::write(&legacy, &bytes).unwrap();
+        *history
+            .pointer_mut(pointer)
+            .ok_or("missing fixture pointer")? = value;
+        let bytes = serde_json::to_vec(&history)?;
+        fs::write(&legacy, &bytes)?;
         assert!(
             ChatSession::open(&path, Arc::new(|| {})).is_err(),
             "{pointer}"
         );
-        assert_eq!(count(&path, "chat_meta"), 0, "{pointer}");
-        assert_eq!(count(&path, "conversations"), 0, "{pointer}");
-        assert_eq!(count(&path, "turns"), 0, "{pointer}");
-        assert_eq!(count(&path, "attempts"), 0, "{pointer}");
-        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+        assert_eq!(count(&path, "chat_meta")?, 0, "{pointer}");
+        assert_eq!(count(&path, "conversations")?, 0, "{pointer}");
+        assert_eq!(count(&path, "turns")?, 0, "{pointer}");
+        assert_eq!(count(&path, "attempts")?, 0, "{pointer}");
+        assert_eq!(fs::read(&legacy)?, bytes);
     }
+    Ok(())
 }
 
 #[test]
-fn legacy_stale_selection_is_repaired_without_discarding_history() {
-    let root = Directory::new();
+fn legacy_stale_selection_is_repaired_without_discarding_history() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let mut history = legacy_history();
     history["value"]["selected"] = json!("removed");
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&history).unwrap(),
-    )
-    .unwrap();
-    let session = open(&path);
+        serde_json::to_vec(&history)?,
+    )?;
+    let session = open(&path)?;
     assert_eq!(session.history().conversations.len(), 2);
-    assert_eq!(session.selected().unwrap().id, "c2");
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .id,
+        "c2"
+    );
+    Ok(())
 }
 
 #[test]
-fn streamed_usage_and_original_price_survive_request_and_reopen() {
+fn streamed_usage_and_original_price_survive_request_and_reopen() -> Result<(), TestError> {
     use lumakit_ai::model_config::{ModelPricing, PriceTier};
-    let root = Directory::new();
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
+    let mut session = setup(&path)?;
     let usage = json!({"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":67}}});
     let body = format!("{}data: {usage}\n\ndata: [DONE]\n\n", delta("含用量回答"));
-    let (url, requests, worker) = server(vec![(body, false)]);
+    let (url, requests, worker) = server(vec![(body, false)])?;
     let mut connection = connection(&url, "source");
     let pricing = ModelPricing {
         currency: "CNY".into(),
@@ -1254,14 +1504,18 @@ fn streamed_usage_and_original_price_survive_request_and_reopen() {
     connection.settings.pricing = Some(pricing.clone());
     session.set_draft("用量问题".into());
     session.send(connection);
-    complete(&mut session);
-    requests.recv().unwrap();
-    worker.join().unwrap();
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    complete(&mut session)?;
+    requests.recv()?;
+    worker.join().map_err(worker_panic)??;
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Completed);
     assert_eq!(attempt.rounds.len(), 1);
     let round = &attempt.rounds[0];
-    let usage = round.usage.as_ref().unwrap();
+    let usage = round.usage.as_ref().ok_or("missing expected value")?;
     assert_eq!(
         (
             usage.input_tokens,
@@ -1273,28 +1527,51 @@ fn streamed_usage_and_original_price_survive_request_and_reopen() {
     );
     assert_eq!(round.pricing.as_ref(), Some(&pricing));
     assert_eq!(round.cost, pricing.cost(usage));
-    let saved = serde_json::to_value(&attempt.rounds).unwrap();
+    let saved = serde_json::to_value(&attempt.rounds)?;
     assert!(attempt.reasoning.is_empty());
     drop(session);
-    let reopened = open(&path);
+    let reopened = open(&path)?;
     assert_eq!(
-        serde_json::to_value(&reopened.selected().unwrap().turns[0].attempts[0].rounds).unwrap(),
+        serde_json::to_value(
+            &reopened
+                .selected()
+                .ok_or("missing selected conversation")?
+                .turns[0]
+                .attempts[0]
+                .rounds
+        )?,
         saved
     );
+    Ok(())
 }
 #[test]
-fn selected_attempt_and_candidate_mutations_survive_restart() {
-    let root = Directory::new();
+fn selected_attempt_and_candidate_mutations_survive_restart() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
-    let (url, _requests, worker) = server(vec![(response("首答"), false)]);
+    let mut session = setup(&path)?;
+    let (url, _requests, worker) = server(vec![(response("首答"), false)])?;
     session.set_draft("问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    let _ = worker.join();
-    let conversation = session.selected().unwrap().id.clone();
-    let turn = session.selected().unwrap().turns[0].id.clone();
-    let first = session.selected().unwrap().turns[0].attempts[0].id.clone();
+    complete(&mut session)?;
+    worker.join().map_err(worker_panic)??;
+    let conversation = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
+    let turn = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .id
+        .clone();
+    let first = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .id
+        .clone();
     assert!(session.select_attempt(&conversation, &turn, &first).is_ok());
     assert!(
         session
@@ -1307,162 +1584,216 @@ fn selected_attempt_and_candidate_mutations_survive_restart() {
             .is_err()
     );
     drop(session);
-    let reopened = open(&path);
+    let reopened = open(&path)?;
     assert_eq!(
-        reopened.selected().unwrap().turns[0]
+        reopened
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
             .selected_attempt
             .as_deref(),
         Some(first.as_str())
     );
     assert_eq!(
-        reopened.selected().unwrap().turns[0].attempts[0].text,
+        reopened
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0]
+            .text,
         "编辑后"
     );
+    Ok(())
 }
 #[test]
-fn search_sources_and_terminal_states_survive_restart() {
-    let root = Directory::new();
+fn search_sources_and_terminal_states_survive_restart() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
-    let (url, _requests, worker) = server(vec![(response("回答"), false)]);
+    let mut session = setup(&path)?;
+    let (url, _requests, worker) = server(vec![(response("回答"), false)])?;
     session.set_draft("问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    worker.join().unwrap();
-    let conversation = session.selected().unwrap().id.clone();
-    let turn = session.selected().unwrap().turns[0].id.clone();
-    let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
-    session
-        .search_start(&conversation, &turn, &attempt, "查询", "provider")
-        .unwrap();
-    session
-        .search_result(
-            &conversation,
-            &turn,
-            &attempt,
-            lumakit_ai::search::SearchResult {
-                query: "查询".into(),
-                provider: "provider".into(),
-                hits: vec![lumakit_ai::search::SearchHit {
-                    title: "来源".into(),
-                    url: "https://example.com/a".into(),
-                    snippet: "摘要".into(),
-                }],
-            },
-        )
-        .unwrap();
+    complete(&mut session)?;
+    worker.join().map_err(worker_panic)??;
+    let conversation = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
+    let turn = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .id
+        .clone();
+    let attempt = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .id
+        .clone();
+    session.search_start(&conversation, &turn, &attempt, "查询", "provider")?;
+    session.search_result(
+        &conversation,
+        &turn,
+        &attempt,
+        lumakit_ai::search::SearchResult {
+            query: "查询".into(),
+            provider: "provider".into(),
+            hits: vec![lumakit_ai::search::SearchHit {
+                title: "来源".into(),
+                url: "https://example.com/a".into(),
+                snippet: "摘要".into(),
+            }],
+        },
+    )?;
     drop(session);
-    let reopened = open(&path);
-    let saved = &reopened.selected().unwrap().turns[0].attempts[0];
+    let reopened = open(&path)?;
+    let saved = &reopened
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(saved.text, "回答");
     assert_eq!(
         saved.search.status,
         lumakit_ai::chat::SearchStatus::Complete
     );
     assert_eq!(saved.search.hits[0].url, "https://example.com/a");
+    Ok(())
 }
 #[test]
-fn tool_events_and_errors_survive_restart() {
-    let root = Directory::new();
+fn tool_events_and_errors_survive_restart() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
-    let (url, _requests, worker) = server(vec![(response("回答"), false)]);
+    let mut session = setup(&path)?;
+    let (url, _requests, worker) = server(vec![(response("回答"), false)])?;
     session.set_draft("问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    worker.join().unwrap();
-    let conversation = session.selected().unwrap().id.clone();
-    let turn = session.selected().unwrap().turns[0].id.clone();
-    let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
-    session
-        .tool_start(
-            &conversation,
-            &turn,
-            &attempt,
-            lumakit_ai::ToolCall {
-                id: "call-1".into(),
-                name: "lookup".into(),
-                arguments: json!({"q":"x"}),
-            },
-        )
-        .unwrap();
-    session
-        .tool_approval(
-            &conversation,
-            &turn,
-            &attempt,
-            "call-1",
-            lumakit_ai::Approval::Allow,
-        )
-        .unwrap();
-    session
-        .tool_error(&conversation, &turn, &attempt, "call-1", "上游失败")
-        .unwrap();
+    complete(&mut session)?;
+    worker.join().map_err(worker_panic)??;
+    let conversation = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
+    let turn = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .id
+        .clone();
+    let attempt = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .id
+        .clone();
+    session.tool_start(
+        &conversation,
+        &turn,
+        &attempt,
+        lumakit_ai::ToolCall {
+            id: "call-1".into(),
+            name: "lookup".into(),
+            arguments: json!({"q":"x"}),
+        },
+    )?;
+    session.tool_approval(
+        &conversation,
+        &turn,
+        &attempt,
+        "call-1",
+        lumakit_ai::Approval::Allow,
+    )?;
+    session.tool_error(&conversation, &turn, &attempt, "call-1", "上游失败")?;
     drop(session);
-    let reopened = open(&path);
-    let event = &reopened.selected().unwrap().turns[0].attempts[0].tool_events[0];
+    let reopened = open(&path)?;
+    let event = &reopened
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .tool_events[0];
     assert_eq!(event.approval, Some(lumakit_ai::Approval::Allow));
     assert_eq!(event.error.as_deref(), Some("上游失败"));
     assert!(event.is_error);
+    Ok(())
 }
 #[test]
-fn tool_result_state_is_not_answer_text() {
-    let root = Directory::new();
+fn tool_result_state_is_not_answer_text() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
-    let (url, _requests, worker) = server(vec![(response("回答"), false)]);
+    let mut session = setup(&path)?;
+    let (url, _requests, worker) = server(vec![(response("回答"), false)])?;
     session.set_draft("问题".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    worker.join().unwrap();
-    let conversation = session.selected().unwrap().id.clone();
-    let turn = session.selected().unwrap().turns[0].id.clone();
-    let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
-    session
-        .tool_start(
-            &conversation,
-            &turn,
-            &attempt,
-            lumakit_ai::ToolCall {
-                id: "call-2".into(),
-                name: "lookup".into(),
-                arguments: json!({}),
-            },
-        )
-        .unwrap();
-    session
-        .tool_approval(
-            &conversation,
-            &turn,
-            &attempt,
-            "call-2",
-            lumakit_ai::Approval::Allow,
-        )
-        .unwrap();
-    session
-        .tool_result(
-            &conversation,
-            &turn,
-            &attempt,
-            "call-2",
-            lumakit_ai::ToolOutput {
-                text: "结果".into(),
-                is_error: false,
-            },
-        )
-        .unwrap();
-    let saved = &session.selected().unwrap().turns[0].attempts[0];
+    complete(&mut session)?;
+    worker.join().map_err(worker_panic)??;
+    let conversation = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
+    let turn = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .id
+        .clone();
+    let attempt = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .id
+        .clone();
+    session.tool_start(
+        &conversation,
+        &turn,
+        &attempt,
+        lumakit_ai::ToolCall {
+            id: "call-2".into(),
+            name: "lookup".into(),
+            arguments: json!({}),
+        },
+    )?;
+    session.tool_approval(
+        &conversation,
+        &turn,
+        &attempt,
+        "call-2",
+        lumakit_ai::Approval::Allow,
+    )?;
+    session.tool_result(
+        &conversation,
+        &turn,
+        &attempt,
+        "call-2",
+        lumakit_ai::ToolOutput {
+            text: "结果".into(),
+            is_error: false,
+        },
+    )?;
+    let saved = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(saved.text, "回答");
     assert_eq!(saved.tool_events[0].result.as_deref(), Some("结果"));
     assert!(!saved.tool_events[0].is_error);
+    Ok(())
 }
 
 #[test]
-fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() {
+fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() -> Result<(), TestError> {
     use lumakit_ai::chat::ComposerSettings;
-    let root = Directory::new();
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
+    let mut session = setup(&path)?;
     session.set_composer(ComposerSettings {
         image_mode: true,
         image_model: Some(model("image")),
@@ -1479,43 +1810,59 @@ fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() {
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/chat/completions", 503, "最终文字失败".into(), false),
-    ]);
+    ])?;
     session.send_with_painting(
         connection(&url, "source"),
         painting_connection(&url, "image"),
     );
-    complete(&mut session);
-    let sent: Vec<_> = (0..4).map(|_| requests.recv().unwrap()).collect();
+    complete(&mut session)?;
+    let sent: Vec<_> = (0..4).map(|_| requests.recv()).collect::<Result<_, _>>()?;
     assert_eq!(sent[2]["size"], "1024x1536");
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Failed);
     assert_eq!(attempt.generated.len(), 2);
     assert!(!attempt.tool_events[0].is_error);
     assert!(!attempt.tool_events[1].is_error);
     assert!(attempt.tool_events[2].is_error);
-    assert!(attempt.error.as_ref().unwrap().contains("503"));
+    assert!(
+        attempt
+            .error
+            .as_ref()
+            .ok_or("missing expected value")?
+            .contains("503")
+    );
     let ids: Vec<_> = attempt
         .generated
         .iter()
         .map(|image| image.id.clone())
         .collect();
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
     drop(session);
-    let reopened = open(&path);
-    let saved = &reopened.selected().unwrap().turns[0].attempts[0];
+    let reopened = open(&path)?;
+    let saved = &reopened
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(saved.generated.len(), 2);
     assert_eq!(saved.tool_events.len(), 3);
     for id in ids {
-        assert!(reopened.media_path(&id).unwrap().is_file());
+        assert!(reopened.media_path(&id)?.is_file());
     }
+    Ok(())
 }
 
 #[test]
-fn painting_cancellation_during_image_or_continuation_preserves_completed_work() {
+fn painting_cancellation_during_image_or_continuation_preserves_completed_work()
+-> Result<(), TestError> {
     use lumakit_ai::chat::ComposerSettings;
     for during_image in [true, false] {
-        let root = Directory::new();
-        let mut session = setup(&root.path());
+        let root = Directory::new()?;
+        let mut session = setup(&root.path())?;
         session.set_composer(ComposerSettings {
             image_mode: true,
             image_model: Some(model("image")),
@@ -1534,36 +1881,51 @@ fn painting_cancellation_during_image_or_continuation_preserves_completed_work()
             steps.push(("/v1/images/generations", 200, image_response(), false));
             steps.push(("/v1/chat/completions", 200, delta("生成后的部分说明"), true));
         }
-        let (url, requests, worker) = server_steps(steps);
+        let (url, requests, worker) = server_steps(steps)?;
         session.send_with_painting(
             connection(&url, "source"),
             painting_connection(&url, "image"),
         );
-        requests.recv_timeout(Duration::from_secs(10)).unwrap();
-        requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        requests.recv_timeout(Duration::from_secs(10))?;
+        requests.recv_timeout(Duration::from_secs(10))?;
         if !during_image {
             wait_until(&mut session, |session| {
-                !session.selected().unwrap().turns[0].attempts[0]
+                Ok(!session
+                    .selected()
+                    .ok_or("missing selected conversation")?
+                    .turns[0]
+                    .attempts[0]
                     .text
-                    .is_empty()
-            });
+                    .is_empty())
+            })?;
         }
         session.cancel();
-        complete(&mut session);
-        let attempt = &session.selected().unwrap().turns[0].attempts[0];
+        complete(&mut session)?;
+        let attempt = &session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0];
         assert_eq!(attempt.status, TurnStatus::Cancelled);
         assert_eq!(attempt.generated.len(), usize::from(!during_image));
         assert_eq!(attempt.tool_events.len(), 1);
-        assert_eq!(session.selected().unwrap().draft, "可取消绘图");
-        worker.join().unwrap();
+        assert_eq!(
+            session
+                .selected()
+                .ok_or("missing selected conversation")?
+                .draft,
+            "可取消绘图"
+        );
+        worker.join().map_err(worker_panic)??;
     }
+    Ok(())
 }
 
 #[test]
-fn painting_insecure_result_is_error_tool_payload_without_retry() {
+fn painting_insecure_result_is_error_tool_payload_without_retry() -> Result<(), TestError> {
     use lumakit_ai::chat::ComposerSettings;
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     session.set_composer(ComposerSettings {
         image_mode: true,
         image_model: Some(model("image")),
@@ -1589,51 +1951,55 @@ fn painting_insecure_result_is_error_tool_payload_without_retry() {
             response("图片地址不安全，生成失败"),
             false,
         ),
-    ]);
+    ])?;
     session.send_with_painting(
         connection(&url, "source"),
         painting_connection(&url, "image"),
     );
-    complete(&mut session);
+    complete(&mut session)?;
     for _ in 0..3 {
-        requests.recv().unwrap();
+        requests.recv()?;
     }
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert!(attempt.generated.is_empty());
     assert!(attempt.tool_events[0].is_error);
     assert!(
         attempt.tool_events[0]
             .error
             .as_ref()
-            .unwrap()
+            .ok_or("missing expected value")?
             .contains("HTTPS")
     );
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn legacy_failed_direct_image_retry_explicitly_migrates_chat_source() {
-    let root = Directory::new();
+fn legacy_failed_direct_image_retry_explicitly_migrates_chat_source() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let legacy = json!({"schemaVersion":1,"value":{"selected":"legacy-c","model":model("source"),"conversations":[{"id":"legacy-c","title":"旧绘图","draft":"","turns":[{"id":"legacy-t","input":"原问题不能丢失","attempts":[{"id":"legacy-a","model":model("old-image"),"text":"","status":"failed","error":"原图片接口失败"}]}]}]}});
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&legacy).unwrap(),
-    )
-    .unwrap();
-    drop(open(&path));
+        serde_json::to_vec(&legacy)?,
+    )?;
+    drop(open(&path)?);
     let composer = json!({"drafts":{},"turns":{"legacy-t":{"settings":{"image_mode":true,"image_model":null,"web_search":false,"reasoning":null},"attachments":[]}}});
-    Connection::open(&path)
-        .unwrap()
-        .execute(
-            "INSERT OR REPLACE INTO chat_meta(key,value) VALUES('composer',?1)",
-            [composer.to_string()],
-        )
-        .unwrap();
-    let mut session = open(&path);
-    assert_eq!(session.request_model(true).unwrap().model, "old-image");
+    Connection::open(&path)?.execute(
+        "INSERT OR REPLACE INTO chat_meta(key,value) VALUES('composer',?1)",
+        [composer.to_string()],
+    )?;
+    let mut session = open(&path)?;
+    assert_eq!(session.request_model(true)?.model, "old-image");
     assert_eq!(
-        session.request_painting_model(true).unwrap().unwrap().model,
+        session
+            .request_painting_model(true)?
+            .ok_or("missing painting model")?
+            .model,
         "old-image"
     );
     let (url, requests, worker) = server_steps(vec![
@@ -1650,37 +2016,42 @@ fn legacy_failed_direct_image_retry_explicitly_migrates_chat_source() {
             response("迁移后生成成功"),
             false,
         ),
-    ]);
+    ])?;
     session.retry_with_model_and_painting(
         connection(&url, "source"),
         painting_connection(&url, "old-image"),
     );
-    complete(&mut session);
-    assert_eq!(
-        requests.recv().unwrap()["messages"][0]["content"],
-        "原问题不能丢失"
-    );
-    assert_eq!(requests.recv().unwrap()["model"], "old-image");
-    requests.recv().unwrap();
-    let attempts = &session.selected().unwrap().turns[0].attempts;
+    complete(&mut session)?;
+    assert_eq!(requests.recv()?["messages"][0]["content"], "原问题不能丢失");
+    assert_eq!(requests.recv()?["model"], "old-image");
+    requests.recv()?;
+    let attempts = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts;
     assert_eq!(attempts[0].model.model, "old-image");
     assert_eq!(attempts[1].model.model, "source");
     assert_eq!(attempts[1].status, TurnStatus::Completed);
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
     drop(session);
-    let session = open(&path);
-    assert_eq!(session.request_model(true).unwrap().model, "source");
+    let session = open(&path)?;
+    assert_eq!(session.request_model(true)?.model, "source");
     assert_eq!(
-        session.request_painting_model(true).unwrap().unwrap().model,
+        session
+            .request_painting_model(true)?
+            .ok_or("missing painting model")?
+            .model,
         "old-image"
     );
+    Ok(())
 }
 
 #[test]
-fn painting_declared_tool_incapability_rejects_before_network() {
+fn painting_declared_tool_incapability_rejects_before_network() -> Result<(), TestError> {
     use lumakit_ai::chat::ComposerSettings;
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     session.set_composer(ComposerSettings {
         image_mode: true,
         image_model: Some(model("image")),
@@ -1692,21 +2063,34 @@ fn painting_declared_tool_incapability_rejects_before_network() {
     session.send_with_painting(chat, painting_connection("http://127.0.0.1:1/v1", "image"));
     assert!(!session.busy());
     assert!(session.notice().contains("不支持工具"));
-    assert!(session.selected().unwrap().turns.is_empty());
-    assert_eq!(session.selected().unwrap().draft, "不支持工具");
+    assert!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns
+            .is_empty()
+    );
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "不支持工具"
+    );
+    Ok(())
 }
 
 #[test]
-fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
+fn painting_responses_continuation_keeps_vision_web_and_reasoning() -> Result<(), TestError> {
     use lumakit_ai::{
         chat::ComposerSettings,
         model_config::{ReasoningConfig, ReasoningDialect, ReasoningEffort},
     };
-    let root = Directory::new();
-    let mut session = setup(&root.path());
+    let root = Directory::new()?;
+    let mut session = setup(&root.path())?;
     let image = root.0.join("input.png");
-    fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-    session.add_attachment(&image).unwrap();
+    fs::write(&image, b"\x89PNG\r\n\x1a\n")?;
+    session.add_attachment(&image)?;
     session.select_model(ModelRef {
         protocol: Protocol::OpenAiResponses,
         ..model("source")
@@ -1725,7 +2109,7 @@ fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
         ("/v1/responses", 200, first, false),
         ("/v1/images/generations", 200, image_response(), false),
         ("/v1/responses", 200, final_response, false),
-    ]);
+    ])?;
     let mut chat = connection(&url, "source");
     chat.protocol = Protocol::OpenAiResponses;
     chat.settings.supports_streaming = false;
@@ -1736,10 +2120,10 @@ fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
         budget_tokens: None,
     });
     session.send_with_painting(chat, painting_connection(&url, "image"));
-    complete(&mut session);
-    let initial = requests.recv().unwrap();
-    requests.recv().unwrap();
-    let continuation = requests.recv().unwrap();
+    complete(&mut session)?;
+    let initial = requests.recv()?;
+    requests.recv()?;
+    let continuation = requests.recv()?;
     assert_eq!(initial["input"][0]["content"][1]["type"], "input_image");
     for body in [&initial, &continuation] {
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -1749,62 +2133,82 @@ fn painting_responses_continuation_keeps_vision_web_and_reasoning() {
     assert_eq!(continuation["input"][0], initial["input"][0]);
     assert_eq!(continuation["input"][1], reasoning);
     assert_eq!(continuation["input"][3]["type"], "function_call_output");
-    let attempt = &session.selected().unwrap().turns[0].attempts[0];
+    let attempt = &session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0];
     assert_eq!(attempt.status, TurnStatus::Completed);
     assert_eq!(attempt.reasoning, vec![reasoning]);
     assert_eq!(attempt.generated.len(), 1);
-    worker.join().unwrap();
+    worker.join().map_err(worker_panic)??;
+    Ok(())
 }
 
 #[test]
-fn context_anchor_tracks_tail_and_invalidates_changed_history_model_and_tools() {
-    let root = Directory::new();
+fn context_anchor_tracks_tail_and_invalidates_changed_history_model_and_tools()
+-> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    let mut session = setup(&path);
+    let mut session = setup(&path)?;
     let usage = json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":2}});
     let body = format!("{}data: {usage}\n\ndata: [DONE]\n\n", delta("ok"));
-    let (url, requests, worker) = server(vec![(body, false)]);
+    let (url, requests, worker) = server(vec![(body, false)])?;
     session.set_draft("q".into());
     session.send(connection(&url, "source"));
-    complete(&mut session);
-    requests.recv().unwrap();
-    worker.join().unwrap();
+    complete(&mut session)?;
+    requests.recv()?;
+    worker.join().map_err(worker_panic)??;
     let settings = lumakit_ai::model_config::ModelSettings {
         context_window: Some(1000),
         ..Default::default()
     };
-    let context = session.context_usage(&settings).unwrap();
+    let context = session.context_usage(&settings)?;
     assert!(context.anchored);
     assert_eq!(context.tokens, 140); // Reported input plus the newly retained assistant reply.
     session.set_draft("next".into());
-    assert_eq!(session.context_usage(&settings).unwrap().tokens, 188);
-    let conversation = session.selected().unwrap().id.clone();
-    let turn = session.selected().unwrap().turns[0].id.clone();
-    let attempt = session.selected().unwrap().turns[0].attempts[0].id.clone();
+    assert_eq!(session.context_usage(&settings)?.tokens, 188);
+    let conversation = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
+    let turn = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .id
+        .clone();
+    let attempt = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .turns[0]
+        .attempts[0]
+        .id
+        .clone();
     drop(session);
-    let mut session = open(&path);
-    assert!(session.context_usage(&settings).unwrap().anchored);
+    let mut session = open(&path)?;
+    assert!(session.context_usage(&settings)?.anchored);
     session.select_model(model("other"));
-    assert!(!session.context_usage(&settings).unwrap().anchored);
+    assert!(!session.context_usage(&settings)?.anchored);
     session.select_model(model("source"));
     let mut composer = session.composer().clone();
     composer.image_mode = true;
     session.set_composer(composer);
-    assert!(!session.context_usage(&settings).unwrap().anchored);
+    assert!(!session.context_usage(&settings)?.anchored);
     let mut composer = session.composer().clone();
     composer.image_mode = false;
     session.set_composer(composer);
-    session
-        .edit_attempt(&conversation, &turn, &attempt, "ok", "edited")
-        .unwrap();
+    session.edit_attempt(&conversation, &turn, &attempt, "ok", "edited")?;
     // Editing the anchor's own output is a changed tail, not a changed provider input prefix.
-    assert_eq!(session.context_usage(&settings).unwrap().tokens, 204);
-    assert!(session.context_usage(&settings).unwrap().anchored);
+    assert_eq!(session.context_usage(&settings)?.tokens, 204);
+    assert!(session.context_usage(&settings)?.anchored);
+    Ok(())
 }
 
 #[test]
-fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() {
-    let root = Directory::new();
+fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
     let mut history = legacy_history();
     let first = json!({"request_id":"request-one","started_at_ms":86400000,"duration_ms":7,"model":model("actual"),"cost_source":"estimate",
@@ -1819,11 +2223,10 @@ fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() {
     ]);
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&history).unwrap(),
-    )
-    .unwrap();
-    let mut session = open(&path);
-    let original = session.usage_report(Some("c2"), None).unwrap();
+        serde_json::to_vec(&history)?,
+    )?;
+    let mut session = open(&path)?;
+    let original = session.usage_report(Some("c2"), None)?;
     assert_eq!(
         (
             original.total.requests,
@@ -1865,10 +2268,10 @@ fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() {
             .iter()
             .any(|group| group.label.contains("actual"))
     );
-    let copy = session.copy_conversation("c2").unwrap();
-    assert_eq!(session.usage_report(Some(&copy), None).unwrap(), original);
-    assert_eq!(session.usage_report(None, None).unwrap(), original);
-    let filtered = session.usage_report(None, Some(172800000)).unwrap();
+    let copy = session.copy_conversation("c2")?;
+    assert_eq!(session.usage_report(Some(&copy), None)?, original);
+    assert_eq!(session.usage_report(None, None)?, original);
+    let filtered = session.usage_report(None, Some(172800000))?;
     assert_eq!(
         (
             filtered.total.requests,
@@ -1884,26 +2287,27 @@ fn usage_ledger_deduplicates_copies_and_survives_deleted_conversations() {
         (1, 1)
     );
     assert_eq!(
-        session.usage_report(Some(&copy), Some(172800000)).unwrap(),
+        session.usage_report(Some(&copy), Some(172800000))?,
         filtered
     );
     session.delete_conversation("c2");
     session.delete_conversation(&copy);
     session.delete_conversation("c1");
-    assert_eq!(count(&path, "usage_requests"), 3);
-    assert_eq!(count(&path, "attempts"), 0);
+    assert_eq!(count(&path, "usage_requests")?, 3);
+    assert_eq!(count(&path, "attempts")?, 0);
     drop(session);
-    let reopened = open(&path);
-    assert_eq!(reopened.usage_report(None, None).unwrap(), original);
+    let reopened = open(&path)?;
+    assert_eq!(reopened.usage_report(None, None)?, original);
     assert!(reopened.usage_report(Some("c2"), None).is_err());
+    Ok(())
 }
 
 #[test]
-fn usage_ledger_import_rolls_back_with_history_and_keeps_unknown_costs() {
-    let root = Directory::new();
+fn usage_ledger_import_rolls_back_with_history_and_keeps_unknown_costs() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path();
-    drop(open(&path));
-    Connection::open(&path).unwrap().execute_batch("DELETE FROM chat_meta; CREATE TRIGGER reject_attempt BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;").unwrap();
+    drop(open(&path)?);
+    Connection::open(&path)?.execute_batch("DELETE FROM chat_meta; CREATE TRIGGER reject_attempt BEFORE INSERT ON attempts BEGIN SELECT RAISE(ABORT, 'injected disk failure'); END;")?;
     let mut history = legacy_history();
     history["value"]["conversations"][0]["turns"][0]["attempts"][0]["rounds"] = json!([
         {"usage":null,"pricing":null,"cost":null},
@@ -1911,14 +2315,13 @@ fn usage_ledger_import_rolls_back_with_history_and_keeps_unknown_costs() {
     ]);
     fs::write(
         path.with_file_name("chat-history.json"),
-        serde_json::to_vec(&history).unwrap(),
-    )
-    .unwrap();
+        serde_json::to_vec(&history)?,
+    )?;
     assert!(ChatSession::open(&path, Arc::new(|| {})).is_err());
-    assert_eq!(count(&path, "usage_requests"), 0);
-    restore_writes(&path);
-    let session = open(&path);
-    let report = session.usage_report(None, None).unwrap();
+    assert_eq!(count(&path, "usage_requests")?, 0);
+    restore_writes(&path)?;
+    let session = open(&path)?;
+    let report = session.usage_report(None, None)?;
     assert_eq!(
         (
             report.total.requests,
@@ -1929,8 +2332,137 @@ fn usage_ledger_import_rolls_back_with_history_and_keeps_unknown_costs() {
     );
     assert!(report.total.costs.is_empty());
     assert_eq!((report.undated_requests, report.legacy_requests), (2, 2));
+    assert_eq!(session.usage_report(None, Some(0))?.total.requests, 0);
+    Ok(())
+}
+
+#[test]
+fn failed_requests_retries_and_translations_keep_their_own_trace_after_restart()
+-> Result<(), TestError> {
+    let root = Directory::new()?;
+    let path = root.path();
+    let mut session = setup(&path)?;
+    let (url, requests, worker) = server_steps(vec![
+        (
+            "/v1/chat/completions",
+            429,
+            "upstream failure".into(),
+            false,
+        ),
+        ("/v1/chat/completions", 503, "retry failure".into(), false),
+        (
+            "/v1/chat/completions",
+            200,
+            response("source answer"),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            429,
+            "translation failure".into(),
+            false,
+        ),
+    ])?;
+    session.set_draft("trace regression".into());
+    session.send(connection(&url, "source"));
+    complete(&mut session)?;
+    session.retry(connection(&url, "source"));
+    complete(&mut session)?;
+    session.retry(connection(&url, "source"));
+    complete(&mut session)?;
+    let conversation = session.selected().ok_or("missing conversation")?;
+    let ci = conversation.id.clone();
+    let ti = conversation.turns[0].id.clone();
+    let ai = conversation.turns[0].attempts[2].id.clone();
+    session.translate(&ci, &ti, &ai, "English", connection(&url, "source"))?;
+    complete(&mut session)?;
+    for _ in 0..4 {
+        requests.recv()?;
+    }
+    worker.join().map_err(worker_panic)??;
+    let attempts = &session.selected().ok_or("missing conversation")?.turns[0].attempts;
     assert_eq!(
-        session.usage_report(None, Some(0)).unwrap().total.requests,
-        0
+        attempts.iter().map(|a| a.status).collect::<Vec<_>>(),
+        [
+            TurnStatus::Failed,
+            TurnStatus::Failed,
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+        ]
     );
+    let ids = attempts
+        .iter()
+        .map(|attempt| {
+            attempt
+                .trace_id
+                .clone()
+                .ok_or("missing actual request trace")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for id in &ids {
+        assert_eq!(id.len(), 32);
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        4
+    );
+    drop(session);
+    let reopened = open(&path)?;
+    assert_eq!(
+        reopened
+            .selected()
+            .ok_or("missing reopened conversation")?
+            .turns[0]
+            .attempts
+            .iter()
+            .map(|a| a.trace_id.clone())
+            .collect::<Vec<_>>(),
+        ids.into_iter().map(Some).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_five_attempts_migrate_without_inventing_a_trace() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let path = root.path();
+    fs::write(
+        path.with_file_name("chat-history.json"),
+        serde_json::to_vec(&legacy_history())?,
+    )?;
+    drop(open(&path)?);
+    let db = Connection::open(&path)?;
+    // Restore the actual v5 shape while keeping the prior rows and import marker.
+    db.execute_batch("ALTER TABLE attempts DROP COLUMN trace_id; PRAGMA user_version=5;")?;
+    let before: (String, String) = db.query_row(
+        "SELECT text,status FROM attempts WHERE id='a2'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    drop(db);
+    let reopened = open(&path)?;
+    let attempts = &reopened
+        .selected()
+        .ok_or("missing migrated conversation")?
+        .turns[0]
+        .attempts;
+    assert_eq!(attempts[0].text, before.0);
+    assert_eq!(attempts[0].status, TurnStatus::Completed);
+    assert_eq!(before.1, "completed");
+    assert!(attempts.iter().all(|attempt| attempt.trace_id.is_none()));
+    let db = Connection::open(&path)?;
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+        6
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM attempts", [], |row| row
+            .get::<_, u32>(0))?,
+        2
+    );
+    Ok(())
 }

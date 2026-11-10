@@ -1,18 +1,29 @@
 //! Chat menus, answer editor and viewport-constrained anchored surfaces.
 use super::*;
 
+pub(super) struct OverlayContext<'a> {
+    pub session: &'a ChatSession,
+    pub options: &'a [ModelOption],
+    pub image_options: &'a [ModelOption],
+    pub settings: Option<&'a ModelSettings>,
+    pub can_image: bool,
+}
+
 impl ChatPanel {
     pub(super) fn render_overlay(
         &mut self,
         layer: Overlay,
-        session: &ChatSession,
-        options: &[ModelOption],
-        image_options: &[ModelOption],
-        settings: Option<&ModelSettings>,
-        can_image: bool,
+        context: OverlayContext<'_>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let OverlayContext {
+            session,
+            options,
+            image_options,
+            settings,
+            can_image,
+        } = context;
         let r = LumaTheme::global(cx).roles;
         let mut content = col().gap(space::S8);
         let menu = !matches!(layer, Overlay::Edit);

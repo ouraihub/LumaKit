@@ -219,6 +219,18 @@ impl Picker {
                     .child(self.data.notice.clone()),
             );
         }
+        if let Some(id) = self.diagnostic_id.clone() {
+            surface = surface.child(
+                Button::new("picker-copy-diagnostic")
+                    .link()
+                    .small()
+                    .label("复制诊断 ID")
+                    .accessibility_label(format!("复制目录刷新诊断 ID {id}"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
+                    }),
+            );
+        }
         surface
             .child(self.footer(current.as_ref(), cx))
             .into_any_element()

@@ -147,12 +147,12 @@ impl ChatSession {
     }
 
     pub(super) fn remember_conversation_model(&mut self) {
-        if let (Some(id), Some(model)) = (&self.history.selected, &self.history.model) {
-            if self.composer_data.conversation_models.get(id) != Some(model) {
-                self.composer_data
-                    .conversation_models
-                    .insert(id.clone(), model.clone());
-            }
+        if let (Some(id), Some(model)) = (&self.history.selected, &self.history.model)
+            && self.composer_data.conversation_models.get(id) != Some(model)
+        {
+            self.composer_data
+                .conversation_models
+                .insert(id.clone(), model.clone());
         }
     }
 

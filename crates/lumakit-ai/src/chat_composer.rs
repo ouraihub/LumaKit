@@ -169,6 +169,9 @@ impl ChatSession {
             .map_or(&[], |turn| turn.attachments.as_slice())
     }
     /// 有界读取 UTF-8 文本或 PNG/JPEG/WebP/GIF；不截断超限文件。
+    ///
+    /// # Errors
+    /// Returns invalid or oversized attachments, media I/O, busy session or persistence errors.
     pub fn add_attachment(&mut self, path: &Path) -> Result<(), String> {
         if !self.mutable() {
             return Err("当前聊天不可修改。".into());
@@ -336,6 +339,9 @@ impl ChatSession {
         &self.media_root
     }
     /// 只允许打开历史已登记且位于受控目录内的媒体。
+    ///
+    /// # Errors
+    /// Returns unknown, invalid or unavailable media instead of opening an arbitrary path.
     pub fn media_path(&self, id: &str) -> Result<PathBuf, String> {
         let image = self
             .history

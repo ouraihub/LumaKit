@@ -13,10 +13,10 @@ impl PickerState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<ChatPanel>) -> (Self, Subscription) {
         let view = cx.new(|cx| Picker::new(window, cx));
         let subscription = cx.subscribe(&view, |this, _, event, cx| {
-            if this.unlocked {
-                if let Some(action) = this.picker.action(event) {
-                    this.emit(action, cx);
-                }
+            if this.unlocked
+                && let Some(action) = this.picker.action(event)
+            {
+                this.emit(action, cx);
             }
         });
         (
@@ -51,9 +51,18 @@ impl PickerState {
 
 impl ChatPanel {
     /// Reports the host's actual catalog refresh, including failures.
-    pub fn set_model_refresh_state(&mut self, refreshing: bool, notice: String) {
+    pub fn set_model_refresh_state(
+        &mut self,
+        refreshing: bool,
+        notice: String,
+        diagnostic_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.picker.refreshing = refreshing;
         self.picker.notice = notice;
+        self.picker
+            .view
+            .update(cx, |picker, cx| picker.set_diagnostic_id(diagnostic_id, cx));
     }
 
     pub(super) fn model_pill(
@@ -197,13 +206,13 @@ fn model_detail(option: &ModelOption) -> String {
     if option.name != option.model.model {
         parts.push(option.model.model.clone());
     }
-    if let Some(price) = &option.settings.pricing {
-        if let Some(tier) = price.tiers.first() {
-            parts.push(format!(
-                "{} {} / {} 每百万 token 起",
-                price.currency, tier.input, tier.output
-            ));
-        }
+    if let Some(price) = &option.settings.pricing
+        && let Some(tier) = price.tiers.first()
+    {
+        parts.push(format!(
+            "{} {} / {} 每百万 token 起",
+            price.currency, tier.input, tier.output
+        ));
     }
     if let Some(context) = option.settings.context_window {
         parts.push(if context >= 1_000_000 {

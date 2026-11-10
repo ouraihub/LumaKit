@@ -32,7 +32,7 @@ UI 动作 / 命令 / AI 请求 / 工具调用 / 后台任务     ← 关键入�
 | 文件日志、轮转、级别持久化与热切换、读尾部 | `LogHandle`、`LogLevel`、`LogStatus`、`LogError` |
 | TraceId 与操作生命周期 | `TraceContext`、`OperationGuard`、`operation` |
 | 脱敏与摘要 | `redact_secret`、`redact_url`、`bounded_text`、`diagnostic_hash` |
-| grep 文本格式 | 由 `LogHandle::init` 内部安装，无公开 API |
+| grep 文本格式与解析 | `SpanFields`、`GrepFormat<T>`、`parse_line`；`LogHandle::init` 默认安装 UTC 格式 |
 
 产品（LumaDesk、ThinkRail Native）负责：配置持久化、日志设置页与查看页、领域错误类型、用户文案、业务字段（`conversation_id`、`chat_id`、`workspace_id` 等）。
 
@@ -61,7 +61,7 @@ pub enum LogLevel { Error, Warn, Info, Debug, Trace }
 每个事件一行：
 
 ```text
-<UTC RFC3339 时间> <级别> TraceId:<id>|SpanId:<n>|ParentSpanId:<n|->|Layer:<layer>|ME:<operation>|[Target:<module>]|[业务 span 字段]|EV:<event>|RT:<ms>|Result:<result>|Error:<code>|Reason:<reason>|Limit:<ms>|[事件字段]|Msg:<message>
+<UTC RFC3339 时间> <级别> TraceId:<id>|SpanId:<n>|ParentSpanId:<n|->|Layer:<layer>|ME:<operation>|[SourceFile:<module path>]|[SourceLine:<line>]|[Target:<module>]|[业务 span 字段]|EV:<event>|RT:<ms>|Result:<result>|Error:<code>|Reason:<reason>|Limit:<ms>|[事件字段]|Msg:<message>
 ```
 
 实际输出（LumaDesk 实窗，回环服务返回 HTTP 429，`Debug` 级别；业务字段已省略）：
@@ -90,10 +90,12 @@ pub enum LogLevel { Error, Warn, Info, Debug, Trace }
 | 公开项 | 用途 |
 |---|---|
 | `SpanFields` | `tracing_subscriber::Layer`，保存 span 字段，供格式器取 TraceId、Layer、ME 与业务字段 |
-| `GrepFormat<T>` | `FormatEvent`，按本节契约写一行 |
-| `parse_line(&str) -> LogLine` | 按同一契约解析一行：时间、级别、TraceId、Layer、ME、EV、RT、Target、Msg；不符合格式的行原样放进 `message` 与 `raw`，不臆造字段 |
+| `parse_line(&str) -> LogLine` | 按同一契约解析一行：时间、级别、TraceId、Layer、ME、EV、RT、SourceFile、SourceLine、Target、Msg；不符合格式的行原样放进 `message` 与 `raw`，不臆造字段 |
 
 `LogHandle::init` 已安装 `SpanFields` + `GrepFormat::utc()`。自带 appender 的宿主（如按日滚动）自行组合：
+
+操作生命周期行还包含操作创建调用点：`SourceFile` 是 Rust module/file 路径，`SourceLine` 是 `TraceContext::root` 或 `operation` 的调用行。它们由 `#[track_caller]` 自动采集，不需要业务代码手写；普通事件仍使用 `Target` 区分事件来源。产品日志列表默认隐藏源码段，展开诊断详情时显示。
+产品日志页默认隐藏源码段，展开诊断详情时显示 `SourceFile:SourceLine`；普通事件仍使用 `Target` 区分来源模块。
 
 ```rust
 tracing_subscriber::registry()
@@ -262,16 +264,19 @@ pub struct ErrorResponse { pub code: String, pub message: String, pub trace_id: 
 - `AiError::code()` 返回稳定错误码：`AI_MODEL_NOT_CONFIGURED`、`AI_TOOL_DENIED`、`AI_PROVIDER_ERROR`、`AI_HTTP_UNAUTHORIZED`（401/403）、`AI_HTTP_RATE_LIMITED`（429）、`AI_HTTP_REJECTED`（其他 4xx）、`AI_HTTP_UPSTREAM_ERROR`（5xx 等）、`AI_CANCELLED`、`AI_TIMEOUT`、`AI_INVALID_ENDPOINT`。
 - 新增 `AiError::Timeout { stage, limit_ms }`。原先超时被折叠成 `Provider("... timed out")` 字符串；现在 reqwest 超时和读取超时都映射到它，日志写 `EV:TIMEOUT|Limit:120000`。
 - `AiRuntime::run` / `run_with_history` 新增 `trace: Option<&TraceContext>` 参数；`None` 不写生命周期。`stream_chat` 无链路。
-- 翻译入口（`ChatSession::translate`）暂未建 root，只走 `None`。
-- 待做（L7）：设置页的目录刷新、连接检测、搜索测试和 MCP 发现入口。
+- 发送、重试与翻译入口均建立真实 `ai.request` root。`Attempt.trace_id` 持久化到 SQLite v6 nullable 列，旧历史缺省 None，不推断诊断 ID。共享 GPUI 失败提示默认简明，展开诊断后可复制完整 ID。
+- 设置目录刷新、模型检测/同步、搜索检测/搜索/读取入口由产品创建 root，显式传递到 worker、HTTP 与存储边界；`settings_task::Failure` 按类型结束 CANCEL/TIMEOUT/ERROR。MCP 设置目前仅保存配置，已覆盖 load/save，产品未提供发现动作。
+- LumaDesk 设置的后台日志页复用 `LogHandle` / `parse_line`，只在页面打开时读取。EV/Layer 过滤与 TraceId/ME 搜索取交集；点击 trace 标签重置其它筛选以查看整条已记录链路；记录级别改变只影响未来事件。
 
 ### ThinkRail Native
 
-当前固定在 LumaKit `b5c0207`，仍是旧 API（`root` 返回 `Result`，有 `child`）。迁移（任务列表 L8）：
+已完成 L8 迁移（Native `c7046db`，依赖 LumaKit `a5b9bf3`）：
 
-- 删除 `agents/trace.rs`、`app/services.rs`、`app/state.rs`、`review/dispatch.rs`、`host-tools/bridge.rs`、`host-tools/mcp.rs` 中 `Err(_)` 的降级分支；
-- `child(...)` 改为 `operation(&trace, ..., layer)`，每层都有 ENTRY 和终态；
-- 保留按日滚动和北京时间，`FlatFormat` 换成 `GrepFormat::new(OffsetTime)` + `SpanFields`；`tail` 用 `parse_line`；删除旧的 `op()` / `finish()`。
+- `root` 直接返回上下文和入口 guard，不再保留随机源失败的降级分支；
+- 下层改用 `operation(&trace, ..., layer)`，各边界覆盖情况见任务列表 L9；
+- 保留按日滚动和北京时间，使用 `GrepFormat::new(OffsetTime)` + `SpanFields`；`tail` 调用 `parse_line`，旧 `op()` / `finish()` 已删除。
+
+L9 已为 Agent process start/exit、request waiter 与 turn 建立 OperationGuard；请求超时记录实际配置 Limit。停止只结束日志 guard，不提前解除引擎 running 状态；真实 settle 负责原状态机收尾，已结束的错误/取消不会再写 SUCCESS。`SessionError.trace_id` 是可缺省的边界诊断字段，由持有显式 SessionTrace 的投影附加，产品失败提示能复制到日志页检索。Native 日志页 EV/Layer 与文本筛选取交集。
 
 ## 10. 验证要求
 

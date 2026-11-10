@@ -1,11 +1,13 @@
 //! 聊天上下文与生命周期行为回归。
 use super::*;
+type TestError = Box<dyn std::error::Error + Send + Sync>;
+
 struct Directory(PathBuf);
 impl Directory {
-    fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("lumakit-lifecycle-{}", new_id().unwrap()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
+    fn new() -> Result<Self, TestError> {
+        let path = std::env::temp_dir().join(format!("lumakit-lifecycle-{}", new_id()?));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
     }
     fn path(&self) -> &Path {
         &self.0
@@ -39,6 +41,7 @@ fn attempt(status: TurnStatus, text: &str) -> Attempt {
         text: text.into(),
         status,
         error: None,
+        trace_id: None,
         rounds: Vec::new(),
         kind: AttemptKind::Reply,
         source_attempt_id: None,
@@ -58,7 +61,7 @@ fn turn(input: &str, attempts: Vec<Attempt>) -> Turn {
     }
 }
 #[test]
-fn context_uses_only_last_completed_attempt_and_enforces_message_bounds() {
+fn context_uses_only_last_completed_attempt_and_enforces_message_bounds() -> Result<(), TestError> {
     let turns = vec![
         turn(
             "第一问",
@@ -77,7 +80,7 @@ fn context_uses_only_last_completed_attempt_and_enforces_message_bounds() {
         turn("第三问", vec![attempt(TurnStatus::Cancelled, "部分内容")]),
         turn("第四问", vec![attempt(TurnStatus::Running, "部分内容")]),
     ];
-    let messages = context(&turns, "现在的问题").unwrap();
+    let messages = context(&turns, "现在的问题")?;
     let text: Vec<_> = messages
         .into_iter()
         .map(|message| match message {
@@ -98,17 +101,22 @@ fn context_uses_only_last_completed_attempt_and_enforces_message_bounds() {
     assert!(context(&large, "nn").is_err());
     let empty = vec![turn("q", vec![attempt(TurnStatus::Completed, " \n")])];
     assert!(context(&empty, "n").is_err());
+    Ok(())
 }
 #[test]
-fn stale_events_cannot_mutate_active_request_and_close_is_terminal() {
-    let root = Directory::new();
-    let mut session = ChatSession::open(&root.path().join("chat.db"), Arc::new(|| {})).unwrap();
+fn stale_events_cannot_mutate_active_request_and_close_is_terminal() -> Result<(), TestError> {
+    let root = Directory::new()?;
+    let mut session = ChatSession::open(&root.path().join("chat.db"), Arc::new(|| {}))?;
     session.new_conversation();
-    let conversation_id = session.selected().unwrap().id.clone();
+    let conversation_id = session
+        .selected()
+        .ok_or("missing selected conversation")?
+        .id
+        .clone();
     session.history.conversations[0]
         .turns
         .push(turn("t", vec![attempt(TurnStatus::Running, "partial")]));
-    let (tx, rx) = session.event_channel();
+    let (tx, rx) = session.event_channel()?;
     let stale = EventSender {
         generation: tx.generation - 1,
         tx: tx.tx.clone(),
@@ -131,71 +139,96 @@ fn stale_events_cannot_mutate_active_request_and_close_is_terminal() {
         context: None,
     });
     session.phase = ChatPhase::Running;
-    stale.send(Event::Delta("stale".into())).unwrap();
-    stale
-        .send(Event::End(Err((TurnStatus::Failed, "stale".into()))))
-        .unwrap();
-    tx.send(Event::Runtime(crate::RunEvent::Waiting { waiting: true }))
-        .unwrap();
+    stale.send(Event::Delta("stale".into()))?;
+    stale.send(Event::End(Err((TurnStatus::Failed, "stale".into()))))?;
+    tx.send(Event::Runtime(crate::RunEvent::Waiting { waiting: true }))?;
     session.poll();
     assert_eq!(session.phase(), ChatPhase::Waiting);
     assert_eq!(
-        session.selected().unwrap().turns[0].attempts[0].text,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0]
+            .text,
         "partial"
     );
     session.cancel();
     assert!(session.busy());
     assert!(session.close().is_err());
-    tx.send(Event::Runtime(crate::RunEvent::Waiting { waiting: false }))
-        .unwrap();
+    tx.send(Event::Runtime(crate::RunEvent::Waiting { waiting: false }))?;
     session.poll();
     assert_eq!(session.phase(), ChatPhase::Running);
-    tx.send(Event::End(Err((TurnStatus::Cancelled, "cancelled".into()))))
-        .unwrap();
-    tx.send(Event::Delta("late".into())).unwrap();
+    tx.send(Event::End(Err((TurnStatus::Cancelled, "cancelled".into()))))?;
+    tx.send(Event::Delta("late".into()))?;
     session.poll();
     assert_eq!(session.phase(), ChatPhase::Idle);
     assert_eq!(
-        session.selected().unwrap().turns[0].attempts[0].status,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0]
+            .status,
         TurnStatus::Cancelled
     );
     assert_eq!(
-        session.selected().unwrap().turns[0].attempts[0].text,
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
+            .attempts[0]
+            .text,
         "partial"
     );
     assert_eq!(
-        session.selected().unwrap().turns[0]
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .turns[0]
             .selected_attempt
             .as_deref(),
         Some("a")
     );
-    session.close().unwrap();
+    session.close()?;
     assert_eq!(session.phase(), ChatPhase::Closed);
-    let snapshot = serde_json::to_value(session.history()).unwrap();
+    let snapshot = serde_json::to_value(session.history())?;
     session.set_draft("closed edit".into());
     session.new_conversation();
     session.poll();
-    assert_eq!(serde_json::to_value(session.history()).unwrap(), snapshot);
+    assert_eq!(serde_json::to_value(session.history())?, snapshot);
     assert_eq!(session.phase(), ChatPhase::Closed);
+    Ok(())
 }
 #[test]
-fn failed_close_preserves_idle_session_for_save_recovery() {
-    let root = Directory::new();
+fn failed_close_preserves_idle_session_for_save_recovery() -> Result<(), TestError> {
+    let root = Directory::new()?;
     let path = root.path().join("chat.db");
-    let mut session = ChatSession::open(&path, Arc::new(|| {})).unwrap();
+    let mut session = ChatSession::open(&path, Arc::new(|| {}))?;
     session.new_conversation();
-    let database = rusqlite::Connection::open(&path).unwrap();
-    database.execute_batch("CREATE TRIGGER reject_close BEFORE UPDATE ON conversations BEGIN SELECT RAISE(ABORT,'disk failure'); END;").unwrap();
+    let database = rusqlite::Connection::open(&path)?;
+    database.execute_batch("CREATE TRIGGER reject_close BEFORE UPDATE ON conversations BEGIN SELECT RAISE(ABORT,'disk failure'); END;")?;
     session.set_draft("retained draft".into());
     assert!(session.close().is_err());
     assert_eq!(session.phase(), ChatPhase::Idle);
-    assert_eq!(session.selected().unwrap().draft, "retained draft");
-    database
-        .execute_batch("DROP TRIGGER reject_close;")
-        .unwrap();
+    assert_eq!(
+        session
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "retained draft"
+    );
+    database.execute_batch("DROP TRIGGER reject_close;")?;
     session.retry_save();
-    session.close().unwrap();
+    session.close()?;
     drop(session);
-    let reopened = ChatSession::open(&path, Arc::new(|| {})).unwrap();
-    assert_eq!(reopened.selected().unwrap().draft, "retained draft");
+    let reopened = ChatSession::open(&path, Arc::new(|| {}))?;
+    assert_eq!(
+        reopened
+            .selected()
+            .ok_or("missing selected conversation")?
+            .draft,
+        "retained draft"
+    );
+    Ok(())
 }

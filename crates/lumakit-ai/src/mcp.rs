@@ -35,6 +35,9 @@ impl McpServerConfig {
     }
 
     /// Returns the parsed and policy-checked endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the URL violates parsing or the HTTPS/loopback endpoint policy.
     pub fn validate_url(&self) -> Result<Url, McpError> {
         validate_url(&self.url)
     }
@@ -134,6 +137,9 @@ impl std::fmt::Debug for McpClient {
 
 impl McpClient {
     /// Creates a client after applying the HTTPS/loopback URL policy.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid endpoint or failure to create the HTTP client.
     pub fn new(config: McpServerConfig) -> Result<Self, McpError> {
         config.validate_url()?;
         let http = Client::builder()
@@ -153,6 +159,10 @@ impl McpClient {
     }
 
     /// Performs MCP initialization and the required initialized notification.
+    ///
+    /// # Errors
+    /// Returns an error for a disabled/untrusted server, invalid endpoint, transport failure,
+    /// or an invalid/rejected initialization response or notification.
     pub async fn initialize(&self) -> Result<(), McpError> {
         self.ensure_allowed()?;
         let result = self
@@ -174,6 +184,10 @@ impl McpClient {
     }
 
     /// Lists and validates all advertised tools, following at most ten pages.
+    ///
+    /// # Errors
+    /// Returns an error for policy/transport/RPC failures, malformed or invalid tools,
+    /// or tool/page limits exceeded.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         self.ensure_allowed()?;
         let mut cursor: Option<String> = None;
@@ -203,11 +217,19 @@ impl McpClient {
     }
 
     /// Alias matching the MCP method name.
+    ///
+    /// # Errors
+    /// Returns the same policy, transport, RPC, validation, and limit errors as [`Self::list_tools`].
     pub async fn tools_list(&self) -> Result<Vec<McpTool>, McpError> {
         self.list_tools().await
     }
 
     /// Calls a server tool. The client never executes tools locally.
+    ///
+    /// # Errors
+    /// Returns an error for a disabled/untrusted server, empty tool name, RPC rejection,
+    /// invalid endpoint, or malformed result content. Transport/protocol failures during
+    /// the RPC return [`McpCallResult::Unknown`] because execution may have occurred.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpCallResult, McpError> {
         self.ensure_allowed()?;
         if name.is_empty() {
@@ -258,6 +280,9 @@ impl McpClient {
     }
 
     /// Alias matching the MCP method name.
+    ///
+    /// # Errors
+    /// Returns the same authorization, input, RPC, and result errors as [`Self::call_tool`].
     pub async fn tools_call(
         &self,
         name: &str,

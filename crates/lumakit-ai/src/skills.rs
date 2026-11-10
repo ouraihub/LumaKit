@@ -124,6 +124,10 @@ pub struct SkillStore {
 
 /// Parse a restricted SKILL.md document. Only scalar name/description/version
 /// frontmatter keys are accepted; no YAML implementation is intentionally used.
+///
+/// # Errors
+/// Returns an error for an oversized document, invalid/unsupported frontmatter,
+/// missing required metadata, or invalid metadata/body content.
 pub fn parse_skill(document: &str, origin: impl Into<String>) -> Result<Skill, SkillError> {
     if document.len() > MAX_DOCUMENT_BYTES {
         return Err(SkillError::Invalid("document exceeds 64 KiB".into()));
@@ -272,6 +276,9 @@ pub fn digest(bytes: &[u8]) -> String {
 
 impl SkillStore {
     /// 打开并读取 JSON 存储；文件不存在时使用空存储，不立即写入文件。
+    ///
+    /// # Errors
+    /// Returns an error if an existing store cannot be read or decoded as JSON.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SkillError> {
         let path = path.as_ref().to_owned();
         let state = if path.exists() {
@@ -283,6 +290,9 @@ impl SkillStore {
     }
 
     /// 解析文档并生成安装预览，不修改存储；已有技能保留当前修订号。
+    ///
+    /// # Errors
+    /// Returns the document validation errors described by [`parse_skill`].
     pub fn preview(
         &self,
         document: &str,
@@ -297,6 +307,9 @@ impl SkillStore {
     }
 
     /// 解析文档，核对确认摘要后安装或替换同标识技能并保存。
+    ///
+    /// # Errors
+    /// Returns an error if parsing fails, the confirmed digest differs, or saving fails.
     pub fn install(
         &mut self,
         document: &str,
@@ -310,6 +323,9 @@ impl SkillStore {
     /// 核对预览及技能摘要，分配新的整体修订号并保存技能。
     ///
     /// 此方法不重新解析预览；保存失败时内存中的修改不会回滚。
+    ///
+    /// # Errors
+    /// Returns an error for a digest mismatch or a directory, serialization, write, or rename failure.
     pub fn install_preview(
         &mut self,
         preview: &SkillPreview,
@@ -339,6 +355,7 @@ impl SkillStore {
 
     /// 按引用顺序复制技能，并检查每个修订号及正文总字节预算。
     ///
+    /// # Errors
     /// 技能缺失、修订号不匹配或正文总字节数超过 `budget` 时返回错误。
     pub fn snapshot(&self, refs: &[SkillRef], budget: usize) -> Result<SkillSnapshot, SkillError> {
         let mut skills = Vec::with_capacity(refs.len());
@@ -382,6 +399,9 @@ impl SkillStore {
 }
 
 /// 累加技能正文的字节数，未超过 `limit` 时返回总数，否则返回预算错误。
+///
+/// # Errors
+/// Returns [`SkillError::BudgetExceeded`] if the combined body size exceeds `limit`.
 pub fn check_budget(skills: &[Skill], limit: usize) -> Result<usize, SkillError> {
     let used = skills.iter().map(|skill| skill.body.len()).sum();
     if used > limit {
@@ -400,28 +420,29 @@ mod tests {
     }
 
     #[test]
-    fn changed_digest_is_rejected() {
+    fn changed_digest_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!("lumakit-skills-{}.json", std::process::id()));
         let _ = fs::remove_file(&path);
-        let mut store = SkillStore::open(&path).unwrap();
-        let preview = store.preview(&doc("one"), "test").unwrap();
+        let mut store = SkillStore::open(&path)?;
+        let preview = store.preview(&doc("one"), "test")?;
         assert!(matches!(
             store.install(&doc("two"), "test", &preview.digest),
             Err(SkillError::DigestMismatch)
         ));
         let _ = fs::remove_file(path);
+        Ok(())
     }
 
     #[test]
-    fn revision_mismatch_rejects_snapshot() {
+    fn revision_mismatch_rejects_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let path = std::env::temp_dir().join(format!(
             "lumakit-skills-revision-{}.json",
             std::process::id()
         ));
         let _ = fs::remove_file(&path);
-        let mut store = SkillStore::open(&path).unwrap();
-        let p = store.preview(&doc("one"), "test").unwrap();
-        let r = store.install_preview(&p, &p.digest).unwrap();
+        let mut store = SkillStore::open(&path)?;
+        let p = store.preview(&doc("one"), "test")?;
+        let r = store.install_preview(&p, &p.digest)?;
         let stale = SkillRef {
             id: r.id.clone(),
             revision: r.revision - 1,
@@ -431,5 +452,6 @@ mod tests {
             Err(SkillError::RevisionMismatch { .. })
         ));
         let _ = fs::remove_file(path);
+        Ok(())
     }
 }

@@ -79,10 +79,10 @@ impl MarkdownEntry {
         display.push_str(&source[end..]);
         let mut cache = CommonMarkCache::default();
         for event in Parser::new_ext(&display, markdown_options()) {
-            if let Event::Start(Tag::Link { dest_url, .. }) = event {
-                if !web_link(&dest_url) {
-                    cache.add_link_hook(dest_url.into_string());
-                }
+            if let Event::Start(Tag::Link { dest_url, .. }) = event
+                && !web_link(&dest_url)
+            {
+                cache.add_link_hook(dest_url.into_string());
             }
         }
         Self {
@@ -122,6 +122,23 @@ fn model_label(option: &ModelOption) -> String {
         "{} · {} / {}",
         option.name, option.provider, option.endpoint
     )
+}
+
+struct SendToolsContext<'a> {
+    session: &'a ChatSession,
+    unlocked: bool,
+    valid_model: bool,
+    shortcut: bool,
+    model_settings: Option<&'a ModelSettings>,
+}
+
+struct AnswerContext<'a> {
+    session: &'a ChatSession,
+    conversation_id: &'a str,
+    turn_id: &'a str,
+    unlocked: bool,
+    options: &'a [ModelOption],
+    image_options: &'a [ModelOption],
 }
 
 /// 每个实例独占输入、弹窗、滚动和 Markdown 缓存；不持有连接或产品设置。
@@ -200,11 +217,11 @@ impl ChatPanel {
             self.last_offset = 0.0;
             self.markdown.clear();
             self.usage.close();
-        } else if let Some(conversation) = selected {
+        } else if let Some(conversation) = selected
+            && self.draft != conversation.draft
+        {
             // 宿主执行 Send 后清空草稿、或保存失败恢复草稿时同步；不是每帧复制全文。
-            if self.draft != conversation.draft {
-                self.draft.clone_from(&conversation.draft);
-            }
+            self.draft.clone_from(&conversation.draft);
         }
         let mut actions = Vec::new();
         ui.push_id(self.id, |ui| {
@@ -336,7 +353,7 @@ impl ChatPanel {
                                 ui.add_enabled_ui(unlocked, |ui| {
                                     model_picker(ui, self.id.with("models"), 136.0, &mut self.model_search, options, picked, &mut actions);
                                 });
-                                self.send_tools(ui, session, unlocked, valid_model, shortcut, &mut reasoning, model_settings, &mut actions);
+                                self.send_tools(ui, SendToolsContext { session, unlocked, valid_model, shortcut, model_settings }, &mut reasoning, &mut actions);
                             }
                         });
                         if narrow_toolbar {
@@ -346,7 +363,7 @@ impl ChatPanel {
                                 ui.add_enabled_ui(unlocked, |ui| {
                                     model_picker(ui, self.id.with("models"), picker_width, &mut self.model_search, options, picked, &mut actions);
                                 });
-                                self.send_tools(ui, session, unlocked, valid_model, shortcut, &mut reasoning, model_settings, &mut actions);
+                                self.send_tools(ui, SendToolsContext { session, unlocked, valid_model, shortcut, model_settings }, &mut reasoning, &mut actions);
                             });
                         }
                     }).response.rect;
@@ -378,13 +395,14 @@ impl ChatPanel {
                                     });
                             });
                             ui.add_space(12.0);
+                            let answer_context = AnswerContext { session, conversation_id: &conversation.id, turn_id: &turn.id, unlocked, options, image_options };
                             if let Some((last, previous)) = turn.attempts.split_last() {
                                 if !previous.is_empty() {
                                     egui::CollapsingHeader::new(format!("之前的 {} 次回答", previous.len())).id_salt("attempts").show(ui, |ui| {
-                                        for attempt in previous { self.answer(ui, session, &conversation.id, &turn.id, attempt, false, unlocked, options, image_options, &mut actions); }
+                                        for attempt in previous { self.answer(ui, &answer_context, attempt, false, &mut actions); }
                                     });
                                 }
-                                self.answer(ui, session, &conversation.id, &turn.id, last, index + 1 == conversation.turns.len(), unlocked, options, image_options, &mut actions);
+                                self.answer(ui, &answer_context, last, index + 1 == conversation.turns.len(), &mut actions);
                             }
                             ui.add_space(12.0);
                         });
@@ -414,14 +432,17 @@ impl ChatPanel {
     fn send_tools(
         &mut self,
         ui: &mut Ui,
-        session: &ChatSession,
-        unlocked: bool,
-        valid_model: bool,
-        shortcut: bool,
+        context: SendToolsContext<'_>,
         reasoning: &mut Option<ReasoningEffort>,
-        model_settings: Option<&ModelSettings>,
         actions: &mut Vec<ChatAction>,
     ) {
+        let SendToolsContext {
+            session,
+            unlocked,
+            valid_model,
+            shortcut,
+            model_settings,
+        } = context;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let send = if session.busy() {
                 let response = crate::icons::action(ui, true, "\u{E46C}", "停止生成");
@@ -509,13 +530,14 @@ impl ChatPanel {
                     modifiers,
                     ..
                 } = event
+                    && (modifiers.ctrl || modifiers.command)
+                    && !modifiers.alt
+                    && !modifiers.shift
                 {
-                    if (modifiers.ctrl || modifiers.command) && !modifiers.alt && !modifiers.shift {
-                        if !repeat && can_send {
-                            send = true;
-                        }
-                        return false;
+                    if !repeat && can_send {
+                        send = true;
                     }
+                    return false;
                 }
                 true
             });
@@ -526,16 +548,19 @@ impl ChatPanel {
     fn answer(
         &mut self,
         ui: &mut Ui,
-        session: &ChatSession,
-        conversation_id: &str,
-        turn_id: &str,
+        context: &AnswerContext<'_>,
         attempt: &Attempt,
         retry: bool,
-        unlocked: bool,
-        options: &[ModelOption],
-        image_options: &[ModelOption],
         actions: &mut Vec<ChatAction>,
     ) {
+        let AnswerContext {
+            session,
+            conversation_id,
+            turn_id,
+            unlocked,
+            options,
+            image_options,
+        } = *context;
         ui.push_id(&attempt.id, |ui| {
             Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(12)
                 .show(ui, |ui| {
@@ -878,6 +903,10 @@ fn reasoning_label(effort: Option<ReasoningEffort>) -> &'static str {
 }
 
 /// 使用系统文件对话框；取消不会生成错误或附件。
+///
+/// # Errors
+/// Returns an error if the platform is unsupported, the file chooser cannot start,
+/// exits unsuccessfully, or returns a path that is not UTF-8.
 pub fn pick_attachment() -> Result<Option<std::path::PathBuf>, String> {
     #[cfg(windows)]
     {
@@ -911,6 +940,9 @@ pub fn pick_attachment() -> Result<Option<std::path::PathBuf>, String> {
 }
 
 /// 仅在用户明确点击后由系统打开本地媒体；文件名作为独立参数传递。
+///
+/// # Errors
+/// Returns an error if the path is not a file or the system opener cannot start.
 pub fn open_media(path: &std::path::Path) -> Result<(), String> {
     if !path.is_file() {
         return Err("图片文件不存在".into());
@@ -1018,8 +1050,10 @@ mod tests {
     };
     use std::sync::Arc;
 
-    fn fixture() -> (tempfile::TempDir, ChatSession, Vec<ModelOption>) {
-        let root = tempfile::tempdir().unwrap();
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn fixture() -> TestResult<(tempfile::TempDir, ChatSession, Vec<ModelOption>)> {
+        let root = tempfile::tempdir()?;
         let model = ModelRef {
             provider: "来源A".into(),
             endpoint: "端点A".into(),
@@ -1043,6 +1077,7 @@ mod tests {
                         text: markdown,
                         status: TurnStatus::Failed,
                         error: Some("很长的错误信息\n".repeat(300)),
+                        trace_id: None,
                         rounds: vec![lumakit_ai::RoundUsage {
                             usage: Some(lumakit_ai::TokenUsage {
                                 input_tokens: 123,
@@ -1068,8 +1103,8 @@ mod tests {
             }],
         };
         let path = root.path().join("chat-history.json");
-        lumakit_support::save_versioned(&path, 1, &history).unwrap();
-        let session = ChatSession::open(&root.path().join("chat.db"), Arc::new(|| {})).unwrap();
+        lumakit_support::save_versioned(&path, 1, &history)?;
+        let session = ChatSession::open(&root.path().join("chat.db"), Arc::new(|| {}))?;
         let options = vec![ModelOption {
             model,
             name: "模型".into(),
@@ -1078,7 +1113,7 @@ mod tests {
             settings: Default::default(),
             has_key: false,
         }];
-        (root, session, options)
+        Ok((root, session, options))
     }
 
     fn draw(
@@ -1089,7 +1124,7 @@ mod tests {
         size: Vec2,
         scale: f32,
         events: Vec<egui::Event>,
-    ) -> Vec<ChatAction> {
+    ) -> TestResult<Vec<ChatAction>> {
         let mut input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
             events,
@@ -1098,7 +1133,7 @@ mod tests {
         input
             .viewports
             .get_mut(&egui::ViewportId::ROOT)
-            .unwrap()
+            .ok_or("root viewport missing")?
             .native_pixels_per_point = Some(scale);
         let mut actions = Vec::new();
         // 无渲染器的 headless 帧显式丢弃纹理增量；正式宿主由 eframe 应用。
@@ -1108,12 +1143,17 @@ mod tests {
             });
         })
         .drop_without_applying_deltas();
-        actions
+        Ok(actions)
     }
     #[test]
-    fn failed_generator_keeps_raw_diagnostics_and_rounds_out_of_default_view() {
-        let (_root, session, options) = fixture();
-        let mut attempt = session.selected().unwrap().turns[0].attempts[0].clone();
+    fn failed_generator_keeps_raw_diagnostics_and_rounds_out_of_default_view() -> TestResult {
+        let (_root, session, options) = fixture()?;
+        let mut attempt = session
+            .selected()
+            .ok_or("selected conversation missing")?
+            .turns[0]
+            .attempts[0]
+            .clone();
         attempt.text.clear();
         attempt.error = Some("RAW_ATTEMPT_DIAGNOSTIC".into());
         attempt.tool_events.push(lumakit_ai::ToolEvent {
@@ -1131,14 +1171,16 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| {
                 panel.answer(
                     ui,
-                    &session,
-                    "conversation",
-                    "turn",
+                    &AnswerContext {
+                        session: &session,
+                        conversation_id: "conversation",
+                        turn_id: "turn",
+                        unlocked: true,
+                        options: &options,
+                        image_options: &[],
+                    },
                     &attempt,
                     true,
-                    true,
-                    &options,
-                    &[],
                     &mut Vec::new(),
                 );
             });
@@ -1169,11 +1211,12 @@ mod tests {
         }
         assert!(!text.contains(&usage::round_label(&attempt.rounds[0])));
         output.drop_without_applying_deltas();
+        Ok(())
     }
 
     #[test]
-    fn actual_layout_keeps_footer_reachable_for_long_content() {
-        let (_root, mut session, options) = fixture();
+    fn actual_layout_keeps_footer_reachable_for_long_content() -> TestResult {
+        let (_root, mut session, options) = fixture()?;
         session.report("保存或请求错误，详细说明\n".repeat(300));
         for (width, height, scale) in [
             (860.0, 560.0, 1.0),
@@ -1210,7 +1253,7 @@ mod tests {
                                     Vec2::new(width, height),
                                     scale,
                                     vec![],
-                                );
+                                )?;
                             }
                             let g = panel.geometry();
                             assert!(g.header.bottom() <= g.transcript.top() + 0.5, "{g:?}");
@@ -1234,11 +1277,12 @@ mod tests {
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn painting_controls_preserve_chat_settings_and_validate_both_models() {
-        let (_root, mut session, options) = fixture();
+    fn painting_controls_preserve_chat_settings_and_validate_both_models() -> TestResult {
+        let (_root, mut session, options) = fixture()?;
         let ctx = egui::Context::default();
         let mut panel = ChatPanel::new("painting");
         let focus = panel.id.with("draft");
@@ -1365,6 +1409,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|model| same_model(model, &options[0].model))
         );
+        Ok(())
     }
 
     #[test]
@@ -1387,8 +1432,8 @@ mod tests {
     }
 
     #[test]
-    fn instance_state_shortcuts_and_cache_are_isolated() {
-        let (_root, session, options) = fixture();
+    fn instance_state_shortcuts_and_cache_are_isolated() -> TestResult {
+        let (_root, session, options) = fixture()?;
         let ctx = egui::Context::default();
         let mut a = ChatPanel::new("first");
         let mut b = ChatPanel::new("second");
@@ -1403,7 +1448,7 @@ mod tests {
             Vec2::new(860.0, 560.0),
             1.0,
             vec![],
-        );
+        )?;
         draw(
             &ctx,
             &mut b,
@@ -1412,7 +1457,7 @@ mod tests {
             Vec2::new(860.0, 560.0),
             1.0,
             vec![],
-        );
+        )?;
         assert!(!b.expanded && b.history_search.is_empty());
         let focus = a.id.with("draft");
         ctx.memory_mut(|m| m.request_focus(focus));
@@ -1437,7 +1482,7 @@ mod tests {
                 }),
                 enter(false),
             ],
-        );
+        )?;
         assert!(!actions.iter().any(|a| matches!(a, ChatAction::Send)));
         let actions = draw(
             &ctx,
@@ -1450,7 +1495,7 @@ mod tests {
                 egui::Event::Ime(egui::ImeEvent::Commit("拼".into())),
                 enter(false),
             ],
-        );
+        )?;
         assert!(!actions.iter().any(|a| matches!(a, ChatAction::Send)));
         let actions = draw(
             &ctx,
@@ -1466,7 +1511,7 @@ mod tests {
                 }),
                 enter(false),
             ],
-        );
+        )?;
         assert!(!actions.iter().any(|a| matches!(a, ChatAction::Send)));
         let actions = draw(
             &ctx,
@@ -1482,7 +1527,7 @@ mod tests {
                 }),
                 enter(false),
             ],
-        );
+        )?;
         assert!(!actions.iter().any(|a| matches!(a, ChatAction::Send)));
         let actions = draw(
             &ctx,
@@ -1492,7 +1537,7 @@ mod tests {
             Vec2::new(860.0, 560.0),
             1.0,
             vec![enter(true)],
-        );
+        )?;
         assert!(!actions.iter().any(|a| matches!(a, ChatAction::Send)));
         draw(
             &ctx,
@@ -1508,7 +1553,7 @@ mod tests {
                 repeat: false,
                 modifiers: egui::Modifiers::CTRL,
             }],
-        );
+        )?;
         let actions = draw(
             &ctx,
             &mut a,
@@ -1517,7 +1562,7 @@ mod tests {
             Vec2::new(860.0, 560.0),
             1.0,
             vec![enter(false)],
-        );
+        )?;
         assert!(actions.iter().any(|a| matches!(a, ChatAction::Send)));
         for i in 0..CACHE_ENTRIES + 10 {
             a.frame += 1;
@@ -1528,6 +1573,7 @@ mod tests {
         }
         assert!(a.markdown.len() <= CACHE_ENTRIES);
         assert!(!a.markdown.contains_key("0"));
+        Ok(())
     }
 
     #[test]
@@ -1563,8 +1609,8 @@ mod tests {
         assert!(measured.height() > 100.0, "{measured:?}");
     }
     #[test]
-    fn streaming_growth_follows_until_reader_scrolls_up() {
-        let (_root, session, options) = fixture();
+    fn streaming_growth_follows_until_reader_scrolls_up() -> TestResult {
+        let (_root, session, options) = fixture()?;
         let ctx = egui::Context::default();
         let mut panel = ChatPanel::new("follow");
         for _ in 0..3 {
@@ -1576,7 +1622,7 @@ mod tests {
                 Vec2::new(860.0, 560.0),
                 1.0,
                 vec![],
-            );
+            )?;
         }
         assert!(panel.follow);
         assert!(panel.last_offset > 100.0);
@@ -1598,7 +1644,7 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 },
             ],
-        );
+        )?;
         assert!(!panel.follow);
         let offset = panel.last_offset;
         draw(
@@ -1609,19 +1655,24 @@ mod tests {
             Vec2::new(860.0, 560.0),
             1.0,
             vec![],
-        );
+        )?;
         assert!(!panel.follow);
         assert!(panel.last_offset <= offset);
+        Ok(())
     }
     #[test]
-    fn toolbar_switch_only_changes_pinning_not_draft_or_request_settings() {
-        let (_root, mut session, options) = fixture();
+    fn toolbar_switch_only_changes_pinning_not_draft_or_request_settings() -> TestResult {
+        let (_root, mut session, options) = fixture()?;
         session.set_composer(lumakit_ai::chat::ComposerSettings {
             web_search: true,
             image_mode: true,
             ..Default::default()
         });
-        let draft = session.selected().unwrap().draft.clone();
+        let draft = session
+            .selected()
+            .ok_or("selected conversation missing")?
+            .draft
+            .clone();
         let ctx = egui::Context::default();
         let mut toolbar = TOOLBAR_TOOLS
             .iter()
@@ -1640,9 +1691,9 @@ mod tests {
                     },
                 )
                 .drop_without_applying_deltas();
-                response.unwrap()
+                response.ok_or("toolbar switch response missing")
             };
-            let response = frame(vec![]);
+            let response = frame(vec![])?;
             ctx.memory_mut(|memory| memory.request_focus(response.id));
             assert!(
                 frame(vec![egui::Event::Key {
@@ -1651,7 +1702,7 @@ mod tests {
                     pressed: true,
                     repeat: false,
                     modifiers: egui::Modifiers::NONE
-                }])
+                }])?
                 .changed()
             );
             frame(vec![egui::Event::Key {
@@ -1660,7 +1711,7 @@ mod tests {
                 pressed: false,
                 repeat: false,
                 modifiers: egui::Modifiers::NONE,
-            }]);
+            }])?;
             assert!(!toolbar.contains(tool));
         }
         session.set_toolbar(toolbar);
@@ -1674,12 +1725,19 @@ mod tests {
             Vec2::new(375.0, 480.0),
             1.0,
             vec![],
-        );
+        )?;
         assert!(actions.is_empty());
         assert_eq!(panel.draft, draft);
-        assert_eq!(session.selected().unwrap().draft, draft);
+        assert_eq!(
+            session
+                .selected()
+                .ok_or("selected conversation missing")?
+                .draft,
+            draft
+        );
         assert!(session.composer().web_search);
         assert!(session.composer().image_mode);
         assert!(session.toolbar().is_empty());
+        Ok(())
     }
 }

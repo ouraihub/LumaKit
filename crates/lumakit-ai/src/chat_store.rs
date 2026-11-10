@@ -36,6 +36,9 @@ ALTER TABLE attempts ADD COLUMN reasoning TEXT NOT NULL DEFAULT '[]';
 CREATE TABLE usage_requests (request_id TEXT PRIMARY KEY, started_at_ms INTEGER, legacy INTEGER NOT NULL CHECK(legacy IN (0,1)), round TEXT NOT NULL);
 CREATE INDEX usage_requests_time ON usage_requests(started_at_ms);
 " },
+    Migration { version: 6, sql: "
+ALTER TABLE attempts ADD COLUMN trace_id TEXT;
+" },
 ];
 
 /// 打开共用结构并拒绝未来版本。
@@ -152,34 +155,32 @@ fn validate(history: &History) -> Result<(), HistoryError> {
             if turn.id.trim().is_empty() || !turns.insert(&turn.id) {
                 return Err(HistoryError::InvalidData("问题标识为空或重复"));
             }
-            if let Some(selected) = &turn.selected_attempt {
-                if !turn.attempts.iter().any(|attempt| &attempt.id == selected) {
-                    return Err(HistoryError::InvalidData("选中的回答不存在"));
-                }
+            if let Some(selected) = &turn.selected_attempt
+                && !turn.attempts.iter().any(|attempt| &attempt.id == selected)
+            {
+                return Err(HistoryError::InvalidData("选中的回答不存在"));
             }
             for attempt in &turn.attempts {
                 if attempt.id.trim().is_empty() || !attempts.insert(&attempt.id) {
                     return Err(HistoryError::InvalidData("回答标识为空或重复"));
                 }
                 validate_model(&attempt.model)?;
-                if let Some(source) = &attempt.source_attempt_id {
-                    if !attempts.contains(source)
-                        && !turn
-                            .attempts
-                            .iter()
-                            .any(|candidate| &candidate.id == source)
-                    {
-                        return Err(HistoryError::InvalidData("回答来源不存在"));
-                    }
+                if let Some(source) = &attempt.source_attempt_id
+                    && !attempts.contains(source)
+                    && !turn
+                        .attempts
+                        .iter()
+                        .any(|candidate| &candidate.id == source)
+                {
+                    return Err(HistoryError::InvalidData("回答来源不存在"));
                 }
-                if let Some(parent) = &attempt.parent_attempt_id {
-                    if !turn
+                if let Some(parent) = &attempt.parent_attempt_id
+                    && !turn
                         .attempts
                         .iter()
                         .any(|candidate| &candidate.id == parent)
-                    {
-                        return Err(HistoryError::InvalidData("回答父节点不存在"));
-                    }
+                {
+                    return Err(HistoryError::InvalidData("回答父节点不存在"));
                 }
             }
         }
@@ -208,7 +209,7 @@ fn write(connection: &Connection, history: &History) -> Result<(), HistoryError>
             connection.execute("INSERT INTO turns(id,conversation_id,position,input,selected_attempt) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET conversation_id=excluded.conversation_id,position=excluded.position,input=excluded.input,selected_attempt=excluded.selected_attempt", params![turn.id, conversation.id, ti as i64, turn.input, turn.selected_attempt])?;
             for (ai, attempt) in turn.attempts.iter().enumerate() {
                 connection.execute("INSERT INTO chat_live VALUES(2,?1)", [&attempt.id])?;
-                connection.execute("INSERT INTO attempts(id,turn_id,position,model,text,status,error,rounds,kind,source_attempt_id,parent_attempt_id,search,tool_events,reasoning,generated) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(id) DO UPDATE SET turn_id=excluded.turn_id,position=excluded.position,model=excluded.model,text=excluded.text,status=excluded.status,error=excluded.error,rounds=excluded.rounds,kind=excluded.kind,source_attempt_id=excluded.source_attempt_id,parent_attempt_id=excluded.parent_attempt_id,search=excluded.search,tool_events=excluded.tool_events,reasoning=excluded.reasoning,generated=excluded.generated", params![attempt.id, turn.id, ai as i64, serde_json::to_string(&attempt.model)?, attempt.text, status(attempt.status), attempt.error, serde_json::to_string(&attempt.rounds)?, kind(attempt.kind), attempt.source_attempt_id, attempt.parent_attempt_id, serde_json::to_string(&attempt.search)?, serde_json::to_string(&attempt.tool_events)?, serde_json::to_string(&attempt.reasoning)?, serde_json::to_string(&attempt.generated)?])?;
+                connection.execute("INSERT INTO attempts(id,turn_id,position,model,text,status,error,rounds,kind,source_attempt_id,parent_attempt_id,search,tool_events,reasoning,generated,trace_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) ON CONFLICT(id) DO UPDATE SET turn_id=excluded.turn_id,position=excluded.position,model=excluded.model,text=excluded.text,status=excluded.status,error=excluded.error,rounds=excluded.rounds,kind=excluded.kind,source_attempt_id=excluded.source_attempt_id,parent_attempt_id=excluded.parent_attempt_id,search=excluded.search,tool_events=excluded.tool_events,reasoning=excluded.reasoning,generated=excluded.generated,trace_id=excluded.trace_id", params![attempt.id, turn.id, ai as i64, serde_json::to_string(&attempt.model)?, attempt.text, status(attempt.status), attempt.error, serde_json::to_string(&attempt.rounds)?, kind(attempt.kind), attempt.source_attempt_id, attempt.parent_attempt_id, serde_json::to_string(&attempt.search)?, serde_json::to_string(&attempt.tool_events)?, serde_json::to_string(&attempt.reasoning)?, serde_json::to_string(&attempt.generated)?, attempt.trace_id])?;
             }
         }
     }
@@ -242,7 +243,7 @@ fn read(connection: &Connection) -> Result<History, HistoryError> {
     let mut turns = connection.prepare(
         "SELECT id,input,selected_attempt FROM turns WHERE conversation_id=?1 ORDER BY position",
     )?;
-    let mut attempts = connection.prepare("SELECT id,model,text,status,error,rounds,kind,source_attempt_id,parent_attempt_id,search,tool_events,reasoning,generated FROM attempts WHERE turn_id=?1 ORDER BY position")?;
+    let mut attempts = connection.prepare("SELECT id,model,text,status,error,rounds,kind,source_attempt_id,parent_attempt_id,search,tool_events,reasoning,generated,trace_id FROM attempts WHERE turn_id=?1 ORDER BY position")?;
     let mut rows = conversations.query([])?;
     while let Some(row) = rows.next()? {
         let mut conversation = Conversation {
@@ -267,6 +268,7 @@ fn read(connection: &Connection) -> Result<History, HistoryError> {
                     text: row.get(2)?,
                     status: parse_status(&row.get::<_, String>(3)?)?,
                     error: row.get(4)?,
+                    trace_id: row.get(13)?,
                     rounds: serde_json::from_str(&row.get::<_, String>(5)?)?,
                     reasoning: serde_json::from_str(&row.get::<_, String>(11)?)?,
                     kind: parse_kind(&row.get::<_, String>(6)?)?,

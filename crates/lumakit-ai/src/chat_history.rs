@@ -105,6 +105,9 @@ impl ChatSession {
         }
     }
     /// 编辑指定回答，使用期望正文做 CAS 冲突保护。
+    ///
+    /// # Errors
+    /// Returns invalid text, missing attempt, edit conflicts, busy session or persistence errors.
     pub fn edit_attempt(
         &mut self,
         conversation_id: &str,
@@ -134,6 +137,9 @@ impl ChatSession {
     }
 
     /// 删除指定回答候选，不删除同问题的其它候选。
+    ///
+    /// # Errors
+    /// Returns missing attempt, busy session or persistence errors.
     pub fn delete_attempt(
         &mut self,
         conversation_id: &str,
@@ -165,6 +171,9 @@ impl ChatSession {
     }
 
     /// 选择指定候选作为该问题的后续上下文来源。
+    ///
+    /// # Errors
+    /// Returns missing attempt, busy session or persistence errors.
     pub fn select_attempt(
         &mut self,
         conversation_id: &str,
@@ -214,6 +223,9 @@ impl ChatSession {
             .ok_or_else(|| "回答不存在。".into())
     }
     /// 复制指定候选之前的线性历史到新对话，并重新生成全部 ID。
+    ///
+    /// # Errors
+    /// Returns missing source, identifier generation, busy session or persistence errors.
     pub fn fork_attempt(
         &mut self,
         conversation_id: &str,
@@ -305,6 +317,9 @@ impl ChatSession {
     }
 
     /// 复制完整对话并重新生成全部 ID。
+    ///
+    /// # Errors
+    /// Returns missing source, identifier generation, busy session or persistence errors.
     pub fn copy_conversation(&mut self, conversation_id: &str) -> Result<String, String> {
         if !self.mutable() {
             return Err("当前聊天不可修改。".into());

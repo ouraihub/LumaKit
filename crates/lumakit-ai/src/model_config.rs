@@ -263,6 +263,10 @@ impl ModelSettings {
         self.max_output.unwrap_or(4096)
     }
     /// 保存或构造请求前校验所有模型设置。
+    ///
+    /// # Errors
+    /// Returns an error for invalid names, token limits, model-type capabilities,
+    /// protocol/reasoning settings, or pricing tiers.
     pub fn validate(&self, protocol: Protocol) -> Result<(), String> {
         for name in [&self.name, &self.group_name].into_iter().flatten() {
             if name.trim().chars().count() > 80 {

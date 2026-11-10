@@ -140,6 +140,22 @@ fn chain_records_entry_exit_parent_and_duration() {
 }
 
 #[test]
+fn lifecycle_lines_include_operation_call_source_location() {
+    let lines = capture("debug", || {
+        let (trace, root) = TraceContext::root("source.root", "ui");
+        let _entered = root.span().clone().entered();
+        operation(&trace, "source.child", "service").finish("SUCCESS");
+        root.finish("SUCCESS");
+    });
+    for line in lines.iter().filter(|line| field(line, "EV").is_some()) {
+        assert!(field(line, "SourceFile").is_some(), "{line}");
+        assert!(field(line, "SourceLine").is_some(), "{line}");
+    }
+    assert!(lines.iter().any(|line| line.contains("source.root")));
+    assert!(lines.iter().any(|line| line.contains("source.child")));
+}
+
+#[test]
 fn terminal_events_use_their_levels_and_fields() {
     let lines = capture("debug", || {
         let (trace, root) = TraceContext::root("job.run", "ui");

@@ -19,6 +19,10 @@ pub struct LogLine {
     pub duration_ms: Option<u64>,
     /// 事件来源模块；生命周期事件为 `None`。
     pub target: Option<String>,
+    /// Source module path of the operation call site.
+    pub source_file: Option<String>,
+    /// Source line of the operation call site.
+    pub source_line: Option<u32>,
     /// `Msg` 段（已反转义）。
     pub message: String,
     /// 原始整行。
@@ -36,6 +40,8 @@ pub fn parse_line(line: &str) -> LogLine {
         event: None,
         duration_ms: None,
         target: None,
+        source_file: None,
+        source_line: None,
         message: line.to_owned(),
         raw: line.to_owned(),
     };
@@ -63,6 +69,8 @@ pub fn parse_line(line: &str) -> LogLine {
             "EV" => parsed.event = Some(value),
             "RT" => parsed.duration_ms = value.parse().ok(),
             "Target" => parsed.target = Some(value),
+            "SourceFile" => parsed.source_file = Some(value),
+            "SourceLine" => parsed.source_line = value.parse().ok(),
             "Msg" => parsed.message = value,
             _ => {}
         }

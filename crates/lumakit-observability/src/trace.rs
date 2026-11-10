@@ -21,11 +21,13 @@ impl TraceContext {
     /// 开始一个顶层操作：生成新的 TraceId，并以 INFO 级别写出 `EV:ENTRY`。
     ///
     /// 只在真实入口（UI 动作、AI 请求、后台任务、工具调用）调用；下层用 [`crate::operation`]。
+    #[track_caller]
     pub fn root(operation: &'static str, layer: &'static str) -> (Self, OperationGuard) {
+        let caller = std::panic::Location::caller();
         let trace = Self {
             trace_id: next_trace_id().into(),
         };
-        let guard = start(&trace, operation, layer, true);
+        let guard = start(&trace, operation, layer, true, caller.file(), caller.line());
         (trace, guard)
     }
 

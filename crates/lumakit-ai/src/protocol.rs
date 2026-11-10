@@ -48,18 +48,14 @@ pub(crate) fn encode(
                 encoded.push(json!({"role":"assistant", "content": if content.is_empty() { json!(text) } else { json!(content) }}));
             }
             (Protocol::AnthropicMessages, Message::Tool { call_id, text }) => {
-                if let Some(Value::Object(last)) = encoded.last_mut() {
-                    if last.get("role") == Some(&Value::String("user".into()))
-                        && last["content"].is_array()
-                    {
-                        last["content"]
-                            .as_array_mut()
-                            .expect("array checked")
-                            .push(json!({
-                                "type":"tool_result", "tool_use_id":call_id, "content":text
-                            }));
-                        continue;
-                    }
+                if let Some(Value::Object(last)) = encoded.last_mut()
+                    && last.get("role") == Some(&Value::String("user".into()))
+                    && let Some(Value::Array(content)) = last.get_mut("content")
+                {
+                    content.push(json!({
+                        "type":"tool_result", "tool_use_id":call_id, "content":text
+                    }));
+                    continue;
                 }
                 encoded.push(json!({"role":"user", "content":[{"type":"tool_result", "tool_use_id":call_id, "content":text}]}));
             }
@@ -136,16 +132,29 @@ pub(crate) fn encode(
             }
         }
     }
+    let mut encoded_tools: Vec<Value> = tools.iter().map(|tool| match connection.protocol {
+        Protocol::AnthropicMessages => json!({
+            "name":tool.name,"description":tool.description,"input_schema":tool.parameters
+        }),
+        Protocol::OpenAiChat => json!({
+            "type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
+        }),
+        Protocol::OpenAiResponses => json!({
+            "type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters
+        }),
+    }).collect();
+    if connection.settings.native_web_search {
+        encoded_tools.push(if connection.protocol == Protocol::AnthropicMessages {
+            json!({"type":"web_search_20250305","name":"web_search","max_uses":5})
+        } else {
+            json!({"type":"web_search"})
+        });
+    }
     let mut body = match connection.protocol {
         Protocol::AnthropicMessages => {
             let mut body = json!({"model":connection.model,"max_tokens":connection.settings.output_limit(),"stream":true,"messages":encoded});
             if let Some(system) = system.filter(|text| !text.is_empty()) {
                 body["system"] = json!(system);
-            }
-            if !tools.is_empty() {
-                body["tools"] = tools.iter().map(|tool| json!({
-                "name":tool.name,"description":tool.description,"input_schema":tool.parameters
-            })).collect();
             }
             body
         }
@@ -153,11 +162,9 @@ pub(crate) fn encode(
             if let Some(system) = system.filter(|text| !text.is_empty()) {
                 encoded.insert(0, json!({"role":"system","content":system}));
             }
-            let mut body = json!({"model":connection.model,"max_tokens":connection.settings.output_limit(),"stream":true,"stream_options":{"include_usage":true},"messages":encoded});
-            if !tools.is_empty() {
-                body["tools"] = tools.iter().map(|tool| json!({
-                "type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.parameters}
-            })).collect();
+            let mut body = json!({"model":connection.model,"max_tokens":connection.settings.output_limit(),"stream":true,"messages":encoded});
+            if connection.settings.supports_streaming {
+                body["stream_options"] = json!({"include_usage":true});
             }
             body
         }
@@ -166,78 +173,58 @@ pub(crate) fn encode(
             if let Some(system) = system.filter(|text| !text.is_empty()) {
                 body["instructions"] = json!(system);
             }
-            if !tools.is_empty() {
-                body["tools"] = tools.iter().map(|tool| json!({
-                "type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters
-            })).collect();
-            }
             body
         }
     };
-    if let Some(config) = &connection.settings.reasoning {
-        if let Some(effort) = connection.settings.reasoning_effort {
-            use crate::model_config::{ReasoningDialect::*, ReasoningEffort};
-            let on = effort != ReasoningEffort::None;
-            match config.dialect {
-                OpenAi if connection.protocol == Protocol::OpenAiResponses => {
-                    body["reasoning"] = json!({"effort":effort});
-                    if reqwest::Url::parse(&connection.base_url).is_ok_and(|u| {
-                        u.scheme() == "https" && u.host_str() == Some("api.openai.com")
-                    }) {
-                        body["reasoning"]["summary"] = json!("auto");
-                    }
+    if !encoded_tools.is_empty() {
+        body["tools"] = Value::Array(encoded_tools);
+    }
+    if let Some(config) = &connection.settings.reasoning
+        && let Some(effort) = connection.settings.reasoning_effort
+    {
+        use crate::model_config::{ReasoningDialect::*, ReasoningEffort};
+        let on = effort != ReasoningEffort::None;
+        match config.dialect {
+            OpenAi if connection.protocol == Protocol::OpenAiResponses => {
+                body["reasoning"] = json!({"effort":effort});
+                if reqwest::Url::parse(&connection.base_url)
+                    .is_ok_and(|u| u.scheme() == "https" && u.host_str() == Some("api.openai.com"))
+                {
+                    body["reasoning"]["summary"] = json!("auto");
                 }
-                OpenAi => body["reasoning_effort"] = json!(effort),
-                ThinkingType => {
-                    body["thinking"] = json!({"type":if on {"enabled"} else {"disabled"}});
-                    if on && effort != ReasoningEffort::Auto {
-                        body["reasoning_effort"] = json!(effort);
-                    }
+            }
+            OpenAi => body["reasoning_effort"] = json!(effort),
+            ThinkingType => {
+                body["thinking"] = json!({"type":if on {"enabled"} else {"disabled"}});
+                if on && effort != ReasoningEffort::Auto {
+                    body["reasoning_effort"] = json!(effort);
                 }
-                Qwen => {
-                    body["enable_thinking"] = json!(on);
-                    if let Some(cap) = config.budget_tokens {
-                        if on && effort != ReasoningEffort::Auto {
-                            body["thinking_budget"] = json!(scaled(cap, effort).max(1));
-                        }
-                    }
+            }
+            Qwen => {
+                body["enable_thinking"] = json!(on);
+                if let Some(cap) = config.budget_tokens
+                    && on
+                    && effort != ReasoningEffort::Auto
+                {
+                    body["thinking_budget"] = json!(scaled(cap, effort).max(1));
                 }
-                AnthropicBudget => {
-                    body["thinking"] = if on {
-                        json!({"type":"enabled","budget_tokens":scaled(config.budget_tokens.unwrap_or(1024),effort).max(1024).min(connection.settings.output_limit()-1)})
-                    } else {
-                        json!({"type":"disabled"})
-                    };
-                }
-                AnthropicAdaptive => {
-                    body["thinking"] = json!({"type":if on {"adaptive"} else {"disabled"}});
-                    if on {
-                        body["output_config"] = json!({"effort":effort});
-                    }
+            }
+            AnthropicBudget => {
+                body["thinking"] = if on {
+                    json!({"type":"enabled","budget_tokens":scaled(config.budget_tokens.unwrap_or(1024),effort).max(1024).min(connection.settings.output_limit()-1)})
+                } else {
+                    json!({"type":"disabled"})
+                };
+            }
+            AnthropicAdaptive => {
+                body["thinking"] = json!({"type":if on {"adaptive"} else {"disabled"}});
+                if on {
+                    body["output_config"] = json!({"effort":effort});
                 }
             }
         }
     }
-    if connection.settings.native_web_search {
-        let tool = if connection.protocol == Protocol::AnthropicMessages {
-            json!({"type":"web_search_20250305","name":"web_search","max_uses":5})
-        } else {
-            json!({"type":"web_search"})
-        };
-        if body["tools"].is_null() {
-            body["tools"] = json!([]);
-        }
-        body["tools"]
-            .as_array_mut()
-            .expect("tools encoded as array")
-            .push(tool);
-    }
     body["stream"] = json!(connection.settings.supports_streaming);
-    if !connection.settings.supports_streaming {
-        body.as_object_mut()
-            .expect("body object")
-            .remove("stream_options");
-    }
     body
 }
 
@@ -430,13 +417,12 @@ impl Decoder {
                             Some("signature_delta") => Some(("signature", "signature")),
                             _ => None,
                         };
-                        if let Some((target, source)) = pair {
-                            if let Some(fragment) = value["delta"][source].as_str() {
-                                let mut text =
-                                    block[target].as_str().unwrap_or_default().to_owned();
-                                text.push_str(fragment);
-                                block[target] = json!(text);
-                            }
+                        if let Some((target, source)) = pair
+                            && let Some(fragment) = value["delta"][source].as_str()
+                        {
+                            let mut text = block[target].as_str().unwrap_or_default().to_owned();
+                            text.push_str(fragment);
+                            block[target] = json!(text);
                         }
                     }
                 }
@@ -536,11 +522,11 @@ impl Decoder {
             }
             if let Some(n) = detail(details, "cache_write_tokens")? {
                 parsed.cache_write_tokens = n;
-            } else if read("prompt_cache_hit_tokens")?.is_none() {
+            } else if read("prompt_cache_hit_tokens")?.is_none()
+                && let Some(n) = read("prompt_cache_miss_tokens")?
+            {
                 // DeepSeek hit/miss splits inclusive prompt tokens; misses are not cache writes.
-                if let Some(n) = read("prompt_cache_miss_tokens")? {
-                    parsed.cache_write_tokens = n;
-                }
+                parsed.cache_write_tokens = n;
             }
             let output_details = if protocol == Protocol::OpenAiChat {
                 &usage["completion_tokens_details"]
@@ -736,7 +722,8 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_capabilities_do_not_choose_a_request_effort() {
+    fn reasoning_capabilities_do_not_choose_a_request_effort()
+    -> Result<(), Box<dyn std::error::Error>> {
         use crate::model_config::*;
         for (protocol, dialect, budget_tokens) in [
             (Protocol::OpenAiChat, ReasoningDialect::OpenAi, None),
@@ -768,7 +755,7 @@ mod tests {
                     ..Default::default()
                 },
             };
-            c.settings.validate(protocol).unwrap();
+            c.settings.validate(protocol)?;
             let body = encode(&c, None, &[], &[]);
             for field in [
                 "reasoning",
@@ -780,18 +767,15 @@ mod tests {
             ] {
                 assert!(body.get(field).is_none(), "unexpected {field}: {body}");
             }
-            let saved = serde_json::to_value(&c.settings).unwrap();
-            let selected = c
-                .clone()
-                .with_reasoning_effort(ReasoningEffort::High)
-                .unwrap();
+            let saved = serde_json::to_value(&c.settings)?;
+            let selected = c.clone().with_reasoning_effort(ReasoningEffort::High)?;
             assert_eq!(selected.settings.reasoning, c.settings.reasoning);
             assert_eq!(
                 selected.settings.reasoning_effort,
                 Some(ReasoningEffort::High)
             );
-            assert_eq!(serde_json::to_value(&selected.settings).unwrap(), saved);
-            let restored: ModelSettings = serde_json::from_value(saved).unwrap();
+            assert_eq!(serde_json::to_value(&selected.settings)?, saved);
+            let restored: ModelSettings = serde_json::from_value(saved)?;
             assert_eq!(restored, c.settings);
             assert!(
                 c.clone()
@@ -817,10 +801,11 @@ mod tests {
                 .with_reasoning_effort(ReasoningEffort::High)
                 .is_err()
         );
+        Ok(())
     }
 
     #[test]
-    fn configured_requests_usage_and_token_prices() {
+    fn configured_requests_usage_and_token_prices() -> Result<(), Box<dyn std::error::Error>> {
         use crate::model_config::*;
         let mut c = AiConnection {
             base_url: "https://api.openai.com/v1".into(),
@@ -838,7 +823,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        c = c.with_reasoning_effort(ReasoningEffort::High).unwrap();
+        c = c.with_reasoning_effort(ReasoningEffort::High)?;
         let body = encode(&c, None, &[], &[]);
         assert_eq!(body["max_output_tokens"], 8192);
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -855,17 +840,16 @@ mod tests {
         assert_eq!(body["thinking"]["budget_tokens"], 1638);
         assert_eq!(body["tools"][0]["type"], "web_search_20250305");
         let mut d = Decoder::default();
-        d.event(c.protocol, r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":50,"cache_creation_input_tokens":25}}}"#).unwrap();
-        d.event(c.protocol, r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"web","name":"web_search"}}"#).unwrap();
+        d.event(c.protocol, r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":50,"cache_creation_input_tokens":25}}}"#)?;
+        d.event(c.protocol, r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"web","name":"web_search"}}"#)?;
         d.event(
             c.protocol,
             r#"{"type":"message_delta","usage":{"output_tokens":20}}"#,
-        )
-        .unwrap();
-        let u = d.usage.clone().unwrap();
+        )?;
+        let u = d.usage.clone().ok_or("decoded usage missing")?;
         assert_eq!(u.input_tokens, 175);
         assert_eq!(u.output_tokens, 20);
-        assert!(d.finish().unwrap().is_empty());
+        assert!(d.finish()?.is_empty());
         let p = ModelPricing {
             currency: "USD".into(),
             tiers: vec![PriceTier {
@@ -876,7 +860,7 @@ mod tests {
                 cache_write: Some(3.0),
             }],
         };
-        assert!((p.cost(&u).unwrap() - 0.00038).abs() < 1e-12);
+        assert!((p.cost(&u).ok_or("usage price missing")? - 0.00038).abs() < 1e-12);
         c.settings.native_web_search = false;
         c.protocol = Protocol::OpenAiChat;
         assert!(c.settings.validate(c.protocol).is_err());
@@ -885,38 +869,48 @@ mod tests {
             efforts: vec![ReasoningEffort::Low],
             budget_tokens: Some(2000),
         });
-        c = c.with_reasoning_effort(ReasoningEffort::Low).unwrap();
+        c = c.with_reasoning_effort(ReasoningEffort::Low)?;
         let body = encode(&c, None, &[], &[]);
         assert_eq!(body["max_tokens"], 8192);
         assert_eq!(body["enable_thinking"], true);
         assert_eq!(body["thinking_budget"], 200);
-        c.settings.reasoning.as_mut().unwrap().dialect = ReasoningDialect::ThinkingType;
-        c.settings.reasoning.as_mut().unwrap().budget_tokens = None;
+        let reasoning = c
+            .settings
+            .reasoning
+            .as_mut()
+            .ok_or("reasoning configuration missing")?;
+        reasoning.dialect = ReasoningDialect::ThinkingType;
+        reasoning.budget_tokens = None;
         assert_eq!(encode(&c, None, &[], &[])["thinking"]["type"], "enabled");
         c.settings.supports_streaming = false;
         let body = encode(&c, None, &[], &[]);
         assert_eq!(body["stream"], false);
         assert!(body.get("stream_options").is_none());
         let mut decoder = Decoder::default();
-        assert_eq!(decoder.complete(Protocol::OpenAiChat, &json!({"choices":[{"finish_reason":"stop","message":{"content":"done"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}})).unwrap(), "done");
-        assert_eq!(decoder.usage.unwrap().output_tokens, 2);
+        assert_eq!(decoder.complete(Protocol::OpenAiChat, &json!({"choices":[{"finish_reason":"stop","message":{"content":"done"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}))?, "done");
+        assert_eq!(decoder.usage.ok_or("chat usage missing")?.output_tokens, 2);
         let mut decoder = Decoder::default();
-        assert_eq!(decoder.complete(Protocol::OpenAiResponses, &json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":10,"output_tokens":2}})).unwrap(), "done");
-        assert_eq!(decoder.usage.unwrap().input_tokens, 10);
+        assert_eq!(decoder.complete(Protocol::OpenAiResponses, &json!({"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":10,"output_tokens":2}}))?, "done");
+        assert_eq!(
+            decoder.usage.ok_or("responses usage missing")?.input_tokens,
+            10
+        );
         let mut decoder = Decoder::default();
-        assert_eq!(decoder.complete(Protocol::AnthropicMessages, &json!({"stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":2}})).unwrap(), "done");
+        assert_eq!(decoder.complete(Protocol::AnthropicMessages, &json!({"stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":2}}))?, "done");
         c.settings.reasoning = Some(ReasoningConfig {
             dialect: ReasoningDialect::AnthropicAdaptive,
             efforts: vec![ReasoningEffort::High],
             budget_tokens: None,
         });
         c.protocol = Protocol::AnthropicMessages;
-        c = c.with_reasoning_effort(ReasoningEffort::High).unwrap();
+        c = c.with_reasoning_effort(ReasoningEffort::High)?;
         assert_eq!(encode(&c, None, &[], &[])["thinking"]["type"], "adaptive");
+        Ok(())
     }
 
     #[test]
-    fn openai_cache_fields_preserve_inclusive_input_and_reasoning_subset() {
+    fn openai_cache_fields_preserve_inclusive_input_and_reasoning_subset()
+    -> Result<(), Box<dyn std::error::Error>> {
         for (protocol, usage, expected) in [
             (
                 Protocol::OpenAiChat,
@@ -940,10 +934,8 @@ mod tests {
             ),
         ] {
             let mut decoder = Decoder::default();
-            decoder
-                .read_usage(protocol, &json!({"usage":usage}))
-                .unwrap();
-            let usage = decoder.usage.unwrap();
+            decoder.read_usage(protocol, &json!({"usage":usage}))?;
+            let usage = decoder.usage.ok_or("decoded usage missing")?;
             assert_eq!(
                 (
                     usage.input_tokens,
@@ -956,13 +948,12 @@ mod tests {
             );
         }
         let mut decoder = Decoder::default();
-        decoder
-            .read_usage(
-                Protocol::OpenAiChat,
-                &json!({"usage":{"prompt_tokens":100}}),
-            )
-            .unwrap();
+        decoder.read_usage(
+            Protocol::OpenAiChat,
+            &json!({"usage":{"prompt_tokens":100}}),
+        )?;
         assert!(decoder.usage.is_none());
         assert!(decoder.read_usage(Protocol::OpenAiChat, &json!({"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":101}}})).is_err());
+        Ok(())
     }
 }

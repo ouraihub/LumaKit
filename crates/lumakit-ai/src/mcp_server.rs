@@ -29,13 +29,15 @@ pub struct ScopeSpec {
     pub destructive: bool,
 }
 
+type ToolHandler = dyn Fn(&Value) -> Result<Value, RpcError> + Send + Sync;
+
 /// A tool and its host-owned implementation.
 pub struct ExposedTool {
     /// Public MCP tool metadata.
     pub tool: McpTool,
     /// The declared permission required to list or call this tool.
     pub scope: String,
-    handler: Box<dyn Fn(&Value) -> Result<Value, RpcError> + Send + Sync>,
+    handler: Box<ToolHandler>,
 }
 
 impl ExposedTool {
@@ -167,6 +169,10 @@ pub struct McpServer {
 impl McpServer {
     /// Validate all registrations before the host opens its fixed loopback port.
     /// Port zero (an ephemeral port), duplicate names and undeclared scopes fail.
+    ///
+    /// # Errors
+    /// Returns an error for port zero, empty/duplicate names, undeclared tool scopes,
+    /// or non-object tool schemas.
     pub fn new(
         port: u16,
         scopes: Vec<ScopeSpec>,
@@ -229,6 +235,9 @@ impl McpServer {
     }
 
     /// Enable/disable a declared scope. Only pass `confirmed` after host UI confirmation.
+    ///
+    /// # Errors
+    /// Returns an error for an undeclared scope or destructive enabling without confirmation.
     pub fn set_scope_enabled(
         &mut self,
         name: &str,
@@ -249,6 +258,9 @@ impl McpServer {
 
     /// Issue a random 8-byte prefix plus a random 32-byte secret, encoded as hex.
     /// Only its SHA-256 digest is retained in this server's state.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared scopes or unavailable system randomness.
     pub fn issue_token(&mut self, scopes: BTreeSet<String>) -> Result<IssuedToken, McpServerError> {
         self.validate_scopes(&scopes)?;
         let mut random = Zeroizing::new([0_u8; 40]);
@@ -271,6 +283,9 @@ impl McpServer {
     }
 
     /// Load a hash-only record from the host database after validating its scopes.
+    ///
+    /// # Errors
+    /// Returns an error if the record contains undeclared scopes.
     pub fn restore_token(&mut self, record: TokenRecord) -> Result<(), McpServerError> {
         self.validate_scopes(&record.scopes)?;
         self.tokens.insert(record.hash, record);
@@ -289,6 +304,10 @@ impl McpServer {
 
     /// Authenticate, enforce peer/Origin/body/scope policy, then dispatch an MCP method.
     /// The host must not send a JSON-RPC response for notifications (missing request ID).
+    ///
+    /// # Errors
+    /// Returns an error for an oversized request, disallowed peer/Origin, invalid token,
+    /// unknown method/tool, invalid arguments, denied scope, or a tool handler failure.
     pub fn handle_request(
         &self,
         auth: RequestAuth<'_>,

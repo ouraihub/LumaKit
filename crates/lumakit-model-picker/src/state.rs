@@ -73,6 +73,7 @@ pub enum PickerEvent {
 /// Shared GPUI control, independent of chat sessions, storage and design-system globals.
 pub struct Picker {
     pub(crate) data: PickerData,
+    pub(crate) diagnostic_id: Option<String>,
     pub(crate) query: Entity<InputState>,
     pub(crate) expanded: std::collections::HashSet<String>,
     pub(crate) search_folded: std::collections::HashSet<String>,
@@ -106,6 +107,7 @@ impl Picker {
         });
         Self {
             data: PickerData::default(),
+            diagnostic_id: None,
             query,
             expanded: Default::default(),
             search_folded: Default::default(),
@@ -116,6 +118,13 @@ impl Picker {
             slider_focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             _query_subscription: subscription,
+        }
+    }
+    /// Diagnostic ID associated with the host's current refresh failure; `None` hides copying.
+    pub fn set_diagnostic_id(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.diagnostic_id != id {
+            self.diagnostic_id = id;
+            cx.notify();
         }
     }
     /// Replace host state only when changed; this never emits a user action.

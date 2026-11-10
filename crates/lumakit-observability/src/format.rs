@@ -224,16 +224,18 @@ where
                         trace_id.to_owned(),
                         values.get("layer").unwrap_or_default().to_owned(),
                         values.get("operation").unwrap_or_default().to_owned(),
+                        values.get("source_file").unwrap_or_default().to_owned(),
+                        values.get("source_line").unwrap_or_default().to_owned(),
                     ));
                 }
-                Some((_, current_trace, _, _)) if current_trace == trace_id => {
+                Some((_, current_trace, _, _, _, _)) if current_trace == trace_id => {
                     parent = Some(span.id().into_u64());
                     break;
                 }
                 Some(_) => break,
             }
         }
-        if let Some((span_id, trace_id, layer, operation)) = &current {
+        if let Some((span_id, trace_id, layer, operation, source_file, source_line)) = &current {
             line.put("TraceId", trace_id)?;
             line.put("SpanId", span_id)?;
             match parent {
@@ -242,6 +244,8 @@ where
             }
             line.put("Layer", layer)?;
             line.put("ME", operation)?;
+            line.put("SourceFile", source_file)?;
+            line.put("SourceLine", source_line)?;
         }
         if event.metadata().target() != TARGET {
             line.put("Target", event.metadata().target())?;

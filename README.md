@@ -76,6 +76,7 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 - `lumakit-egui::ChatPanel`：egui/eframe **0.37.0** 版，Markdown 用 egui_commonmark **0.26.0**；`install_icon_font` 在 `set_fonts` 前注册 Phosphor 图标字体。只服务 LumaDesk 旧 egui 版（标签 `legacy-egui`）与 `examples/chat-host`。
 - 两个面板沿用现有“用量”入口，弹层展示上下文估算和当前对话累计，上次回答明细默认折叠；全局按日期／模型／服务商统计由宿主设置页提供。仅用户配置的请求价格用于金额显示；未配置时显示 token，不套用目录参考价，不进行币种换算。
 - 共享选择器只接收无密钥的 `PickerData`（模型稳定身份、来源、已声明档位、当前组合、默认组合和忙碌／错误状态），只发 `Select/SetDefault/Refresh` 意图。`lumakit-gpui` 将它们转为既有 `ChatAction`；ThinkRail Native 将它们转为原有 `AgentSession::set_model`、`ModelPrefService::set_default` 和目录刷新。两宿主的数据库和引擎状态不互相迁移。
+- `ChatPanel::set_model_refresh_state(refreshing, notice, diagnostic_id, cx)` 接收宿主真实刷新失败 ID；独立 `Picker::set_diagnostic_id` 只控制失败时的复制动作，不读日志或修改请求。普通发送、重试、翻译的 `Attempt.trace_id` 保存真实 `ai.request` root（chat.db schema 6 的 nullable 列，旧记录为 None），失败诊断默认折叠，展开后可复制完整 ID，到产品日志页定位。
 - 图标使用原版 ThinkRail `ModelEffortPicker.tsx` 所用的 `@remixicon/react` **4.9.0** 路径（npm SHA-1 `e4469985dc88af987f03c2309e36b04028cb4600`），不以相似 Lucide 图形替换：关闭 Zzz、最低 Leaf、低 Flashlight、中 ContrastDrop2（半填充水滴）、高 Sparkling2、极高 Sparkling、最高 Fire；图钉、钥匙、重置／刷新同源。通过 `PickerAssets(HostAssets)` 组合宿主资源；资源离线嵌入，许可见 `crates/lumakit-model-picker/LICENSE-REMIX`（https://github.com/Remix-Design/RemixIcon/blob/master/License）。
 - 底部输入栏发送按钮左侧共用 `lumakit-usage-status::ContextStatusView`，上下文摘要按 OMP 阈值着色；Windows/macOS/Linux 使用目标系统图标，魔杖使用 Remix `RiMagicLine`，两组之间是留有间距的暗色圆点，不使用竖线。只有用户保存的有效单价才显示 `≈$金额`／`≈¥金额`；否则显示 token。完整 token、缓存子集和自动压缩状态在详情中。
 
