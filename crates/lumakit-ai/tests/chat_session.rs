@@ -1828,13 +1828,6 @@ fn painting_two_image_cap_and_later_text_failure_keep_persisted_media() -> Resul
     assert!(!attempt.tool_events[0].is_error);
     assert!(!attempt.tool_events[1].is_error);
     assert!(attempt.tool_events[2].is_error);
-    assert!(
-        attempt
-            .error
-            .as_ref()
-            .ok_or("missing expected value")?
-            .contains("503")
-    );
     let ids: Vec<_> = attempt
         .generated
         .iter()

@@ -76,6 +76,9 @@ impl ChatSession {
         let Some(job) = &self.job else {
             return false;
         };
+        self.active_job_identity_matches(job)
+    }
+    fn active_job_identity_matches(&self, job: &Job) -> bool {
         self.history
             .conversations
             .get(job.conversation)
@@ -97,11 +100,21 @@ impl ChatSession {
                         job.generation == envelope.generation
                             && envelope.generation == self.generation
                     }) {
+                        tracing::debug!(
+                            event = "chat.event.drop",
+                            reason = "generation_changed",
+                            "丢弃过期聊天事件"
+                        );
                         continue;
                     }
                     envelope.event
                 }
                 Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    tracing::warn!(
+                        event = "chat.worker.disconnected",
+                        code = "CHAT_WORKER_DISCONNECTED",
+                        "聊天线程未交付终态即关闭通道"
+                    );
                     if self.active_identity_matches()
                         && let Some(attempt) = self.active_attempt()
                     {
@@ -115,10 +128,20 @@ impl ChatSession {
             };
             processed += 1;
             if !self.active_identity_matches() {
+                tracing::debug!(
+                    event = "chat.event.drop",
+                    reason = "identity_changed",
+                    "丢弃身份不匹配的聊天事件"
+                );
                 continue;
             }
             let terminal = self.job.as_ref().is_some_and(|job| job.terminal);
             if terminal {
+                tracing::debug!(
+                    event = "chat.event.drop",
+                    reason = "terminal_already_applied",
+                    "丢弃终态后的聊天事件"
+                );
                 continue;
             }
             let persist = !matches!(&event, Event::Delta(_) | Event::End(_));
@@ -222,14 +245,30 @@ impl ChatSession {
         }
         if ended {
             if let Some(job) = self.job.take() {
-                if self.history.conversations[job.conversation].turns[job.turn].attempts
-                    [job.attempt]
-                    .status
-                    != TurnStatus::Completed
+                let identity_matches = self.active_job_identity_matches(&job);
+                if job.thread.join().is_err() {
+                    // panic hook 是程序错误的最终 ERROR 所有者；join 仅补充安全线程边界诊断。
+                    tracing::warn!(
+                        event = "chat.worker.join",
+                        code = "CHAT_WORKER_PANICKED",
+                        "聊天线程异常退出；已保留内存记录"
+                    );
+                    if identity_matches {
+                        let attempt = &mut self.history.conversations[job.conversation].turns
+                            [job.turn]
+                            .attempts[job.attempt];
+                        attempt.status = TurnStatus::Failed;
+                        attempt.error = Some("聊天线程异常退出；已保留部分回答，可重试。（错误码：CHAT_WORKER_PANICKED）".into());
+                    }
+                }
+                if identity_matches
+                    && self.history.conversations[job.conversation].turns[job.turn].attempts
+                        [job.attempt]
+                        .status
+                        != TurnStatus::Completed
                 {
                     self.restore_draft(job.conversation, job.turn, job.draft);
                 }
-                let _ = job.thread.join();
             }
             self.phase = ChatPhase::Idle;
             self.save();

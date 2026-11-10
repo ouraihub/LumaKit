@@ -330,8 +330,12 @@ async fn exercise(protocol: Protocol) -> TestResult {
             body,
         } => {
             assert_eq!(*status, 401);
-            assert_eq!(request_id, "x-request-id=req-test-***");
-            assert_eq!(body, "rejected ***");
+            assert_eq!(
+                request_id,
+                &lumakit_observability::diagnostic_hash(&format!("req-test-{KEY}"))
+            );
+            assert!(!body.contains("rejected"));
+            assert!(!body.contains(KEY));
         }
         other => return Err(format!("上游 HTTP 错误丢失类型和请求标识：{other}").into()),
     }
@@ -357,7 +361,6 @@ async fn exercise(protocol: Protocol) -> TestResult {
     .ok_or("upstream error unexpectedly succeeded")?
     .to_string();
     assert!(!error.contains(KEY));
-    assert!(error.contains("***"));
     worker.join().map_err(|_| "HTTP fixture panicked")??;
 
     let (url, worker) = server(protocol, 401, "x".repeat(16384), false, None)?;
@@ -371,8 +374,8 @@ async fn exercise(protocol: Protocol) -> TestResult {
     .err()
     .ok_or("oversized error body unexpectedly succeeded")?
     .to_string();
-    assert!(error.contains("exceeds 8192 bytes"));
-    assert!(error.len() < 200);
+    assert!(!error.contains(&"x".repeat(128)));
+    assert!(matches!(error.len(), 1..=256));
     worker.join().map_err(|_| "HTTP fixture panicked")??;
 
     let (url, worker) = server(protocol, 200, "x".repeat(4 * 1024 * 1024 + 1), false, None)?;

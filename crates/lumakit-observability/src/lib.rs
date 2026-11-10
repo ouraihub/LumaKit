@@ -2,7 +2,7 @@
 use lumakit_support::SupportError;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -14,11 +14,16 @@ use tracing_subscriber::{
 
 mod format;
 mod operation;
+mod panic_log;
 mod parse;
 mod redact;
+mod source;
 #[cfg(test)]
 mod tests;
 mod trace;
+mod writer;
+
+use writer::SharedWriter;
 
 pub use format::{GrepFormat, SpanFields};
 pub use operation::{OperationGuard, operation};
@@ -70,7 +75,7 @@ pub enum LogError {
     /// 底层支持功能返回的错误。
     #[error(transparent)]
     Support(#[from] SupportError),
-    /// 日志级别配置的 JSON 序列化失败。
+    /// 日志级别配置的 JSON 解析或序列化失败。
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     /// 全局 tracing 订阅器已被初始化，无法再次安装。
@@ -84,73 +89,21 @@ pub enum LogError {
 struct LevelFile {
     level: LogLevel,
 }
-struct FileWriter {
-    file: File,
-    path: PathBuf,
-    max_bytes: u64,
-}
-impl FileWriter {
-    fn open(path: PathBuf, max_bytes: u64) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self {
-            file,
-            path,
-            max_bytes,
-        })
-    }
-    fn rotate(&mut self, incoming: usize) -> io::Result<()> {
-        if self.file.metadata()?.len() + incoming as u64 <= self.max_bytes {
-            return Ok(());
-        }
-        self.file.flush()?;
-        let old = self.path.with_extension("log.1");
-        let _ = fs::remove_file(&old);
-        fs::rename(&self.path, &old)?;
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        Ok(())
-    }
-}
-impl Write for FileWriter {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.rotate(b.len())?;
-        self.file.write(b)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-#[derive(Clone)]
-struct SharedWriter(Arc<Mutex<FileWriter>>);
-impl Write for SharedWriter {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::other("log writer poisoned"))?
-            .write(b)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::other("log writer poisoned"))?
-            .flush()
-    }
-}
 /// 可克隆的全局文件日志控制句柄；克隆之间共享级别和过滤器。
 #[derive(Clone)]
 pub struct LogHandle {
     level: Arc<Mutex<LogLevel>>,
     path: PathBuf,
     reload: reload::Handle<EnvFilter, Registry>,
+    writer: SharedWriter,
 }
 impl LogHandle {
     /// 创建目录并安装全局日志订阅器，将日志追加到 `app.log`。
     ///
-    /// 优先读取 `level.json`，读取或解析失败时使用 `default`。
+    /// 优先读取 `level.json`，仅文件不存在时使用 `default`；损坏配置和读取失败返回错误。
     /// 写入使文件超过 `max_bytes` 时轮转到 `app.log.1`，仅保留一份旧文件。
     /// 每行使用 `TraceId:…|Layer:…|ME:…|EV:…` 的 grep 格式。
+    /// 安装安全同步 panic hook，保留 unwind/abort，不输出原始载荷。
     ///
     /// # Errors
     /// 目录或文件操作失败、全局订阅器已安装时返回错误。
@@ -158,36 +111,40 @@ impl LogHandle {
         fs::create_dir_all(dir)?;
         let path = dir.join("app.log");
         let level_path = dir.join("level.json");
-        let level = fs::read(&level_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<LevelFile>(&b).ok())
-            .map(|v| v.level)
-            .unwrap_or(default);
-        let filter = EnvFilter::new(level.as_filter());
+        let level = match fs::read(&level_path) {
+            Ok(bytes) => serde_json::from_slice::<LevelFile>(&bytes)?.level,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => default,
+            Err(error) => return Err(error.into()),
+        };
+        let filter = log_filter(level);
         let (layer, reload) = reload::Layer::new(filter);
-        let shared = SharedWriter(Arc::new(Mutex::new(FileWriter::open(
-            path.clone(),
-            max_bytes,
-        )?)));
+        let shared = SharedWriter::open(path.clone(), max_bytes)?;
+        let output_writer = shared.clone();
         let output = fmt::layer()
             .with_ansi(false)
             .event_format(GrepFormat::utc())
-            .with_writer(move || shared.clone());
+            .with_writer(move || output_writer.clone())
+            .log_internal_errors(false);
         Registry::default()
             .with(layer)
             .with(SpanFields)
             .with(output)
             .try_init()
             .map_err(|_| LogError::AlreadyInitialized)?;
+        panic_log::install(shared.clone());
         Ok(Self {
             level: Arc::new(Mutex::new(level)),
             path,
             reload,
+            writer: shared,
         })
     }
-    /// 返回共享的当前级别；级别锁中毒时返回 `Info`。
+    /// 返回共享的当前级别；锁中毒时读取锁内最后保存的值，不替换为默认级别。
     pub fn level(&self) -> LogLevel {
-        self.level.lock().map(|v| *v).unwrap_or(LogLevel::Info)
+        *self
+            .level
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// 更新过滤器及内存级别，再将级别写入 `level.json`。
     ///
@@ -195,7 +152,7 @@ impl LogHandle {
     /// 重载、锁定或持久化失败时返回错误；持久化失败不会回滚已更新的级别。
     pub fn set_level(&self, level: LogLevel) -> Result<LogStatus, LogError> {
         self.reload
-            .modify(|f| *f = EnvFilter::new(level.as_filter()))
+            .modify(|f| *f = log_filter(level))
             .map_err(|_| LogError::InvalidLevel)?;
         *self
             .level
@@ -233,11 +190,16 @@ impl LogHandle {
             .rev()
             .collect())
     }
-    /// 当前不执行额外刷盘操作。
+    /// 刷新实际日志 writer；若之前的写入或轮转失败，也返回该失败。
     ///
     /// # Errors
-    /// 始终返回成功；保留 `Result` 供宿主统一处理关闭流程。
+    /// writer 锁中毒、写入或刷新失败时返回错误。
     pub fn flush(&self) -> Result<(), LogError> {
+        self.writer.clone().flush()?;
         Ok(())
     }
+}
+
+fn log_filter(level: LogLevel) -> EnvFilter {
+    EnvFilter::new(format!("{},{}=error", level.as_filter(), panic_log::TARGET))
 }

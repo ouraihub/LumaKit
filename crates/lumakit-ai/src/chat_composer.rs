@@ -241,7 +241,7 @@ impl ChatSession {
                 .is_err()
             {
                 drop(file);
-                let _ = std::fs::remove_file(&path);
+                super::diagnostics::remove_media(&path);
                 return Err("无法完整保存图片附件。".into());
             }
             let image = ImageRef {
@@ -306,7 +306,7 @@ impl ChatSession {
         } else {
             self.composer_data = before;
             if let Some(key) = media_key {
-                let _ = std::fs::remove_file(self.media_root.join(key));
+                super::diagnostics::remove_media(&self.media_root.join(key));
             }
             Err(self.notice.clone())
         }

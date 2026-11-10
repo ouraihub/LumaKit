@@ -678,7 +678,10 @@ fn implicit_composer_attachment_and_send_keep_pending_model() -> Result<(), Test
                     settings: pending.settings.clone(),
                 });
                 assert!(!session.busy());
-                assert_eq!(session.notice(), "请输入问题或添加附件。");
+                assert!(session.notice().contains("CHAT_PREPARE_FAILED"));
+                let conversation = session.selected().ok_or("missing selected conversation")?;
+                assert!(conversation.draft.is_empty());
+                assert!(conversation.turns.is_empty());
             }
             other => return Err(format!("unknown fixture input: {other}").into()),
         }
