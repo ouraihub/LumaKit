@@ -37,12 +37,26 @@ impl ChatPanel {
         let icon = match tool {
             ToolbarTool::NewConversation => IconName::MessageSquarePlus,
             ToolbarTool::Attachment => IconName::Paperclip,
-            ToolbarTool::WebSearch => IconName::Globe,
+            ToolbarTool::WebSearch => {
+                if composer.web_search {
+                    IconName::Globe
+                } else {
+                    IconName::GlobeOff
+                }
+            }
             ToolbarTool::GenerateImage => IconName::Image,
         };
         icon_button(label, icon, label)
             .disabled(!enabled)
             .selected(selected)
+            .when(tool == ToolbarTool::WebSearch, |button| {
+                let state = if composer.web_search {
+                    "网络搜索已开启，点击关闭"
+                } else {
+                    "网络搜索已关闭，点击开启"
+                };
+                button.accessibility_label(state).tooltip(state)
+            })
             .when(tool == ToolbarTool::GenerateImage, |button| {
                 button.tooltip(if composer.image_mode {
                     "关闭生成图片"

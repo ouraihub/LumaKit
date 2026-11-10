@@ -77,6 +77,7 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 
 - `lumakit-gpui::ChatPanel`：GPUI 聊天面板，样式只取自 `lumakit-design`；Markdown 先经 pulldown-cmark 清理，不加载图片。
 - GPUI 输入区“＋”菜单使用 256px 锚定浮层；“自定义工具栏”提供图标、拖动手柄、显示开关与恢复默认。手柄可拖放或用上下键调整已固定工具的顺序，关闭后重开、应用重启均保留。只列出实际实现的新对话、网络搜索、上传附件、生成图片，不改变请求开关或执行工具。未固定工具仍可从“＋”菜单执行；Esc 或点击外部关闭浮层。
+- GPUI 网络搜索开关沿用 Aether `ChatPanelToolbar` 的状态语义：开启显示 `Globe`，关闭显示带斜杠的 `GlobeOff`，不只靠选中底色区分；悬浮提示与底栏可访问名称显示当前状态及点击动作。2026-11-10：图标资源回归通过，LumaDesk debug 实窗鼠标开启、空格关闭及 320/375/414/768 逻辑宽度已观察；截图 `C:/Users/Administrator/AppData/Local/Temp/search-icons-p93wi096/`。工具栏模块 327 行，仍只负责工具显示与意图回调；资源模块 167 行。未改请求、持久化或工具栏布局。
 - GPUI 模型与推理强度入口由独立 `lumakit-model-picker::Picker` 提供：底部输入工具栏的紧凑模型按钮向上展开 360px 浮层，搜索支持 `模型名 high`；供应商分组、两行来源信息、当前选中标记、离散滑杆、档位点击及左右键共用实现。按截图不再重复铺“最近使用／全部模型／收藏”区块。底栏“设为默认”“重置为 off”和刷新具有不同含义；无 off 能力时不伪造关闭，默认继承不会自动变成第一档。
 - `lumakit-egui::ChatPanel`：egui/eframe **0.37.0** 版，Markdown 用 egui_commonmark **0.26.0**；`install_icon_font` 在 `set_fonts` 前注册 Phosphor 图标字体。只服务 LumaDesk 旧 egui 版（标签 `legacy-egui`）与 `examples/chat-host`。
 - 两个面板沿用现有“用量”入口，弹层展示上下文估算和当前对话累计，上次回答明细默认折叠；全局按日期／模型／服务商统计由宿主设置页提供。仅用户配置的请求价格用于金额显示；未配置时显示 token，不套用目录参考价，不进行币种换算。
