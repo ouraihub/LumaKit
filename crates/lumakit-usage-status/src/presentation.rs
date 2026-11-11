@@ -1,5 +1,5 @@
-use crate::{ContextStatus, Money, StatusState};
 use crate::localization::text as tr;
+use crate::{ContextStatus, Money, StatusState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pressure {
@@ -126,14 +126,24 @@ pub(crate) fn details(status: &ContextStatus) -> String {
         "{}: {used} / {window} tokens ({p})\n{}: {}\n{}: {total}\n{}: {spending}\n{}: {}\n{}: {}\n{}",
         tr("上下文"),
         tr("来源"),
-        tr(if status.estimate { "估算" } else { "宿主报告；缺失值保持未知" }),
+        tr(if status.estimate {
+            "估算"
+        } else {
+            "宿主报告；缺失值保持未知"
+        }),
         tr("累计请求 tokens"),
         tr("显示"),
         tr("状态"),
         state_label(status.state),
         tr("自动压缩"),
-        tr(if status.auto_compact { "已启用" } else { "未启用或未报告" }),
-        tr("? 表示未知，~ 表示上下文估算；有请求时保存的用户单价才显示金额，否则显示 token。金额不是服务商账单。"),
+        tr(if status.auto_compact {
+            "已启用"
+        } else {
+            "未启用或未报告"
+        }),
+        tr(
+            "? 表示未知，~ 表示上下文估算；有请求时保存的用户单价才显示金额，否则显示 token。金额不是服务商账单。"
+        ),
     );
     if !status.detail.trim().is_empty() {
         text.push_str("\n\n");

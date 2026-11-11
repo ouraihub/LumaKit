@@ -1,6 +1,6 @@
 //! Native draggable discrete effort rail, clickable ticks and keyboard navigation.
-use crate::{Model, Picker, effort::selected_effort, icons::glyph};
 use crate::localization::text as tr;
+use crate::{Model, Picker, effort::selected_effort, icons::glyph};
 use gpui_kit::base::{Slider, SliderIndicator, SliderThumb, SliderTrack};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
@@ -50,7 +50,8 @@ impl Picker {
             state.update(cx, |s, cx| s.set_value(index as f32, window, cx));
         }
         let label = current.map_or_else(|| tr("默认").into_owned(), |e| e.label.clone());
-        let hint = current.map_or_else(|| tr("使用服务商默认强度").into_owned(), |e| e.hint.clone());
+        let hint =
+            current.map_or_else(|| tr("使用服务商默认强度").into_owned(), |e| e.hint.clone());
         let icon = glyph(current.map(|e| e.id.as_str()));
         let color = match current.map(|e| e.id.as_str()) {
             Some("off" | "minimal" | "low") => colors.info,

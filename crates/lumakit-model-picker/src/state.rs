@@ -76,6 +76,7 @@ pub struct Picker {
     pub(crate) data: PickerData,
     pub(crate) diagnostic_id: Option<String>,
     pub(crate) query: Entity<InputState>,
+    pub(crate) query_placeholder: std::borrow::Cow<'static, str>,
     pub(crate) expanded: std::collections::HashSet<String>,
     pub(crate) search_folded: std::collections::HashSet<String>,
     pub(crate) highlighted: usize,
@@ -95,9 +96,8 @@ impl EventEmitter<PickerEvent> for Picker {}
 impl Picker {
     /// Create transient inputs; call `set_data` with an authoritative host snapshot.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(tr("搜索模型…（可附加等级：opus high）"))
-        });
+        let query_placeholder = tr("搜索模型…（可附加等级：opus high）");
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(query_placeholder.clone()));
         let subscription = cx.subscribe(&query, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
                 this.highlighted = 0;
@@ -110,6 +110,7 @@ impl Picker {
             data: PickerData::default(),
             diagnostic_id: None,
             query,
+            query_placeholder,
             expanded: Default::default(),
             search_folded: Default::default(),
             highlighted: 0,
@@ -149,7 +150,12 @@ impl Picker {
     /// absent IDs retain their host-provided labels and hints.
     pub fn set_effort_labels(&mut self, labels: &[(&str, &str)], cx: &mut Context<Self>) {
         let mut changed = false;
-        for effort in self.data.models.iter_mut().flat_map(|model| &mut model.efforts) {
+        for effort in self
+            .data
+            .models
+            .iter_mut()
+            .flat_map(|model| &mut model.efforts)
+        {
             if let Some((_, label)) = labels.iter().find(|(id, _)| *id == effort.id)
                 && effort.label != *label
             {

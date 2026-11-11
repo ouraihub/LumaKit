@@ -1,7 +1,7 @@
 //! Model-service presentation shared by GPUI hosts. Hosts own configuration, requests and secrets;
 //! this module owns layout and accepts explicit semantic colors, controls and intent handlers.
-use gpui_kit::base::{h_flex, v_flex};
 use crate::localization::text as tr;
+use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::{AnyElement, Div, ParentElement, SharedString, Styled, div};
 use lumakit_design::{
     Roles,

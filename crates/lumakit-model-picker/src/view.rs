@@ -1,6 +1,6 @@
 //! Screenshot-aligned grouped surface and bottom-composer trigger; host theme only.
-use crate::{Model, Picker, effort};
 use crate::localization::text as tr;
+use crate::{Model, Picker, effort};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
@@ -21,8 +21,11 @@ impl Picker {
     pub(crate) fn surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
         let placeholder = tr("搜索模型…（可附加等级：opus high）");
-        if self.query.read(cx).placeholder().as_ref() != placeholder.as_ref() {
-            self.query.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
+        if self.query_placeholder != placeholder {
+            self.query_placeholder = placeholder.clone();
+            self.query.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx)
+            });
         }
         let query = self.query.read(cx).value().to_string();
         let searching = !query.trim().is_empty();
@@ -100,7 +103,11 @@ impl Picker {
                                         } else {
                                             std::borrow::Cow::Borrowed("")
                                         },
-                                        if models.iter().any(|m| m.has_key) { " · " } else { "" },
+                                        if models.iter().any(|m| m.has_key) {
+                                            " · "
+                                        } else {
+                                            ""
+                                        },
                                         source,
                                         models.len()
                                     )),
@@ -139,13 +146,16 @@ impl Picker {
             }
         }
         if self.data.models.is_empty() || (searching && visible.is_empty()) {
-            rows = rows.child(div().p(px(12.)).text_color(colors.muted_foreground).child(
-                tr(if searching {
-                    "没有匹配的模型"
-                } else {
-                    "没有可用模型，请先配置服务商"
-                }),
-            ));
+            rows = rows.child(
+                div()
+                    .p(px(12.))
+                    .text_color(colors.muted_foreground)
+                    .child(tr(if searching {
+                        "没有匹配的模型"
+                    } else {
+                        "没有可用模型，请先配置服务商"
+                    })),
+            );
         }
         let current = self
             .data

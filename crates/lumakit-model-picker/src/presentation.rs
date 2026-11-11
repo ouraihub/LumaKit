@@ -1,7 +1,7 @@
 //! Model rows, action footer and bottom trigger; grouped surface layout lives in view.
 use super::view::{col, row};
-use crate::{Model, Picker, PickerEvent, effort, icons::icon};
 use crate::localization::text as tr;
+use crate::{Model, Picker, PickerEvent, effort, icons::icon};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _,
@@ -38,7 +38,12 @@ impl Picker {
             .px(px(8.))
             .selected(selected || highlighted)
             .disabled(!self.data.enabled)
-            .accessibility_label(format!("{} {} · {}", tr("选择模型"), model.name, model.provider))
+            .accessibility_label(format!(
+                "{} {} · {}",
+                tr("选择模型"),
+                model.name,
+                model.provider
+            ))
             .child(
                 row()
                     .w_full()

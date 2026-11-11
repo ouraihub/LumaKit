@@ -17,12 +17,12 @@ use gpui_kit::{
 };
 
 use super::{field, label};
+use crate::localization::text as tr;
 use crate::{
     Roles,
     components::{Handler, roles},
     metrics::{radius, size, space, text},
 };
-use crate::localization::text as tr;
 
 /// One saved key: its masked (or explicitly revealed) value in a bordered box with icon actions.
 ///
@@ -409,7 +409,9 @@ impl RenderOnce for KeyManager {
                     &r,
                 )
                 .when(editing, |d| {
-                    d.child(label(text::METADATA, tr("空草稿不会清空原密钥")).text_color(r.text_subtle))
+                    d.child(
+                        label(text::METADATA, tr("空草稿不会清空原密钥")).text_color(r.text_subtle),
+                    )
                 }),
             )
             .child(actions)

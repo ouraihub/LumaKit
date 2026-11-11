@@ -1,11 +1,11 @@
 //! Shared GPUI model-service and chat presentation. Hosts retain business state and persistence;
 //! colors, typography and visual tokens come from lumakit-design.
 extern crate gpui_kit as gpui;
-pub mod localization;
 #[cfg(feature = "chat")]
 mod capabilities;
 #[cfg(feature = "chat")]
 pub mod chat;
+pub mod localization;
 pub mod providers;
 #[cfg(feature = "chat")]
 pub use capabilities::model_capability_badges;
