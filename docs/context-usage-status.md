@@ -60,6 +60,11 @@ pub enum StatusState { Ready, Streaming, Compacting, Unknown }
 - 窄宽度优先保留上下文百分比和窗口，累计费用退化为 tooltip/详情；
 - 状态条固定在输入工具栏中，发送按钮保持最右侧。
 
+本地化通过 `lumakit_usage_status::localization::set_translator` 注入 UI 线程回调；
+默认中文。每次渲染（包括已打开的详情）重新读取标签，宿主切换语言后刷新窗口即可。
+状态、来源、估算/未知及账单免责声明、tooltip 和可访问名称均覆盖；数值、币种、
+平台名称与宿主 `detail` 不翻译或改写。该回调不访问网络/存储、不安装额外主题。
+
 OS 图标由 `UsageStatusAssets<A>` 组合到宿主 AssetSource：Windows 使用四格透视标志，macOS 使用 Apple，Linux 使用 Linux/Tux 图标映射。Windows 为按参考绘制的组件图形；Apple/Linux 使用 Simple Icons CC0 资源，商标仍归原权利人。系统在编译目标选择，不查询外部服务；macOS/Linux 仅完成资源与接口设计，未声明平台运行验收。
 
 ## LumaDesk 接入

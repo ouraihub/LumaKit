@@ -22,6 +22,7 @@ use crate::{
     components::{Handler, roles},
     metrics::{radius, size, space, text},
 };
+use crate::localization::text as tr;
 
 /// One saved key: its masked (or explicitly revealed) value in a bordered box with icon actions.
 ///
@@ -166,8 +167,8 @@ fn action(id: SharedString, icon: IconName, name: &'static str, handler: Handler
         .ghost()
         .xsmall()
         .icon(icon)
-        .accessibility_label(name)
-        .tooltip(name)
+        .accessibility_label(tr(name))
+        .tooltip(tr(name))
         .on_click(handler)
 }
 
@@ -278,7 +279,7 @@ impl RenderOnce for KeyRow {
                         .xsmall()
                         .ghost()
                         .icon(IconName::Check)
-                        .label("使用此密钥")
+                        .label(tr("使用此密钥"))
                         .selected(selected)
                         .disabled(disabled)
                         .on_click(handler),
@@ -371,7 +372,7 @@ impl RenderOnce for KeyManager {
             actions = actions.child(
                 Button::new("key-manager-cancel-edit")
                     .outline()
-                    .label("取消修改")
+                    .label(tr("取消修改"))
                     .on_click(handler),
             );
         }
@@ -379,11 +380,11 @@ impl RenderOnce for KeyManager {
             actions = actions.child(
                 Button::new("key-manager-save")
                     .primary()
-                    .label(if editing {
+                    .label(tr(if editing {
                         "保存修改后的密钥"
                     } else {
                         "保存新密钥"
-                    })
+                    }))
                     .disabled(!self.can_save)
                     .on_click(handler),
             );
@@ -399,16 +400,16 @@ impl RenderOnce for KeyManager {
             })
             .child(
                 field(
-                    if editing {
+                    tr(if editing {
                         "修改密钥"
                     } else {
                         "添加密钥"
-                    },
+                    }),
                     self.input,
                     &r,
                 )
                 .when(editing, |d| {
-                    d.child(label(text::METADATA, "空草稿不会清空原密钥").text_color(r.text_subtle))
+                    d.child(label(text::METADATA, tr("空草稿不会清空原密钥")).text_color(r.text_subtle))
                 }),
             )
             .child(actions)
@@ -420,8 +421,8 @@ pub fn key_manage_button(id: impl Into<gpui_kit::ElementId>) -> Button {
     Button::new(id)
         .outline()
         .icon(IconName::KeyRound)
-        .accessibility_label("密钥管理")
-        .tooltip("密钥管理")
+        .accessibility_label(tr("密钥管理"))
+        .tooltip(tr("密钥管理"))
 }
 
 /// A delete confirmation: title, what goes away, a quiet cancel and a destructive confirm.
@@ -437,7 +438,7 @@ pub fn delete_confirm(
         .child(
             v_flex()
                 .gap(space::S4)
-                .child(label(text::TITLE_DIALOG, "确认删除"))
+                .child(label(text::TITLE_DIALOG, tr("确认删除")))
                 .child(label(text::UI, note).text_color(r.text_muted)),
         )
         .child(
@@ -447,13 +448,13 @@ pub fn delete_confirm(
                 .child(
                     Button::new("cancel-delete")
                         .outline()
-                        .label("取消")
+                        .label(tr("取消"))
                         .on_click(on_cancel),
                 )
                 .child(
                     Button::new("confirm-delete")
                         .danger()
-                        .label("确认删除")
+                        .label(tr("确认删除"))
                         .on_click(on_confirm),
                 ),
         )

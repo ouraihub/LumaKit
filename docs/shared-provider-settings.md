@@ -18,6 +18,11 @@
 
 组件接收 lumakit-design 的语义 Roles，不安装第二套主题。LumaDesk 从 LumaTheme 传入；Native 在宿主边界把现有同名语义角色转换成共享 Roles。所有尺寸来自 lumakit-design::metrics；不新增主题或十六进制颜色。
 
+本地化：`lumakit-gpui::localization::set_translator` 覆盖内置 API 密钥/地址、策略和模型标题；
+`lumakit-design::localization::set_translator` 覆盖密钥显示/隐藏/复制/编辑/删除、管理按钮、
+保存/取消和确认文案（含 tooltip 与可访问名称）。宿主在 UI 线程显式注册翻译并刷新窗口，
+未注册的消费者保持中文；宿主提供的字段值、业务说明和模型/协议名不交给共享翻译。
+
 ## 状态与敏感信息
 
 1. 首钥按 Enter 或失焦提交；空值不删除已有密钥。保存成功才清空输入；失败保留草稿并提供重试，不伪造成功。

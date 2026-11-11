@@ -40,6 +40,14 @@ GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui
 
 `KeyRow` / `KeyManager` 可通过 `.roles(host_roles)` 使用宿主语义色，不要求安装第二套 `LumaTheme`；`KeyRow::hover_actions` 保留键盘可达的悬停动作。`lumakit-gpui::providers` 组合服务商栏、详情、密钥、线路、模型列表与编辑表单；它只接收显示内容及用户意图回调，不访问网络、数据库或凭据存储。默认 `chat` feature 保留聊天 API；Native 关闭默认 feature，仅消费共享模型服务 UI。
 
+共享选择器、用量状态、密钥控件及服务商展示分别通过各 crate 的
+`localization::set_translator(fn(&'static str) -> Cow<'static, str>)` 注入宿主翻译。
+默认保持中文；在 GPUI UI 线程注册，语言变更后刷新窗口即可更新已打开弹层、搜索占位、
+工具提示与无障碍名称。回调只接收内置 UI 源标签，不翻译服务商/模型名、协议或 effort wire ID。
+宿主自有 `PickerData` 文案仍由宿主翻译；缓存的 effort 标签可用
+`Picker::set_effort_labels` 原位更新，不重新加载目录、不清除搜索、不改变选择。
+回调不得执行 I/O 或重入 GPUI；普通语言可返回借用标签，伪本地化可由宿主缓存生成文本。
+
 多密钥标签通过 `SavedKey::label` 保存；`normalize_key_label` / `set_label` 统一可选标签校验。模型目录 schema 3 追加 nullable `endpoint_keys.label`，schema 4 追加默认启用的 `enabled`；旧数据库/JSON 未命名密钥保持原 ID 和密文。修改标签或启用状态不解密或重新加密；停用密钥不参与连接解析或检测，存有密钥但全部停用时明确拒绝而非匿名请求。服务商密钥管理共用紧凑 `key_entry`（标签、密钥、提交同一行）、`KeyRow::trailing` 内嵌启用 Switch 及内容自适应短弹层。
 
 ## lumakit-ai

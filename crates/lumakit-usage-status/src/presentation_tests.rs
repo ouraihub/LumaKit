@@ -160,3 +160,31 @@ fn thresholds_use_highest_reported_pressure_and_require_known_capacity_for_token
         Pressure::Critical
     );
 }
+
+#[test]
+fn details_follow_translator_changes_without_changing_reported_facts() {
+    use std::borrow::Cow;
+    fn translated(source: &'static str) -> Cow<'static, str> {
+        Cow::Borrowed(match source {
+            "上下文" => "Context",
+            "状态未知" => "Unknown state",
+            other => other,
+        })
+    }
+    let status = ContextStatus {
+        used_tokens: Some(12),
+        context_window: Some(100),
+        state: StatusState::Unknown,
+        detail: "provider/model:high".into(),
+        ..Default::default()
+    };
+    let chinese = details(&status);
+    crate::localization::set_translator(translated);
+    let english = details(&status);
+    crate::localization::set_translator(Cow::Borrowed);
+    assert!(chinese.starts_with("上下文: 12 / 100 tokens (?)"));
+    assert!(english.starts_with("Context: 12 / 100 tokens (?)"));
+    assert!(english.contains("Unknown state"));
+    assert!(english.ends_with("provider/model:high"));
+    assert_eq!(details(&status), chinese);
+}

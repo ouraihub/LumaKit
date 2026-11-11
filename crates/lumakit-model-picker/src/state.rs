@@ -1,4 +1,5 @@
 //! Host-owned data and transient picker interaction state; no I/O or model inference.
+use crate::localization::text as tr;
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::{
     component::input::{InputEvent, InputState},
@@ -95,7 +96,7 @@ impl Picker {
     /// Create transient inputs; call `set_data` with an authoritative host snapshot.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let query = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("搜索模型…（可附加等级：opus high）")
+            InputState::new(window, cx).placeholder(tr("搜索模型…（可附加等级：opus high）"))
         });
         let subscription = cx.subscribe(&query, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
@@ -142,6 +143,24 @@ impl Picker {
         }
         self.data = data;
         cx.notify();
+    }
+    /// Refreshes labels in an existing host snapshot without reloading its catalog.
+    /// Wire IDs, selection and search text remain unchanged. Hosts call this on locale changes;
+    /// absent IDs retain their host-provided labels and hints.
+    pub fn set_effort_labels(&mut self, labels: &[(&str, &str)], cx: &mut Context<Self>) {
+        let mut changed = false;
+        for effort in self.data.models.iter_mut().flat_map(|model| &mut model.efforts) {
+            if let Some((_, label)) = labels.iter().find(|(id, _)| *id == effort.id)
+                && effort.label != *label
+            {
+                effort.label.clear();
+                effort.label.push_str(label);
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
     }
     pub(crate) fn select(&self, model: String, effort: Option<String>, cx: &mut Context<Self>) {
         if self.data.enabled {

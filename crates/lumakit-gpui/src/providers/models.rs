@@ -1,4 +1,5 @@
 //! Model toolbar, groups and rows. Hosts supply actual model metadata and intent controls.
+use crate::localization::text as tr;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::{AnyElement, Div, ParentElement, Styled, div, px};
 use lumakit_design::{
@@ -20,7 +21,7 @@ pub fn models_toolbar(
         .min_w(px(0.))
         .flex_wrap()
         .gap(space::S4)
-        .child(label(text::TITLE_SECTION, "模型"))
+        .child(label(text::TITLE_SECTION, tr("模型")))
         .child(fold)
         .children(search.map(|search| {
             div()

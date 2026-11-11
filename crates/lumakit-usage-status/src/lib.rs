@@ -6,6 +6,7 @@
 //! open their own accounting surface instead, using `set_builtin_details(false)`.
 //! Numbers are facts supplied by the host, not a billing or context-limit guarantee.
 mod assets;
+pub mod localization;
 mod presentation;
 mod view;
 

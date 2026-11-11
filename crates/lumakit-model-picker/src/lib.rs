@@ -1,6 +1,7 @@
 //! Host-controlled model and reasoning-effort picker for GPUI applications.
 mod effort;
 mod icons;
+pub mod localization;
 mod presentation;
 mod rail;
 mod state;

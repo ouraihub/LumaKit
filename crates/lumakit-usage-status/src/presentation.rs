@@ -1,4 +1,5 @@
 use crate::{ContextStatus, Money, StatusState};
+use crate::localization::text as tr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Pressure {
@@ -86,13 +87,13 @@ pub(crate) fn summary(status: &ContextStatus) -> String {
     format!("{}{p}%/{window}", if status.estimate { "~" } else { "" })
 }
 
-pub(crate) fn state_label(state: StatusState) -> &'static str {
-    match state {
+pub(crate) fn state_label(state: StatusState) -> std::borrow::Cow<'static, str> {
+    tr(match state {
         StatusState::Ready => "就绪",
         StatusState::Streaming => "生成中",
         StatusState::Compacting => "压缩中",
         StatusState::Unknown => "状态未知",
-    }
+    })
 }
 
 pub(crate) fn spending(status: &ContextStatus) -> String {
@@ -122,18 +123,17 @@ pub(crate) fn details(status: &ContextStatus) -> String {
         .map_or_else(|| "?".into(), |n| n.to_string());
     let spending = spending(status);
     let mut text = format!(
-        "上下文：{used} / {window} tokens（{p}）\n来源：{}\n累计请求 tokens：{total}\n显示：{spending}\n状态：{}\n自动压缩：{}\n? 表示未知，~ 表示上下文估算；有请求时保存的用户单价才显示金额，否则显示 token。金额不是服务商账单。",
-        if status.estimate {
-            "估算"
-        } else {
-            "宿主报告；缺失值保持未知"
-        },
+        "{}: {used} / {window} tokens ({p})\n{}: {}\n{}: {total}\n{}: {spending}\n{}: {}\n{}: {}\n{}",
+        tr("上下文"),
+        tr("来源"),
+        tr(if status.estimate { "估算" } else { "宿主报告；缺失值保持未知" }),
+        tr("累计请求 tokens"),
+        tr("显示"),
+        tr("状态"),
         state_label(status.state),
-        if status.auto_compact {
-            "已启用"
-        } else {
-            "未启用或未报告"
-        },
+        tr("自动压缩"),
+        tr(if status.auto_compact { "已启用" } else { "未启用或未报告" }),
+        tr("? 表示未知，~ 表示上下文估算；有请求时保存的用户单价才显示金额，否则显示 token。金额不是服务商账单。"),
     );
     if !status.detail.trim().is_empty() {
         text.push_str("\n\n");

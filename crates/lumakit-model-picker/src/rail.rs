@@ -1,5 +1,6 @@
 //! Native draggable discrete effort rail, clickable ticks and keyboard navigation.
 use crate::{Model, Picker, effort::selected_effort, icons::glyph};
+use crate::localization::text as tr;
 use gpui_kit::base::{Slider, SliderIndicator, SliderThumb, SliderTrack};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Sizable as _,
@@ -48,10 +49,8 @@ impl Picker {
         if state.read(cx).value().end() != index as f32 {
             state.update(cx, |s, cx| s.set_value(index as f32, window, cx));
         }
-        let label = current.map_or("默认", |e| e.label.as_str()).to_owned();
-        let hint = current
-            .map_or("使用服务商默认强度", |e| e.hint.as_str())
-            .to_owned();
+        let label = current.map_or_else(|| tr("默认").into_owned(), |e| e.label.clone());
+        let hint = current.map_or_else(|| tr("使用服务商默认强度").into_owned(), |e| e.hint.clone());
         let icon = glyph(current.map(|e| e.id.as_str()));
         let color = match current.map(|e| e.id.as_str()) {
             Some("off" | "minimal" | "low") => colors.info,
@@ -80,7 +79,7 @@ impl Picker {
             .track_focus(&focus)
             .tab_stop(true)
             .role(Role::Slider)
-            .aria_label(format!("推理强度：{label}"))
+            .aria_label(format!("{}: {label}", tr("推理强度")))
             .aria_value(label.clone())
             .aria_numeric_value(index as f64)
             .aria_min_numeric_value(0.)
@@ -177,7 +176,7 @@ impl Picker {
                     .text_size(px(11.))
                     .whitespace_nowrap()
                     .label(level.label.clone())
-                    .accessibility_label(format!("推理强度 {}", level.label))
+                    .accessibility_label(format!("{} {}", tr("推理强度"), level.label))
                     .disabled(!enabled)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select(id.clone(), Some(effort.clone()), cx)
@@ -197,7 +196,7 @@ impl Picker {
                 div()
                     .text_xs()
                     .text_color(colors.muted_foreground)
-                    .child(format!("力度 · {}", model.name)),
+                    .child(format!("{} · {}", tr("力度"), model.name)),
             )
             .child(rail)
             .child(div().flex().flex_nowrap().w_full().children(ticks))

@@ -1,5 +1,6 @@
 //! Screenshot-aligned grouped surface and bottom-composer trigger; host theme only.
 use crate::{Model, Picker, effort};
+use crate::localization::text as tr;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
@@ -19,6 +20,10 @@ const WIDTH: f32 = 360.;
 impl Picker {
     pub(crate) fn surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
+        let placeholder = tr("搜索模型…（可附加等级：opus high）");
+        if self.query.read(cx).placeholder().as_ref() != placeholder.as_ref() {
+            self.query.update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
+        }
         let query = self.query.read(cx).value().to_string();
         let searching = !query.trim().is_empty();
         let mut groups: Vec<(String, String, Vec<Model>)> = Vec::new();
@@ -65,8 +70,9 @@ impl Picker {
                     .ghost()
                     .w_full()
                     .accessibility_label(format!(
-                        "模型分组 {provider}，{}",
-                        if expanded { "已展开" } else { "已折叠" }
+                        "{} {provider}, {}",
+                        tr("模型分组"),
+                        tr(if expanded { "已展开" } else { "已折叠" })
                     ))
                     .child(
                         row()
@@ -88,12 +94,13 @@ impl Picker {
                                     .text_xs()
                                     .text_color(colors.muted_foreground)
                                     .child(format!(
-                                        "{}{} {}",
+                                        "{}{}{} {}",
                                         if models.iter().any(|m| m.has_key) {
-                                            "API 密钥 · "
+                                            tr("API 密钥")
                                         } else {
-                                            ""
+                                            std::borrow::Cow::Borrowed("")
                                         },
+                                        if models.iter().any(|m| m.has_key) { " · " } else { "" },
                                         source,
                                         models.len()
                                     )),
@@ -133,11 +140,11 @@ impl Picker {
         }
         if self.data.models.is_empty() || (searching && visible.is_empty()) {
             rows = rows.child(div().p(px(12.)).text_color(colors.muted_foreground).child(
-                if searching {
+                tr(if searching {
                     "没有匹配的模型"
                 } else {
                     "没有可用模型，请先配置服务商"
-                },
+                }),
             ));
         }
         let current = self
@@ -192,7 +199,7 @@ impl Picker {
                     Input::new(&self.query)
                         .appearance(false)
                         .small()
-                        .aria_label("搜索模型，可附加等级")
+                        .aria_label(tr("搜索模型，可附加等级"))
                         .prefix(Icon::new(IconName::Search).small()),
                 ),
             )
@@ -224,8 +231,8 @@ impl Picker {
                 Button::new("picker-copy-diagnostic")
                     .link()
                     .small()
-                    .label("复制诊断 ID")
-                    .accessibility_label(format!("复制目录刷新诊断 ID {id}"))
+                    .label(tr("复制诊断 ID"))
+                    .accessibility_label(format!("{} {id}", tr("复制目录刷新诊断 ID")))
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(id.clone()));
                     }),

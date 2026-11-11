@@ -12,6 +12,7 @@ pub mod appearance;
 mod assets;
 pub mod components;
 pub mod fonts;
+pub mod localization;
 pub mod metrics;
 pub mod theme;
 mod theme_map;

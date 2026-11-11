@@ -1,6 +1,7 @@
 //! Model-service presentation shared by GPUI hosts. Hosts own configuration, requests and secrets;
 //! this module owns layout and accepts explicit semantic colors, controls and intent handlers.
 use gpui_kit::base::{h_flex, v_flex};
+use crate::localization::text as tr;
 use gpui_kit::{AnyElement, Div, ParentElement, SharedString, Styled, div};
 use lumakit_design::{
     Roles,
@@ -91,7 +92,7 @@ pub fn key_section(
     v_flex()
         .min_w(gpui_kit::px(0.))
         .gap(space::S6)
-        .child(settings::field_title("API 密钥", links, r))
+        .child(settings::field_title(tr("API 密钥"), links, r))
         .child(
             h_flex()
                 .min_w(gpui_kit::px(0.))
@@ -117,7 +118,7 @@ pub fn strategy(
 ) -> Div {
     v_flex()
         .gap(space::S4)
-        .child(label(text::TITLE_COMPACT, "密钥使用方式").text_color(r.text_muted))
+        .child(label(text::TITLE_COMPACT, tr("密钥使用方式")).text_color(r.text_muted))
         .child(label(text::UI, value))
         .child(label(text::METADATA, description).text_color(r.text_subtle))
 }
@@ -135,7 +136,7 @@ pub fn route_section(
     v_flex()
         .min_w(gpui_kit::px(0.))
         .gap(space::S6)
-        .child(settings::field_title("API 地址", add, r))
+        .child(settings::field_title(tr("API 地址"), add, r))
         .children(picker)
         .child(
             h_flex()

@@ -1,6 +1,7 @@
 //! Model rows, action footer and bottom trigger; grouped surface layout lives in view.
 use super::view::{col, row};
 use crate::{Model, Picker, PickerEvent, effort, icons::icon};
+use crate::localization::text as tr;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _,
@@ -37,7 +38,7 @@ impl Picker {
             .px(px(8.))
             .selected(selected || highlighted)
             .disabled(!self.data.enabled)
-            .accessibility_label(format!("选择模型 {} · {}", model.name, model.provider))
+            .accessibility_label(format!("{} {} · {}", tr("选择模型"), model.name, model.provider))
             .child(
                 row()
                     .w_full()
@@ -83,7 +84,7 @@ impl Picker {
                     .small()
                     .ghost()
                     .icon(icon("RiPushpin2Line"))
-                    .label("设为默认")
+                    .label(tr("设为默认"))
                     .disabled(!enabled || pair.is_none() || same)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.data.enabled
@@ -98,7 +99,7 @@ impl Picker {
                     .small()
                     .ghost()
                     .icon(icon("RiRefreshLine"))
-                    .label("重置为 off")
+                    .label(tr("重置为 off"))
                     .disabled(!enabled || off.is_none())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(id) = &off {
@@ -112,11 +113,11 @@ impl Picker {
                     .small()
                     .outline()
                     .icon(icon("RiRefreshLine"))
-                    .label(if self.data.refreshing {
+                    .label(tr(if self.data.refreshing {
                         "更新中…"
                     } else {
                         "刷新"
-                    })
+                    }))
                     .disabled(self.data.refreshing)
                     .on_click(
                         cx.listener(|_, _, _, cx| cx.emit(PickerEvent::Refresh { force: true })),
@@ -132,10 +133,12 @@ impl Render for Picker {
             .selected
             .as_ref()
             .and_then(|s| self.data.models.iter().find(|m| m.id == s.model));
-        let name = selected.map_or("选择模型", |m| m.name.as_str());
+        let choose = tr("选择模型");
+        let name = selected.map_or(choose.as_ref(), |m| m.name.as_str());
         let level =
             selected.and_then(|model| effort::selected_effort(model, self.data.selected.as_ref()));
-        let label = level.map_or("默认", |level| level.label.as_str());
+        let default = tr("默认");
+        let label = level.map_or(default.as_ref(), |level| level.label.as_str());
         let mut pill = row()
             .gap(px(5.))
             .min_w_0()
@@ -189,7 +192,7 @@ impl Render for Picker {
             .child(pill)
             .icon(IconName::ChevronDown)
             .disabled(!self.data.enabled)
-            .accessibility_label(format!("模型与推理强度：{name} · {label}"));
+            .accessibility_label(format!("{}: {name} · {label}", tr("模型与推理强度")));
         let entity = cx.entity().downgrade();
         let open_entity = entity.clone();
         let focus = self.query.read(cx).focus_handle(cx);

@@ -1,4 +1,5 @@
 use crate::{ContextStatus, Platform, UsageStatusEvent, assets, presentation};
+use crate::localization::text as tr;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -53,7 +54,7 @@ impl Render for ContextStatusView {
         let colors = cx.theme().colors;
         let platform = Platform::current();
         let detail = presentation::details(&self.status);
-        let label = format!("{} 上下文用量。{}。查看用量详情", platform.label(), detail);
+        let label = format!("{} {}. {}. {}", platform.label(), tr("上下文用量"), detail, tr("查看用量详情"));
         let color = match presentation::pressure(&self.status) {
             presentation::Pressure::Normal => colors.muted_foreground,
             presentation::Pressure::Warning => colors.warning,
