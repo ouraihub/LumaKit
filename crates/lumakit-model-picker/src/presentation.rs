@@ -80,6 +80,7 @@ impl Picker {
             .map(|m| m.id.clone());
         let enabled = self.data.enabled;
         row()
+            .flex_wrap()
             .gap(px(2.))
             .border_t_1()
             .border_color(colors.border)
