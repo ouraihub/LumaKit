@@ -28,7 +28,7 @@ Rust 原生桌面应用基础库：不依赖浏览器、WebView 或 Tauri。当�
 
 ## lumakit-design
 
-GPUI（gpui-kit **0.9.0**）设计系统，提炼自 ThinkRail Native `crates/ui`：
+GPUI（gpui-kit **0.9.1**）设计系统，提炼自 ThinkRail Native `crates/ui`：
 
 - 主题目录：ThinkRail 六套 + 暖纸 `warm-light`/`warm-dark`，支持用户主题文件；颜色角色由调色板推导并映射到 Kit `ThemeColor`；`LumaTheme::with_accent` 强调色覆盖。
 - `metrics`：间距、尺寸、圆角、字体样式令牌；`Typography`：中文回退与密度缩放。
