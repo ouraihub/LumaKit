@@ -1,0 +1,18 @@
+[package]
+name = "lumakit-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+async-channel = "=2.5.0"
+parking_lot = "=0.12.5"
+tracing.workspace = true
+unicode-width = "=0.2.3"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

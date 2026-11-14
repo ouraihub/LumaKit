@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/lumakit-support",
+  "crates/lumakit-term",
   "crates/lumakit-observability",
   "crates/lumakit-ai",
   "crates/lumakit-egui",
