@@ -53,6 +53,9 @@ getrandom = "0.3"
 rusqlite = { version = "0.40", features = ["bundled"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 tempfile = "3"
+tracing-appender = "=0.2.5"
+time = { version = "=0.3.44", features = ["formatting", "macros"] }
+blake3 = "=1.5.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

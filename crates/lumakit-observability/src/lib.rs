@@ -15,6 +15,7 @@ use tracing_subscriber::{
     EnvFilter, Registry, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+mod daily;
 mod format;
 mod operation;
 mod panic_log;
@@ -29,6 +30,7 @@ mod writer;
 
 use writer::SharedWriter;
 
+pub use daily::{DailyLogHandle, DailyOptions, MAX_TAIL_BYTES, MAX_TAIL_LINES};
 pub use format::{GrepFormat, SpanFields};
 pub use operation::{OperationGuard, operation};
 pub use parse::{LogLine, parse_line};
