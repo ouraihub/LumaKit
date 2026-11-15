@@ -1,0 +1,13 @@
+[package]
+name = "lumakit-term-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["gpui-fast"] }
+lumakit-term.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

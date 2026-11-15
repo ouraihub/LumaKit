@@ -3,6 +3,7 @@ members = [
   "crates/lumakit-support",
   "crates/lumakit-pty",
   "crates/lumakit-term",
+  "crates/lumakit-term-view",
   "crates/lumakit-observability",
   "crates/lumakit-ai",
   "crates/lumakit-egui",
@@ -24,6 +25,10 @@ license = "MIT OR Apache-2.0"
 lumakit-support = { path = "crates/lumakit-support" }
 lumakit-observability = { path = "crates/lumakit-observability" }
 lumakit-ai = { path = "crates/lumakit-ai" }
+lumakit-pty = { path = "crates/lumakit-pty" }
+lumakit-term = { path = "crates/lumakit-term" }
+lumakit-term-view = { path = "crates/lumakit-term-view" }
+parking_lot = "=0.12.5"
 egui = "=0.37.0"
 eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard", "links", "system_fonts"] }
 lumakit-egui = { path = "crates/lumakit-egui" }

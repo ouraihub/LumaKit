@@ -25,7 +25,10 @@ mod term;
 
 pub use alacritty_terminal::term::TermMode;
 pub use alacritty_terminal::vte::ansi::CursorShape;
-pub use event::{EventSink, OscProgress, Prompt133, PromptKind, PtyWriter, TermEvent};
+pub use event::{
+    ChannelSink, EventSink, NullSink, NullWriter, OscProgress, Prompt133, PromptKind, PtyWriter,
+    TermEvent,
+};
 pub use lines::{LineHistory, LineStamp};
 pub use links::{Link, URL_REGEX};
 pub use osc::OscPreParser;

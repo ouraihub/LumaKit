@@ -2571,6 +2571,7 @@ dependencies = [
  "async-channel",
  "data-url",
  "futures",
+ "gpui-fast",
  "gpui-pre",
  "gpui-pre-macros",
  "gpui-pre-sum-tree",
@@ -2613,6 +2614,7 @@ dependencies = [
  "enum-iterator",
  "gpui-base",
  "gpui-component-macros",
+ "gpui-fast",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-macros",
@@ -2725,6 +2727,7 @@ dependencies = [
  "uuid",
  "waker-fn",
  "windows 0.62.2",
+ "zed-scap",
 ]
 
 [[package]]
@@ -2994,7 +2997,9 @@ checksum = "60c0655c4af9fe268693531ebfe6d322809e7771e8a5cd5faceca358d479dd90"
 dependencies = [
  "gpui-base",
  "gpui-component",
+ "gpui-fast",
  "gpui-fast-platform",
+ "gpui-fast-web",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-macros",
@@ -3009,6 +3014,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "003d6a55cfa4fff4f44247a162443a48a949faaa19e8687c51c4fe5ed793a539"
 dependencies = [
  "anyhow",
+ "gpui-fast",
  "gpui-pre",
  "gpui-pre-reqwest",
  "log",
@@ -4696,6 +4702,15 @@ dependencies = [
  "tempfile",
  "tracing",
  "unicode-width",
+]
+
+[[package]]
+name = "lumakit-term-view"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
+ "lumakit-term",
+ "parking_lot",
 ]
 
 [[package]]
@@ -6997,7 +7012,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
