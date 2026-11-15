@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
-use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{
     EnvFilter, Registry, fmt, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
@@ -51,7 +51,8 @@ struct DailyInner {
     dir: PathBuf,
     prefix: String,
     reload: reload::Handle<EnvFilter, Registry>,
-    _guard: WorkerGuard,
+    filter_for: fn(LogLevel) -> String,
+    _appender: Arc<RollingFileAppender>,
 }
 
 impl std::fmt::Debug for DailyLogHandle {
@@ -80,16 +81,21 @@ impl DailyLogHandle {
         }
         fs::create_dir_all(dir)?;
         prune_old_files(dir, prefix, opts.keep_days)?;
-
-        let appender = RollingFileAppender::new(Rotation::DAILY, dir, prefix);
-        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let appender = Arc::new(
+            RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix(prefix)
+                .filename_suffix("log")
+                .build(dir)
+                .map_err(|error| io::Error::other(format!("init rolling appender: {error}")))?,
+        );
 
         let filter = log_filter(default);
         let (layer, reload) = reload::Layer::new(filter);
         let output = fmt::layer()
             .with_ansi(false)
             .event_format(GrepFormat::utc())
-            .with_writer(non_blocking.clone())
+            .with_writer(SharedAppender(Arc::clone(&appender)))
             .log_internal_errors(false);
         Registry::default()
             .with(layer)
@@ -98,7 +104,7 @@ impl DailyLogHandle {
             .try_init()
             .map_err(|_| LogError::AlreadyInitialized)?;
 
-        install_panic_hook(non_blocking);
+        install_panic_hook(Arc::clone(&appender));
 
         Ok(Self {
             inner: Arc::new(DailyInner {
@@ -106,9 +112,25 @@ impl DailyLogHandle {
                 dir: dir.to_path_buf(),
                 prefix: prefix.to_owned(),
                 reload,
-                _guard: guard,
+                _appender: appender,
+                filter_for: default_filter_directive,
             }),
         })
+    }
+    /// Start a builder to customise env-var override, timer, stderr
+    /// tee, or filter directive. Hosts without those needs call
+    /// [`DailyLogHandle::init`] instead.
+    #[must_use]
+    pub fn builder(dir: &Path, prefix: &str) -> DailyBuilder {
+        DailyBuilder {
+            dir: dir.to_path_buf(),
+            prefix: prefix.to_owned(),
+            default: LogLevel::Info,
+            keep_days: DailyOptions::default().keep_days,
+            env_var: None,
+            filter_for: None,
+            stderr_tee: false,
+        }
     }
 
     /// Current effective level.
@@ -128,7 +150,7 @@ impl DailyLogHandle {
     pub fn set_level(&self, level: LogLevel) -> Result<LogStatus, LogError> {
         self.inner
             .reload
-            .modify(|f| *f = log_filter(level))
+            .modify(|f| *f = EnvFilter::new((self.inner.filter_for)(level)))
             .map_err(|_| LogError::InvalidLevel)?;
         *self
             .inner
@@ -157,6 +179,17 @@ impl DailyLogHandle {
     #[must_use]
     pub fn current_path(&self) -> PathBuf {
         self.status().path
+    }
+    /// Directory the appender writes into.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.inner.dir
+    }
+
+    /// Filename prefix used for `<prefix>.YYYY-MM-DD.log`.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.inner.prefix
     }
 
     /// Read the tail of the newest file. Returns at most `limit` lines
@@ -190,6 +223,149 @@ impl DailyLogHandle {
             .rev()
             .collect())
     }
+}
+
+/// Builder for [`DailyLogHandle`] with host-specific knobs.
+pub struct DailyBuilder {
+    dir: PathBuf,
+    prefix: String,
+    default: LogLevel,
+    keep_days: usize,
+    env_var: Option<String>,
+    filter_for: Option<fn(LogLevel) -> String>,
+    stderr_tee: bool,
+}
+
+impl std::fmt::Debug for DailyBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DailyBuilder")
+            .field("dir", &self.dir)
+            .field("prefix", &self.prefix)
+            .field("env_var", &self.env_var)
+            .field("stderr_tee", &self.stderr_tee)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DailyBuilder {
+    /// Default level used when no env override is present.
+    #[must_use]
+    pub fn default_level(mut self, level: LogLevel) -> Self {
+        self.default = level;
+        self
+    }
+
+    /// Daily file retention.
+    #[must_use]
+    pub fn keep_days(mut self, days: usize) -> Self {
+        self.keep_days = days;
+        self
+    }
+
+    /// Environment variable whose value overrides both the default and
+    /// runtime level changes (`EnvFilter` syntax). An empty or missing
+    /// variable leaves the level unpinned.
+    #[must_use]
+    pub fn env_var(mut self, name: &str) -> Self {
+        self.env_var = Some(name.to_owned());
+        self
+    }
+
+    /// Host-supplied filter directive builder. Takes the current level
+    /// and returns the `EnvFilter` directive to install.
+    #[must_use]
+    pub fn filter_for(mut self, map: fn(LogLevel) -> String) -> Self {
+        self.filter_for = Some(map);
+        self
+    }
+
+    /// Tee log output to `stderr` as well (useful for debug builds).
+    #[must_use]
+    pub fn stderr_tee(mut self, enable: bool) -> Self {
+        self.stderr_tee = enable;
+        self
+    }
+
+    /// Install the subscriber. Returns `(handle, pinned)` where `pinned`
+    /// indicates the env override fixed the level.
+    ///
+    /// # Errors
+    /// Directory creation, appender creation, or installing the global
+    /// subscriber fails.
+    pub fn build(self) -> Result<(DailyLogHandle, bool), LogError> {
+        use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+
+        if self.prefix.is_empty() {
+            return Err(LogError::InvalidLevel);
+        }
+        fs::create_dir_all(&self.dir)?;
+        prune_old_files(&self.dir, &self.prefix, self.keep_days)?;
+        let appender = Arc::new(
+            RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix(&self.prefix)
+                .filename_suffix("log")
+                .build(&self.dir)
+                .map_err(|error| io::Error::other(format!("init rolling appender: {error}")))?,
+        );
+
+        let make_filter = self.filter_for.unwrap_or(default_filter_directive);
+        let (initial, pinned) = match self.env_var.as_deref().and_then(std::env::var_os) {
+            Some(raw) => {
+                let text = raw.into_string().map_err(|_| LogError::InvalidLevel)?;
+                (
+                    EnvFilter::try_new(text).map_err(|_| LogError::InvalidLevel)?,
+                    true,
+                )
+            }
+            None => (EnvFilter::new(make_filter(self.default)), false),
+        };
+        let (layer, reload) = reload::Layer::new(initial);
+        let shared = SharedAppender(Arc::clone(&appender));
+        let registry = Registry::default().with(layer).with(SpanFields);
+        if self.stderr_tee {
+            let writer = shared.and(std::io::stderr);
+            let output = fmt::layer()
+                .with_ansi(false)
+                .event_format(GrepFormat::utc())
+                .with_writer(writer)
+                .log_internal_errors(false);
+            registry
+                .with(output)
+                .try_init()
+                .map_err(|_| LogError::AlreadyInitialized)?;
+        } else {
+            let output = fmt::layer()
+                .with_ansi(false)
+                .event_format(GrepFormat::utc())
+                .with_writer(shared)
+                .log_internal_errors(false);
+            registry
+                .with(output)
+                .try_init()
+                .map_err(|_| LogError::AlreadyInitialized)?;
+        }
+
+        install_panic_hook(Arc::clone(&appender));
+
+        Ok((
+            DailyLogHandle {
+                inner: Arc::new(DailyInner {
+                    level: Mutex::new(self.default),
+                    dir: self.dir,
+                    prefix: self.prefix,
+                    reload,
+                    _appender: appender,
+                    filter_for: make_filter,
+                }),
+            },
+            pinned,
+        ))
+    }
+}
+
+fn default_filter_directive(level: LogLevel) -> String {
+    format!("{},{}=error", level.as_filter(), crate::panic_log::TARGET)
 }
 
 /// Upper bound on bytes read from the newest log for `tail`.
@@ -260,7 +436,7 @@ fn prune_old_files(dir: &Path, prefix: &str, keep_days: usize) -> io::Result<()>
     Ok(())
 }
 
-fn install_panic_hook(writer: NonBlocking) {
+fn install_panic_hook(appender: Arc<RollingFileAppender>) {
     std::panic::set_hook(Box::new(move |info| {
         let payload = info
             .payload()
@@ -286,9 +462,20 @@ fn install_panic_hook(writer: NonBlocking) {
             thread_id = ?std::thread::current().id(),
             backtrace = %backtrace,
             "app.panic");
-        let mut writer = writer.clone();
-        let _ = writer.flush();
+        let _ = appender.make_writer().flush();
     }));
+}
+
+/// `MakeWriter` wrapper over an `Arc<RollingFileAppender>`; cloning the
+/// Arc is free and the appender itself serialises writes internally.
+#[derive(Clone)]
+struct SharedAppender(Arc<RollingFileAppender>);
+
+impl<'a> MakeWriter<'a> for SharedAppender {
+    type Writer = tracing_appender::rolling::RollingWriter<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.make_writer()
+    }
 }
 
 #[cfg(test)]

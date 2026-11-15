@@ -30,7 +30,7 @@ mod writer;
 
 use writer::SharedWriter;
 
-pub use daily::{DailyLogHandle, DailyOptions, MAX_TAIL_BYTES, MAX_TAIL_LINES};
+pub use daily::{DailyBuilder, DailyLogHandle, DailyOptions, MAX_TAIL_BYTES, MAX_TAIL_LINES};
 pub use format::{GrepFormat, SpanFields};
 pub use operation::{OperationGuard, operation};
 pub use parse::{LogLine, parse_line};
