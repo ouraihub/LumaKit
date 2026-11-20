@@ -89,6 +89,7 @@ gpui_kit::assets::icon_assets!(
         AtSign,
         Gauge,
         Image,
+        GlobeOff,
         MessageSquarePlus,
         GripVertical,
         Activity,
@@ -139,6 +140,7 @@ mod tests {
         for icon in [
             IconName::Paperclip,
             IconName::Image,
+            IconName::GlobeOff,
             IconName::KeyRound,
             IconName::SlidersHorizontal,
         ] {

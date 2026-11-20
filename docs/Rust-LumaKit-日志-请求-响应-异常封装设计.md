@@ -69,7 +69,7 @@ pub enum LogLevel { Error, Warn, Info, Debug, Trace }
 ```text
 2026-11-09T11:05:47.288Z INFO  TraceId:5259…f360|SpanId:5|ParentSpanId:-|Layer:service|ME:ai.request|EV:ENTRY
 2026-11-09T11:05:47.289Z DEBUG TraceId:5259…f360|SpanId:2252…|ParentSpanId:5|Layer:external|ME:ai.http.request|conversation_id:…|model:loop-chat|EV:ENTRY
-2026-11-09T11:05:47.292Z WARN  TraceId:5259…f360|SpanId:5|ParentSpanId:-|Layer:service|ME:ai.request|Target:lumakit_ai::http|…|endpoint:http://127.0.0.1:18765/v1/chat/completions|status:429|request_id:x-request-id=req-loop-429|Msg:上游拒绝请求；错误正文仅返回调用方，不写入日志
+2026-11-09T11:05:47.292Z WARN  TraceId:5259…f360|SpanId:5|ParentSpanId:-|Layer:service|ME:ai.request|Target:lumakit_ai::http|status:429|endpoint_hash:0123456789abcdef|request_id_hash:fedcba9876543210|Msg:ai.http.rejected
 2026-11-09T11:05:47.292Z WARN  TraceId:5259…f360|SpanId:2252…|ParentSpanId:5|Layer:external|ME:ai.http.request|…|EV:ERROR|RT:3|Result:FAILED|Error:AI_HTTP_RATE_LIMITED
 2026-11-09T11:05:47.292Z ERROR TraceId:5259…f360|SpanId:5|ParentSpanId:-|Layer:service|ME:ai.request|EV:ERROR|RT:4|Result:FAILED|Error:AI_HTTP_RATE_LIMITED
 ```
@@ -221,7 +221,7 @@ async 任务用 `tracing::Instrument::instrument(fut, span)`；channel 消息需
 
 禁止写入日志：API key、token、密码、Cookie、Authorization、完整 prompt、模型输出、文件正文、Base64 附件、带查询参数的 URL、无长度上限的响应正文。
 
-可以记录摘要：`status`、白名单 `request_id`、`prompt_chars`、`body_bytes`、`content_hash`。
+可以记录摘要：`status`、外部请求标识的 `request_id_hash`、`prompt_chars`、`body_bytes`、`content_hash`；不记录 URL 路径、query 或不可信响应头原文。
 
 | 函数 | 行为 |
 |---|---|
@@ -235,7 +235,7 @@ async 任务用 `tracing::Instrument::instrument(fut, span)`；channel 消息需
 ## 8. 请求、错误与响应
 
 - 请求 DTO 只放业务字段，不放 TraceId、连接或 UI 状态。上下文（`TraceContext`、取消令牌）作为独立参数传递。
-- `request_id` 标识一次外部请求，`trace_id` 标识完整业务链路，二者不能互相替代。`chat_id`、`conversation_id` 也不能替代 TraceId。
+- 外部 `request_id` 只以哈希关联，`trace_id` 标识完整业务链路，二者不能互相替代。`chat_id`、`conversation_id` 也不能替代 TraceId。
 - 业务层返回 `Result<T, E>`。`E` 用 `thiserror` 定义，每个可处理的变体都有稳定的 `code()`，保留 `source`。不按错误消息判断错误类别。
 - 业务层不返回 GPUI、HTTP 或 MCP 响应类型。边界层把错误转换为安全响应，至少保留：
 
@@ -267,6 +267,8 @@ pub struct ErrorResponse { pub code: String, pub message: String, pub trace_id: 
 - 发送、重试与翻译入口均建立真实 `ai.request` root。`Attempt.trace_id` 持久化到 SQLite v6 nullable 列，旧历史缺省 None，不推断诊断 ID。共享 GPUI 失败提示默认简明，展开诊断后可复制完整 ID。
 - 设置目录刷新、模型检测/同步、搜索检测/搜索/读取入口由产品创建 root，显式传递到 worker、HTTP 与存储边界；`settings_task::Failure` 按类型结束 CANCEL/TIMEOUT/ERROR。MCP 设置目前仅保存配置，已覆盖 load/save，产品未提供发现动作。
 - LumaDesk 设置的后台日志页复用 `LogHandle` / `parse_line`，只在页面打开时读取。EV/Layer 过滤与 TraceId/ME 搜索取交集；点击 trace 标签重置其它筛选以查看整条已记录链路；记录级别改变只影响未来事件。
+
+2026-11-10 日志异常整改合同：LumaDesk 进一步遵守[日志与异常规范](../../LumaDesk/docs/日志与异常规范.md)。普通设置保存、启动加载与聊天持久化失败也必须有明确最终边界；禁止以 UI 提示替代错误日志。上游 HTTP 失败只保留状态码、端点/request-id 的诊断哈希与固定说明，流式错误不回传上游 message 原文。共享 LogHandle 提供同步安全 panic ERROR、源码位置净化与实际 flush；panic payload 不原样输出。取消/窗口关闭不得覆盖已返回的失败，panic 的最终 ERROR 由 hook 负责，join 仅记录安全 WARN，guard 的 UNFINISHED 保留中断事实。具体运行证据以本轮 LumaDesk BUILD.md 为准，旧 L6/L7 的记录不代表新增要求已经验收。
 
 ### ThinkRail Native
 

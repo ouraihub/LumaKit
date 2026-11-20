@@ -313,10 +313,7 @@ struct PartialCall {
 impl Decoder {
     pub(crate) fn complete(&mut self, protocol: Protocol, value: &Value) -> Result<String, String> {
         if !value["error"].is_null() {
-            return Err(value["error"]["message"]
-                .as_str()
-                .unwrap_or("provider error")
-                .into());
+            return Err("上游返回错误；原始响应已省略".into());
         }
         self.read_usage(protocol, value)?;
         let mut text = String::new();
@@ -572,19 +569,13 @@ impl Decoder {
                 self.done = true;
                 Ok(None)
             }
-            "error" => Err(value["error"]["message"]
-                .as_str()
-                .unwrap_or("provider error")
-                .to_owned()),
+            "error" => Err("上游返回错误；原始响应已省略".into()),
             _ => Ok(None),
         }
     }
     fn chat(&mut self, value: &Value) -> Result<Option<String>, String> {
         if !value["error"].is_null() {
-            return Err(value["error"]["message"]
-                .as_str()
-                .unwrap_or("provider error")
-                .to_owned());
+            return Err("上游返回错误；原始响应已省略".into());
         }
         let choice = &value["choices"][0];
         if let Some(deltas) = choice["delta"]["tool_calls"].as_array() {
@@ -634,11 +625,7 @@ impl Decoder {
                 Ok(None)
             }
             "response.incomplete" => Err("provider response incomplete".into()),
-            "response.failed" | "error" => Err(value["response"]["error"]["message"]
-                .as_str()
-                .or_else(|| value["error"]["message"].as_str())
-                .unwrap_or("provider error")
-                .to_owned()),
+            "response.failed" | "error" => Err("上游返回错误；原始响应已省略".into()),
             _ => Ok(None),
         }
     }

@@ -101,7 +101,7 @@ impl AiHost for PaintingHost {
                 ));
             }
             let request = ImageRequest::parse(call.arguments)?;
-            tracing::info!(event = "ai.image.tool", call_id = %call.id, prompt_chars = request.prompt.chars().count(), size = ?request.size, "执行绘图工具");
+            tracing::debug!(event = "ai.image.tool", prompt_chars = request.prompt.chars().count(), size = ?request.size, "执行绘图工具");
             let painting = painting.ok_or_else(|| error("尚未配置绘图连接。"))?;
             let op = trace.as_ref().map(|trace| {
                 lumakit_observability::operation(trace, "ai.image.generate", "external")
@@ -185,13 +185,13 @@ async fn generate(
     }
     let (round_usage, started) = RoundUsage::start(None).map_err(AiError::Provider)?;
     let response = tokio::select! { biased; _ = cancel.cancelled() => return Err(AiError::Cancelled), result = request.send() => result.map_err(crate::network)? };
-    tracing::info!(
+    tracing::debug!(
         event = "ai.image.response",
         status = response.status().as_u16(),
         "Image generation response received"
     );
     if !response.status().is_success() {
-        return Err(crate::provider_response(response, connection.api_key.as_ref(), cancel).await);
+        return Err(crate::provider_response(response, cancel).await);
     }
     let body = read_body(response, 24 * 1024 * 1024, cancel).await?;
     let value: serde_json::Value =
@@ -297,7 +297,7 @@ async fn generate(
     })();
     if let Err(error) = save {
         for image in &stored {
-            let _ = std::fs::remove_file(root.join(&image.storage_key));
+            super::diagnostics::remove_media(&root.join(&image.storage_key));
         }
         return Err(error);
     }
@@ -310,7 +310,7 @@ async fn generate(
             reasoning_tokens: None,
         })
     });
-    tracing::info!(
+    tracing::debug!(
         event = "ai.image.stored",
         count = stored.len(),
         "Generated images stored"

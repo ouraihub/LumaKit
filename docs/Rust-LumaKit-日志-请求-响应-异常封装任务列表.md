@@ -162,3 +162,9 @@ Native 真实链路（隔离目录 `C:\Users\Administrator\AppData\Local\Temp\na
 - Kit 聊天请求准备 369、翻译 156、worker 211 行；诊断视图 62 行。共享 GPUI 主视图仍为既有 1137 行，只抽离本次诊断职责，未改其它消息/输入布局；继续拆其它渲染职责会扩大此次日志范围，因此保留为明确例外，后续修改相应渲染时应继续拆分。已有模型设置大视图同理，本次只增加真实诊断复制并移出同步持久化。
 - 非聊天 AI 原大文件此次只做准确文档、Result 测试传播与等价 lint 清理，不增加业务职责；不以机械搬运掩盖既有规模。行为验证由上述 workspace 测试覆盖。
 - Native process 370、streams 90、projection 394、request waiter 157、trace 72、聊天view 260、core agent合同324行；均低于500行。进程拥有启动/退出资源，projection拥有turn终态，UI只消费错误诊断ID；未引入第二套状态机。
+
+## 2026-11-10 LumaDesk 日志异常规范复查与整改
+
+旧 L6/L7/L11 DONE 为当时网络链路验收，不代表普通保存、启动失败和panic均满足新规范。本轮补充共享安全panic、源码路径净化、真实flush、HTTP/SSE错误隐私、聊天保存失败去重，以及宿主配置保存和worker失败优先级。公共API签名不变；外部request-id改诊断哈希、HTTP body固定安全说明。`ai.request`保留，网络完成结果明确为 `NETWORK_COMPLETED_PENDING_SAVE`；最终保存单独结算。panic hook为唯一最终ERROR所有者，join WARN，异常中断允许UNFINISHED，不以正常取消掩盖。
+
+本轮通过：LumaDesk63项、AI117项、observability15项单元和1项真实panic子进程回归；宿主及两个共享crate严格clippy、fmt与受影响编译通过。panic覆盖debug unwind与release abort、载荷隐私与链路。实窗观察启动失败、搜索成功/429/取消、搜索与模型保存trigger失败及恢复；16个root均一个终态，合成秘密/正文/SQL/URL路径零命中。完整命令、截图目录、模块规模及未验证范围见 [LumaDesk BUILD](../../LumaDesk/docs/BUILD.md#2026-11-10-日志与异常规范整改)。不将本轮验证扩大为Native或Kit其它crate复测，也不声称dist正式包已更新。

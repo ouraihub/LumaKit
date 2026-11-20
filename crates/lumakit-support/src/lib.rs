@@ -1,7 +1,10 @@
 //! Shared, UI-free contracts for LumaKit desktop applications.
+/// 内置服务商预设：公开模板，宿主播种为停用服务商。
+pub mod presets;
 /// 随机配置 ID 与系统加密凭据；明文仅在显式解密时短暂持有。
 pub mod secrets;
 pub mod sqlite;
+pub use presets::{PROVIDER_PRESETS, PresetProtocol, ProviderPreset, provider_preset};
 pub use secrets::new_id;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{

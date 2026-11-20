@@ -16,6 +16,8 @@ mod action;
 mod activity;
 #[path = "chat_composer.rs"]
 mod composer;
+#[path = "chat_diagnostics.rs"]
+mod diagnostics;
 #[path = "chat_generation.rs"]
 mod generation;
 #[path = "chat_history.rs"]
@@ -117,6 +119,7 @@ pub struct ChatSession {
     phase: ChatPhase,
     generation: u64,
     save_error: bool,
+    save_code: &'static str,
     notice: String,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -129,13 +132,20 @@ impl ChatSession {
     /// Returns lock, migration, history validation or persistence errors without replacing existing data.
     pub fn open(path: &Path, wake: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let lock = FileLock::acquire(&path.with_file_name("chat-history.lock")).map_err(|_| {
-            "无法独占聊天记录；请关闭其它使用此数据目录的实例，并检查目录权限。".to_owned()
+            "无法独占聊天记录；请关闭其它使用此数据目录的实例，并检查目录权限。（错误码：CHAT_STORAGE_LOCK_FAILED）".to_owned()
         })?;
         let (connection, history) = store::open(path).map_err(|error| {
-            format!("无法读取或迁移聊天记录：{error}；请检查权限或恢复备份，旧文件未修改。")
+            format!(
+                "无法读取或迁移聊天记录；请检查权限或恢复备份，旧文件未修改。（错误码：{}）",
+                diagnostics::storage_code(&error)
+            )
         })?;
-        let composer_data = store::load_composer(&connection)
-            .map_err(|error| format!("无法读取输入附件和控制：{error}"))?;
+        let composer_data = store::load_composer(&connection).map_err(|error| {
+            format!(
+                "无法读取输入附件和控制。（错误码：{}）",
+                diagnostics::storage_code(&error)
+            )
+        })?;
         let mut session = Self {
             default_composer: composer_data.default_composer.clone(),
             connection,
@@ -147,6 +157,7 @@ impl ChatSession {
             phase: ChatPhase::Idle,
             generation: 0,
             save_error: false,
+            save_code: "CHAT_STORAGE_DATABASE_FAILED",
             notice: String::new(),
             wake,
         };
@@ -206,15 +217,7 @@ impl ChatSession {
         self.phase == ChatPhase::Idle && !self.save_error
     }
     fn save(&mut self) -> bool {
-        self.composer_data.default_composer = self.default_composer.clone();
-        self.save_error =
-            store::save_composer(&mut self.connection, &self.history, &self.composer_data).is_err();
-        if self.save_error {
-            self.notice = "聊天记录保存失败。内存中的问题、部分回答和草稿仍保留；请检查目录权限或磁盘空间后重试保存。保存成功前禁止更改和发送。".into();
-        } else {
-            self.notice.clear();
-        }
-        !self.save_error
+        self.save_with_trace(None)
     }
     /// 空闲时重新保存当前历史，并更新保存失败状态与提示。
     pub fn retry_save(&mut self) {

@@ -322,3 +322,49 @@ fn redaction_never_returns_secrets_or_query_data() {
     assert_eq!(diagnostic_hash("same"), diagnostic_hash("same"));
     assert_ne!(diagnostic_hash("same"), "same");
 }
+
+#[test]
+fn source_locations_never_expose_absolute_build_paths() {
+    let lines = capture("info", || {
+        let (trace, seed) = TraceContext::root("source.seed", "worker");
+        seed.finish("SUCCESS");
+        let root = crate::operation::start(
+            &trace,
+            "source.absolute",
+            "worker",
+            true,
+            "C:\\PRIVATE_BUILD\\checkout\\crates\\demo\\src\\lib.rs",
+            42,
+        );
+        root.span().in_scope(|| {
+            tracing::info!(
+                log.file = "C:\\PRIVATE_BUILD\\checkout\\src\\handler.rs",
+                "source.event"
+            );
+            tracing::info!(log.file = ?"/PRIVATE_BUILD/checkout/src/debug.rs", "source.debug");
+        });
+        root.finish("SUCCESS");
+    });
+    assert!(
+        lines.iter().all(|line| !line.contains("PRIVATE_BUILD")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("SourceFile:crates\\demo\\src\\lib.rs")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("log.file:src\\handler.rs")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("log.file:src/debug.rs")),
+        "{lines:#?}"
+    );
+}

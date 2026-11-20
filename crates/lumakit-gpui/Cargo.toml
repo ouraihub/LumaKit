@@ -9,7 +9,7 @@ default = ["chat"]
 chat = ["dep:lumakit-ai", "dep:lumakit-model-picker", "dep:lumakit-usage-status", "dep:pulldown-cmark", "dep:image"]
 
 [dependencies]
-gpui-kit = "=0.9.0"
+gpui-kit = "=0.9.1"
 lumakit-ai = { path = "../lumakit-ai", optional = true }
 lumakit-design = { path = "../lumakit-design" }
 lumakit-model-picker = { path = "../lumakit-model-picker", optional = true }

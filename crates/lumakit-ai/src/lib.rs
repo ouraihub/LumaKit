@@ -25,6 +25,8 @@ pub mod mcp_server;
 /// 自动补全的模型目录参考元数据；显式设置优先。
 pub mod model_reference;
 mod protocol;
+mod provider_failure;
+use provider_failure::provider_response;
 /// 服务商配置、模型能力与密钥存储。
 pub mod providers;
 /// 搜索结果策略及外部搜索接口。
@@ -353,14 +355,14 @@ pub enum AiError {
     /// 服务商、网络或响应解析错误说明。
     #[error("AI provider error: {0}")]
     Provider(String),
-    /// 上游 HTTP 拒绝；保留状态码、请求 ID 与有界脱敏正文，不依赖字符串判断状态。
-    #[error("provider returned HTTP {status} (request_id={request_id}): {body}")]
+    /// 上游 HTTP 拒绝；保留状态码、请求标识哈希与固定安全说明。
+    #[error("服务返回 HTTP {status}（请求标识哈希={request_id}）：{body}")]
     Http {
         /// 上游 HTTP 状态码。
         status: u16,
-        /// 上游响应的白名单请求标识；缺失时为 unavailable。
+        /// 首个白名单请求标识的诊断哈希；缺失时为 unavailable。
         request_id: String,
-        /// 最多 8 KiB 的脱敏错误正文，超限时整段丢弃。
+        /// 固定安全说明，不包含上游响应原文。
         body: String,
     },
     /// 请求已取消。
@@ -774,7 +776,7 @@ where
         result = builder.json(&protocol::encode(connection, system, messages, tools)).send() => result.map_err(network)?,
     };
     if !response.status().is_success() {
-        return Err(provider_response(response, connection.api_key.as_ref(), cancel).await);
+        return Err(provider_response(response, cancel).await);
     }
     if !connection.settings.supports_streaming {
         let read = async {
@@ -1005,76 +1007,6 @@ fn provider_error(body: String, secret: Option<&Zeroizing<String>>) -> AiError {
         None => body,
     };
     AiError::Provider(body)
-}
-
-async fn provider_response(
-    mut response: reqwest::Response,
-    secret: Option<&Zeroizing<String>>,
-    cancel: &CancellationToken,
-) -> AiError {
-    let status = response.status().as_u16();
-    // 只读请求标识白名单，绝不打印 Authorization、Cookie 或全部响应头。
-    let request_id = [
-        "x-request-id",
-        "request-id",
-        "x-oneapi-request-id",
-        "x-new-api-request-id",
-        "trace-id",
-        "cf-ray",
-    ]
-    .iter()
-    .filter_map(|name| {
-        response
-            .headers()
-            .get(*name)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| value.len() <= 256)
-            .map(|value| (*name, value))
-    })
-    .map(|(name, value)| format!("{name}={value}"))
-    .collect::<Vec<_>>()
-    .join(", ");
-    let request_id = if request_id.is_empty() {
-        "unavailable".into()
-    } else {
-        request_id
-    };
-    let url = response.url();
-    // URL 查询参数可能带凭据；日志只保留无查询的源和路径。
-    let endpoint = format!("{}{}", url.origin().ascii_serialization(), url.path());
-    let read = async {
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(network)? {
-            if chunk.len() > 8192 - body.len() {
-                return Ok::<_, AiError>("error body exceeds 8192 bytes; omitted".to_owned());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(String::from_utf8_lossy(&body).into_owned())
-    };
-    let body = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return AiError::Cancelled,
-        result = tokio::time::timeout(std::time::Duration::from_secs(10), read) => match result {
-            Ok(Ok(body)) => body,
-            Ok(Err(error)) => error.to_string(),
-            Err(_) => "error body read timed out".into(),
-        },
-    };
-    let redact = |value: String| match secret.filter(|secret| !secret.is_empty()) {
-        Some(secret) => value.replace(secret.as_str(), "***"),
-        None => value,
-    };
-    let endpoint = redact(endpoint);
-    let request_id = redact(request_id);
-    let body = redact(body);
-    // 只记 WARN：请求链路的终态（入口 ERROR）已带错误码；这里补充状态码、请求 ID 与端点。
-    tracing::warn!(target: "lumakit_ai::http", %endpoint, status, request_id = %request_id, "上游拒绝请求；错误正文仅返回调用方，不写入日志");
-    AiError::Http {
-        status,
-        request_id,
-        body,
-    }
 }
 
 #[cfg(test)]

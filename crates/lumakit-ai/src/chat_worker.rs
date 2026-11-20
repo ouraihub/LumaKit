@@ -42,7 +42,8 @@ pub(super) fn run_session_worker(
     media_root: PathBuf,
 ) -> Result<crate::AiRun, (TurnStatus, String)> {
     let (context, root) = trace;
-    let (result, code) = session_result(
+    let _entered = root.span().clone().entered();
+    let (mut result, code) = session_result(
         connection,
         painting,
         painting_model,
@@ -53,8 +54,29 @@ pub(super) fn run_session_worker(
         wake,
         media_root,
     );
+    if let Err((status, message)) = &mut result
+        && *status != TurnStatus::Cancelled
+    {
+        let error_code = match code {
+            Some(Err(code)) => code,
+            Some(Ok(_)) => "AI_REQUEST_TIMEOUT",
+            None => "AI_REQUEST_FAILED",
+        };
+        let summary = match error_code {
+            "AI_REPLY_TOO_LARGE" => "回答超过 1 MiB，已停止；保留已有内容。",
+            "AI_EMPTY_REPLY" => "服务返回了空回答，请重试；空回答不会用于后续上下文。",
+            "AI_RUNTIME_UNAVAILABLE" => "无法启动聊天网络运行时，请重试。",
+            "AI_REQUEST_TIMEOUT" => "请求超时；已保留部分回答，请稍后重试。",
+            _ => "请求失败；已保留部分回答，请检查配置或稍后重试。",
+        };
+        *message = format!(
+            "{summary}（错误码：{error_code}；诊断 ID：{}）",
+            context.trace_id()
+        );
+    }
     match (&result, code) {
-        (Ok(_), _) => root.finish("SUCCESS"),
+        // 这里只结算网络执行；事件归约后的持久化由 session 独立结算。
+        (Ok(_), _) => root.finish("NETWORK_COMPLETED_PENDING_SAVE"),
         (Err(_), Some(Ok(limit_ms))) => root.timeout(limit_ms),
         (Err((TurnStatus::Cancelled, _)), _) => root.cancel("user_cancelled"),
         (Err(_), Some(Err(code))) => root.fail(code),

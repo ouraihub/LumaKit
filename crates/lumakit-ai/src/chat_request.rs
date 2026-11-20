@@ -219,14 +219,14 @@ impl ChatSession {
         let (ci, ti, input, messages, mut attempt, turn_id, snapshot, connection) = match prepared {
             Ok(value) => value,
             Err(error) => {
-                self.notice = error;
+                self.notice = diagnostics::prepare_failure(&error, "CHAT_PREPARE_FAILED");
                 return;
             }
         };
         let (tx, rx) = match self.event_channel() {
             Ok(channel) => channel,
             Err(error) => {
-                self.notice = error;
+                self.notice = diagnostics::prepare_failure(&error, "CHAT_GENERATION_EXHAUSTED");
                 return;
             }
         };
@@ -276,7 +276,7 @@ impl ChatSession {
             draft.attachments.clear();
         }
         // 接受请求前必须落盘；失败时完整撤销新增记录，不能留下重复问题或 Running。
-        if !self.save() {
+        let Some(root) = self.save_request(&trace, root) else {
             let conversation = &mut self.history.conversations[ci];
             if retry {
                 conversation.turns[ti].attempts.pop();
@@ -290,9 +290,8 @@ impl ChatSession {
                 conversation.draft = draft;
             }
             self.composer_data = previous_composer;
-            root.fail("CHAT_SAVE_FAILED");
             return;
-        }
+        };
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let wake = self.wake.clone();
@@ -311,7 +310,7 @@ impl ChatSession {
                 connection.settings.native_web_search,
             )
         });
-        let span = tracing::info_span!(parent: root.span(), "ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, model = %connection.model, protocol = ?connection.protocol, image_mode);
+        let span = tracing::debug_span!(parent: root.span(), "ai.request", conversation_id = %identity.conversation_id, turn_id = %identity.turn_id, attempt_id = %identity.attempt_id, protocol = ?connection.protocol, image_mode);
         let pending_root = super::worker::PendingRoot::new(root);
         let worker = thread::Builder::new()
             .name("lumakit-chat".into())
@@ -337,7 +336,13 @@ impl ChatSession {
                     &wake,
                     media_root,
                 );
-                let _ = tx.send(Event::End(result));
+                if tx.send(Event::End(result)).is_err() {
+                    tracing::debug!(
+                        event = "chat.event.drop",
+                        reason = "receiver_closed",
+                        "聊天终态接收端已关闭"
+                    );
+                }
                 wake();
             });
         match worker {

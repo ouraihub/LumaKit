@@ -48,10 +48,25 @@ impl Collect<'_> {
 
 impl Visit for Collect<'_> {
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.set(field.name(), value.to_owned());
+        self.set(
+            field.name(),
+            if matches!(field.name(), "source_file" | "log.file") {
+                crate::source::source_path(value).to_owned()
+            } else {
+                value.to_owned()
+            },
+        );
     }
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.set(field.name(), format!("{value:?}"));
+        let value = format!("{value:?}");
+        self.set(
+            field.name(),
+            if matches!(field.name(), "source_file" | "log.file") {
+                crate::source::source_path(value.trim_matches('"')).to_owned()
+            } else {
+                value
+            },
+        );
     }
 }
 
@@ -146,7 +161,14 @@ impl Visit for EventFields<'_, '_, '_> {
             self.message = Some(value.to_owned());
         } else if self.result.is_ok() {
             let label = self.label(field.name());
-            self.result = self.line.put(label, value);
+            self.result = self.line.put(
+                label,
+                if field.name() == "log.file" {
+                    crate::source::source_path(value)
+                } else {
+                    value
+                },
+            );
         }
     }
 
@@ -155,10 +177,15 @@ impl Visit for EventFields<'_, '_, '_> {
             self.message = Some(format!("{value:?}"));
         } else if self.result.is_ok() {
             let label = self.label(field.name());
-            self.result = self
-                .line
-                .key(label)
-                .and_then(|()| write!(Escaped(self.line.writer), "{value:?}"));
+            self.result = if field.name() == "log.file" {
+                let value = format!("{value:?}");
+                self.line
+                    .put(label, crate::source::source_path(value.trim_matches('"')))
+            } else {
+                self.line
+                    .key(label)
+                    .and_then(|()| write!(Escaped(self.line.writer), "{value:?}"))
+            };
         }
     }
 }
@@ -244,7 +271,7 @@ where
             }
             line.put("Layer", layer)?;
             line.put("ME", operation)?;
-            line.put("SourceFile", source_file)?;
+            line.put("SourceFile", crate::source::source_path(source_file))?;
             line.put("SourceLine", source_line)?;
         }
         if event.metadata().target() != TARGET {
