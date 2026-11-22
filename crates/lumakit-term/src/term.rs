@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, test::TermSize};
+use alacritty_terminal::term::{Config, TermMode, test::TermSize};
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::event::{EventSink, PtyWriter, TermEvent};
@@ -146,10 +147,69 @@ impl TermHandle {
         f(&mut term)
     }
 
+    /// Scroll the viewport `delta` lines into history (positive = up, toward
+    /// older output). The alternate screen has no history, so it stays put.
+    pub fn scroll(&self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
+        self.inner.term.lock().scroll_display(Scroll::Delta(delta));
+        self.mark_dirty();
+    }
+
+    /// Return the viewport to the newest output.
+    pub fn scroll_to_bottom(&self) {
+        let mut term = self.inner.term.lock();
+        if term.grid().display_offset() == 0 {
+            return;
+        }
+        term.scroll_display(Scroll::Bottom);
+        drop(term);
+        self.mark_dirty();
+    }
+
+    /// Lines of history above the viewport bottom (0 = following output).
+    pub fn display_offset(&self) -> usize {
+        self.inner.term.lock().grid().display_offset()
+    }
+
+    /// Current terminal mode bits (application cursor, bracketed paste,
+    /// alternate screen, …).
+    pub fn mode(&self) -> TermMode {
+        *self.inner.term.lock().mode()
+    }
+
+    /// Cursor position as `(row, col)` within the live screen, ignoring the
+    /// scroll offset.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let term = self.inner.term.lock();
+        let point = term.grid().cursor.point;
+        (usize::try_from(point.line.0).unwrap_or(0), point.column.0)
+    }
+
+    /// Text of the rows currently in view, one line per row, trailing blanks
+    /// trimmed by alacritty.
+    pub fn screen_text(&self) -> String {
+        let term = self.inner.term.lock();
+        let offset = term.grid().display_offset() as i32;
+        let top = Point::new(Line(-offset), Column(0));
+        let bottom = Point::new(
+            Line(term.screen_lines() as i32 - 1 - offset),
+            term.last_column(),
+        );
+        term.bounds_to_string(top, bottom)
+    }
+
     /// Clone of the host-supplied writer, for reply paths that live in
     /// sibling modules.
     pub fn writer(&self) -> Arc<dyn PtyWriter> {
         self.inner.writer.clone()
+    }
+
+    fn mark_dirty(&self) {
+        if !self.inner.dirty.swap(true, Ordering::AcqRel) {
+            self.inner.sink.send(TermEvent::Wakeup);
+        }
     }
 }
 
@@ -305,5 +365,49 @@ mod tests {
         handle.advance(b"");
         assert!(rx.try_recv().is_err());
         assert!(!handle.take_dirty());
+    }
+
+    fn small() -> TermHandle {
+        TermHandle::new(
+            GridSize { cols: 10, rows: 3 },
+            100,
+            Arc::new(NullWriter),
+            Arc::new(crate::event::NullSink),
+        )
+    }
+
+    #[test]
+    fn scroll_moves_the_viewport_into_history_and_back() {
+        let handle = small();
+        handle.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert_eq!(handle.screen_text(), "three\nfour\nfive");
+        handle.scroll(2);
+        assert_eq!(handle.display_offset(), 2);
+        assert_eq!(handle.screen_text(), "one\ntwo\nthree");
+        handle.scroll_to_bottom();
+        assert_eq!(handle.display_offset(), 0);
+        assert_eq!(handle.screen_text(), "three\nfour\nfive");
+    }
+
+    #[test]
+    fn mode_and_cursor_follow_the_stream() {
+        let handle = small();
+        handle.advance(b"ab\r\ncd");
+        assert_eq!(handle.cursor_position(), (1, 2));
+        assert!(!handle.mode().contains(TermMode::APP_CURSOR));
+        handle.advance(b"\x1b[?1h\x1b[?2004h");
+        assert!(handle.mode().contains(TermMode::APP_CURSOR));
+        assert!(handle.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn alternate_screen_has_no_history_to_scroll() {
+        let handle = small();
+        handle.advance(b"1\r\n2\r\n3\r\n4\r\n5\x1b[?1049hALT");
+        handle.scroll(3);
+        assert_eq!(handle.display_offset(), 0);
+        // The alternate screen starts blank and keeps the cursor where the
+        // primary screen left it, so only the new text is visible.
+        assert_eq!(handle.screen_text().trim(), "ALT");
     }
 }
