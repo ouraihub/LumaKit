@@ -74,6 +74,31 @@ pub fn paint_frame(
         ));
     }
 
+    // A block cursor sits under the glyph so the character stays readable;
+    // beam and underline are thin and drawn on top (step 5). A hidden cursor
+    // (DECTCEM off) paints nothing.
+    let cursor = frame.cursor.filter(|c| c.row < frame.rows.len());
+    let cursor_color = to_rgba(if focused {
+        palette.cursor
+    } else {
+        SnapshotRgba {
+            a: palette.cursor.a / 2,
+            ..palette.cursor
+        }
+    });
+    if let Some(c) = cursor
+        && c.visible
+        && !matches!(c.shape, CursorShape::Beam | CursorShape::Underline)
+    {
+        window.paint_quad(fill(
+            Bounds::new(
+                cell(c.row, c.col),
+                size(px(m.cell_width), px(m.line_height)),
+            ),
+            cursor_color,
+        ));
+    }
+
     // 3. Shaped segments.
     let mut shaped = 0;
     for (row, snap) in frame.rows.iter().enumerate() {
@@ -136,29 +161,23 @@ pub fn paint_frame(
         );
     }
 
-    // 5. Cursor + IME composition.
-    if let Some(cursor) = frame.cursor
-        && cursor.row < frame.rows.len()
-    {
-        let origin = cell(cursor.row, cursor.col);
-        let full = Bounds::new(origin, size(px(m.cell_width), px(m.line_height)));
-        let quad = match cursor.shape {
-            CursorShape::Beam => Bounds::new(origin, size(px(2.0), px(m.line_height))),
-            CursorShape::Underline => Bounds::new(
+    // 5. Thin cursor + IME composition; the composition still shows where
+    // text will land when the cursor is hidden.
+    if let Some(c) = cursor {
+        let origin = cell(c.row, c.col);
+        let thin = match c.shape {
+            CursorShape::Beam => Some(Bounds::new(origin, size(px(2.0), px(m.line_height)))),
+            CursorShape::Underline => Some(Bounds::new(
                 point(origin.x, origin.y + px(m.line_height - 2.0)),
                 size(px(m.cell_width), px(2.0)),
-            ),
-            _ => full,
+            )),
+            _ => None,
         };
-        let color = if focused {
-            palette.cursor
-        } else {
-            SnapshotRgba {
-                a: palette.cursor.a / 2,
-                ..palette.cursor
-            }
-        };
-        window.paint_quad(fill(quad, to_rgba(color)));
+        if let Some(quad) = thin
+            && c.visible
+        {
+            window.paint_quad(fill(quad, cursor_color));
+        }
         if !composition.is_empty() {
             let run = TextRun {
                 len: composition.len(),
