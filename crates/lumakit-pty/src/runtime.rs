@@ -118,7 +118,7 @@ struct Shared {
 /// A live PTY runtime handle.
 pub struct PtyRuntime {
     shared: Arc<Shared>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     waiter: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<Option<JoinHandle<()>>>,
@@ -186,7 +186,6 @@ impl PtyRuntime {
         let (tx, rx) = mpsc::sync_channel::<RuntimeEvent>(QUEUE_CHUNKS);
         let waiter = {
             let shared = shared.clone();
-            let tx = tx.clone();
             thread::Builder::new()
                 .name("lumakit-pty-waiter".into())
                 .spawn(move || {
@@ -198,15 +197,17 @@ impl PtyRuntime {
                         .map(|c| c as i32);
                     *shared.exit_code.lock() = code;
                     shared.exited.store(true, Ordering::Release);
+                    // Closing the master is what ends the reader on Windows ConPTY.
                     drop(shared.master.lock().take());
-                    let _ = tx.try_send(RuntimeEvent::Exited { exit_code: code });
+                    if status.is_err() {
+                        warn!("lumakit-pty: wait for child failed");
+                    }
                 })
                 .map_err(|e| RuntimeError::Pty(format!("spawn waiter: {e}")))?
         };
 
         let reader_handle = {
             let shared = shared.clone();
-            let tx = tx.clone();
             thread::Builder::new()
                 .name("lumakit-pty-reader".into())
                 .spawn(move || read_loop(reader, decoder, shared, tx))
@@ -215,7 +216,7 @@ impl PtyRuntime {
 
         Ok(Self {
             shared,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             killer: Mutex::new(killer),
             waiter: Mutex::new(Some(waiter)),
             reader: Mutex::new(Some(reader_handle)),
@@ -232,17 +233,18 @@ impl PtyRuntime {
     /// Write `bytes` to the PTY.
     ///
     /// # Errors
-    /// Returns [`RuntimeError::Closed`] after shutdown; OS write errors wrap
-    /// to `RuntimeError::Pty`.
+    /// Returns [`RuntimeError::Closed`] after shutdown or once the child has
+    /// exited; OS write errors wrap to `RuntimeError::Pty`.
     pub fn write(&self, bytes: &[u8]) -> Result<(), RuntimeError> {
-        if self.shared.stopped.load(Ordering::Acquire) {
-            return Err(RuntimeError::Closed);
-        }
         let mut guard = self.writer.lock();
-        guard
+        let writer = guard
+            .as_mut()
+            .filter(|_| !self.is_exited())
+            .ok_or(RuntimeError::Closed)?;
+        writer
             .write_all(bytes)
             .map_err(|e| RuntimeError::Pty(format!("write: {e}")))?;
-        guard
+        writer
             .flush()
             .map_err(|e| RuntimeError::Pty(format!("flush: {e}")))
     }
@@ -253,12 +255,13 @@ impl PtyRuntime {
     /// Returns [`RuntimeError`] when the master is gone or the resize fails.
     pub fn resize(&self, size: TermSize) -> Result<(), RuntimeError> {
         validate_size(size)?;
-        if let Some(master) = self.shared.master.lock().as_ref() {
-            master
-                .resize(pty_size(size))
-                .map_err(|e| RuntimeError::Pty(format!("resize: {e}")))?;
-        }
-        Ok(())
+        self.shared
+            .master
+            .lock()
+            .as_ref()
+            .ok_or(RuntimeError::Closed)?
+            .resize(pty_size(size))
+            .map_err(|e| RuntimeError::Pty(format!("resize: {e}")))
     }
 
     /// Copy the ring-buffered raw bytes (oldest first).
@@ -276,25 +279,34 @@ impl PtyRuntime {
         *self.shared.exit_code.lock()
     }
 
-    /// Shut the runtime down: close the master, signal the waiter / reader
-    /// threads, kill the child if it hasn't exited within [`EXIT_TIMEOUT`].
+    /// End the shell and join its threads. The child is killed unless it
+    /// already exited; success means the exit was observed within
+    /// [`EXIT_TIMEOUT`]. portable-pty 0.9.0's Windows `kill` can report an
+    /// error even when it worked, so its result alone is not proof.
     ///
     /// # Errors
-    /// Returns [`RuntimeError`] if killing the child fails.
+    /// [`RuntimeError::ExitTimeout`] when the child is still alive after the
+    /// timeout (or [`RuntimeError::Pty`] carrying the kill error).
     pub fn shutdown(&self) -> Result<(), RuntimeError> {
-        if self.shared.stopped.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        drop(self.shared.master.lock().take());
+        self.shared.stopped.store(true, Ordering::Release);
+        let kill_error = if self.is_exited() {
+            None
+        } else {
+            self.killer.lock().kill().err()
+        };
+        self.writer.lock().take();
         let deadline = Instant::now() + EXIT_TIMEOUT;
-        while !self.shared.exited.load(Ordering::Acquire) {
-            if Instant::now() >= deadline {
-                let _ = self.killer.lock().kill();
-                break;
-            }
+        while !self.is_exited() && Instant::now() < deadline {
             thread::sleep(POLL);
         }
+        if !self.is_exited() {
+            return Err(match kill_error {
+                Some(error) => RuntimeError::Pty(format!("kill: {error}")),
+                None => RuntimeError::ExitTimeout(EXIT_TIMEOUT),
+            });
+        }
         join(&self.waiter);
+        drop(self.shared.master.lock().take());
         join(&self.reader);
         Ok(())
     }
@@ -330,6 +342,10 @@ fn join(handle: &Mutex<Option<JoinHandle<()>>>) {
     }
 }
 
+/// Reads until end of stream, then waits (bounded) for the waiter to record
+/// the exit code and sends [`RuntimeEvent::Exited`] after the last data, so
+/// consumers never see output arrive after the exit. After shutdown the PTY
+/// is still drained, without emitting, until it closes.
 fn read_loop(
     mut reader: Box<dyn Read + Send>,
     mut decoder: Decoder,
@@ -338,22 +354,59 @@ fn read_loop(
 ) {
     let mut buffer = [0u8; READ_BUFFER];
     loop {
-        if shared.stopped.load(Ordering::Acquire) {
-            break;
-        }
         let n = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                if !shared.exited.load(Ordering::Acquire) && !shared.stopped.load(Ordering::Acquire)
+                {
+                    warn!(io_kind = ?error.kind(), "lumakit-pty: read failed");
+                }
+                break;
+            }
         };
+        if shared.stopped.load(Ordering::Acquire) {
+            continue;
+        }
         let raw = buffer[..n].to_vec();
         shared.ring.lock().push(&raw);
         let text = decoder.feed(&raw);
-        let event = RuntimeEvent::Data { raw, text };
-        if !send(&tx, &shared.stopped, event) {
-            break;
+        if !send(&tx, &shared.stopped, RuntimeEvent::Data { raw, text }) {
+            return;
         }
     }
+    if shared.stopped.load(Ordering::Acquire) {
+        return;
+    }
+    let tail = decoder.finish();
+    if !tail.is_empty()
+        && !send(
+            &tx,
+            &shared.stopped,
+            RuntimeEvent::Data {
+                raw: Vec::new(),
+                text: tail,
+            },
+        )
+    {
+        return;
+    }
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    while !shared.exited.load(Ordering::Acquire)
+        && !shared.stopped.load(Ordering::Acquire)
+        && Instant::now() < deadline
+    {
+        thread::sleep(POLL);
+    }
+    if !shared.exited.load(Ordering::Acquire) && !shared.stopped.load(Ordering::Acquire) {
+        warn!(
+            limit_ms = EXIT_TIMEOUT.as_millis() as u64,
+            "lumakit-pty: exit unconfirmed"
+        );
+    }
+    let exit_code = *shared.exit_code.lock();
+    send(&tx, &shared.stopped, RuntimeEvent::Exited { exit_code });
 }
 
 fn send(tx: &SyncSender<RuntimeEvent>, stopped: &AtomicBool, mut event: RuntimeEvent) -> bool {
@@ -388,5 +441,49 @@ mod tests {
             PtyRuntime::spawn(options),
             Err(RuntimeError::InvalidSize(_, _))
         ));
+    }
+
+    /// Real ConPTY: output precedes the exit event, the exit code is
+    /// reported, and writes after the exit are refused.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Starts a disposable real Windows ConPTY cmd.exe process"]
+    fn exit_follows_output_and_closes_writes() {
+        let runtime = PtyRuntime::spawn(SpawnOptions {
+            program: PathBuf::from("cmd.exe"),
+            args: vec![
+                "/D".into(),
+                "/C".into(),
+                "echo LUMAKIT_PTY_MARK & exit 7".into(),
+            ],
+            cwd: std::env::temp_dir(),
+            ..SpawnOptions::default()
+        })
+        .unwrap();
+        let events = runtime.take_events().unwrap();
+        let mut output = String::new();
+        let exit = loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap_or_else(|_| panic!("no exit event; output so far: {output:?}"));
+            match event {
+                RuntimeEvent::Data { text, .. } => {
+                    // ConPTY waits for a cursor-position report before it
+                    // runs the child; a terminal emulator would answer.
+                    if text.contains("\u{1b}[6n") {
+                        runtime.write(b"\x1b[1;1R").unwrap();
+                    }
+                    output.push_str(&text);
+                }
+                RuntimeEvent::Exited { exit_code } => break exit_code,
+            }
+        };
+        assert!(
+            output.contains("LUMAKIT_PTY_MARK"),
+            "no output before exit: {output:?}"
+        );
+        assert_eq!(exit, Some(7));
+        assert!(matches!(runtime.write(b"x"), Err(RuntimeError::Closed)));
+        runtime.shutdown().unwrap();
     }
 }

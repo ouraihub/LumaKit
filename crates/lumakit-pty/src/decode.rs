@@ -60,16 +60,7 @@ impl Decoder {
     /// Feed another chunk; returns freshly decoded UTF-8 text.
     pub fn feed(&mut self, bytes: &[u8]) -> String {
         match &mut self.inner {
-            None => {
-                // UTF-8 fast path. Append to residue only if the chunk ends
-                // mid-sequence; otherwise emit directly.
-                self.residue.extend_from_slice(bytes);
-                let residue = std::mem::take(&mut self.residue);
-                let (text, tail) = split_at_utf8_boundary(&residue);
-                let out = text.to_owned();
-                self.residue = tail.to_vec();
-                out
-            }
+            None => decode_utf8(&mut self.residue, bytes, false),
             Some(decoder) => {
                 // encoding_rs owns its own partial-sequence state when we
                 // pass `last=false`. Allocate a safe worst-case output
@@ -94,34 +85,36 @@ impl Decoder {
             let (_r, _read, _rep) = decoder.decode_to_string(b"", &mut out, true);
             out
         } else {
-            let text = String::from_utf8_lossy(&self.residue).into_owned();
-            self.residue.clear();
-            text
+            decode_utf8(&mut self.residue, &[], true)
         }
     }
 }
-/// Split `bytes` into the longest valid UTF-8 prefix and the trailing
-/// partial sequence. A partial sequence is at most 3 bytes long.
-fn split_at_utf8_boundary(bytes: &[u8]) -> (&str, &[u8]) {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => (text, &[]),
-        Err(error) => {
-            let valid_up_to = error.valid_up_to();
-            match error.error_len() {
-                Some(_) => {
-                    // Genuine invalid sequence; feed the prefix as-is and
-                    // keep the rest as residue so the next chunk may contain
-                    // the completion. `from_utf8_lossy` would eat the error.
-                    let (head, tail) = bytes.split_at(valid_up_to);
-                    (std::str::from_utf8(head).unwrap_or(""), tail)
-                }
-                None => {
-                    let (head, tail) = bytes.split_at(valid_up_to);
-                    (std::str::from_utf8(head).unwrap_or(""), tail)
-                }
-            }
+/// Append `bytes` to `pending` and decode as much as possible. Invalid
+/// sequences become U+FFFD; an incomplete trailing sequence stays in
+/// `pending` for the next call unless `end` is set.
+fn decode_utf8(pending: &mut Vec<u8>, bytes: &[u8], end: bool) -> String {
+    pending.extend_from_slice(bytes);
+    let mut text = String::with_capacity(pending.len());
+    let mut keep = 0;
+    let mut chunks = pending.utf8_chunks().peekable();
+    while let Some(chunk) = chunks.next() {
+        text.push_str(chunk.valid());
+        let invalid = chunk.invalid();
+        if invalid.is_empty() {
+            continue;
+        }
+        let incomplete_tail = !end
+            && chunks.peek().is_none()
+            && std::str::from_utf8(invalid).is_err_and(|error| error.error_len().is_none());
+        if incomplete_tail {
+            keep = invalid.len();
+        } else {
+            text.push('\u{fffd}');
         }
     }
+    let used = pending.len() - keep;
+    pending.drain(..used);
+    text
 }
 
 #[cfg(test)]
@@ -170,5 +163,12 @@ mod tests {
     fn utf8_passthrough_simple() {
         let mut decoder = Decoder::utf8();
         assert_eq!(decoder.feed(b"hello"), "hello");
+    }
+
+    #[test]
+    fn invalid_utf8_byte_is_replaced_and_later_text_still_flows() {
+        let mut decoder = Decoder::utf8();
+        assert_eq!(decoder.feed(b"a\xffb"), "a\u{fffd}b");
+        assert_eq!(decoder.feed(b"next"), "next");
     }
 }
