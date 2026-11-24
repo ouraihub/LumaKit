@@ -34,6 +34,7 @@ mod model_picker;
 mod overlays;
 mod toolbar;
 mod usage;
+pub use model_picker::effort_label;
 pub use usage::usage_totals;
 use usage::{context_summary, usage_details};
 

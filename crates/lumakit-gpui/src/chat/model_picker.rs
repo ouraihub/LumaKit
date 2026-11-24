@@ -173,7 +173,8 @@ fn effort_options(option: &ModelOption) -> Vec<Effort> {
         .collect()
 }
 
-fn effort_label(level: ReasoningEffort) -> &'static str {
+/// Short Chinese label for a reasoning effort, shared by the picker and host model editors.
+pub fn effort_label(level: ReasoningEffort) -> &'static str {
     use ReasoningEffort::*;
     match level {
         None => "关闭",
