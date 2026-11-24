@@ -368,3 +368,77 @@ fn source_locations_never_expose_absolute_build_paths() {
         "{lines:#?}"
     );
 }
+
+/// The `log`-bridge shape gpui-pre-windows emits through `log_err()`.
+fn backend_error(file: &str, code: &str) {
+    let message = format!("无效的窗口句柄。 ({code})");
+    tracing::event!(target: "log", tracing::Level::ERROR, { log.file = file, log.line = 701_u64 }, "{message}");
+}
+
+#[test]
+fn window_handle_noise_is_demoted_only_after_closing_and_only_for_the_backend() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let closing = Arc::new(AtomicBool::new(false));
+    let run = |level: crate::LogLevel, filter: &str, body: &dyn Fn()| {
+        let buffer = Buffer::default();
+        let subscriber = Registry::default()
+            .with(EnvFilter::new(filter))
+            .with(crate::shutdown::ShutdownNoise {
+                closing: closing.clone(),
+                level: Arc::new(Mutex::new(level)),
+            })
+            .with(SpanFields)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .event_format(GrepFormat::utc_closing(closing.clone()))
+                    .with_writer(buffer.clone()),
+            );
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(parse_line)
+            .collect::<Vec<_>>()
+    };
+    let backend = "src\\index.crates.io-x\\gpui-pre-windows-0.3.12\\src\\window.rs";
+    let open = run(crate::LogLevel::Info, "info", &|| {
+        backend_error(backend, "0x80070578")
+    });
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        open[0].level, "ERROR",
+        "an open window's handle failure is a real error"
+    );
+
+    closing.store(true, Ordering::Release);
+    let closed = run(crate::LogLevel::Info, "info", &|| {
+        backend_error(backend, "0x80070578");
+        backend_error(backend, "0x80040102");
+        backend_error("src\\app\\window.rs", "0x80070578");
+        backend_error(backend, "0x80004005");
+    });
+    let levels: Vec<_> = closed.iter().map(|line| line.level.as_str()).collect();
+    assert_eq!(
+        levels,
+        ["ERROR", "ERROR"],
+        "INFO drops the demoted noise, keeps other files/codes"
+    );
+    assert!(
+        closed
+            .iter()
+            .all(|line| !line.raw.contains("UI_WINDOW_HANDLE_CLOSED"))
+    );
+
+    let debug = run(crate::LogLevel::Debug, "debug", &|| {
+        backend_error(backend, "0x80040102")
+    });
+    assert_eq!(debug.len(), 1);
+    assert_eq!(debug[0].level, "DEBUG");
+    assert!(
+        debug[0].raw.contains("|Reason:UI_WINDOW_HANDLE_CLOSED|"),
+        "{:?}",
+        debug[0].raw
+    );
+}

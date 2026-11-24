@@ -5,7 +5,13 @@
 //! [`LogHandle::init`](crate::LogHandle::init) 已安装这两层；自带 appender 的宿主（例如按日滚动）
 //! 用 `registry().with(SpanFields).with(fmt::layer().event_format(GrepFormat::new(timer)))` 组合。
 
-use std::fmt::{self, Write as _};
+use std::{
+    fmt::{self, Write as _},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tracing::{
     Event, Subscriber,
@@ -197,19 +203,34 @@ fn is_operation<S: for<'a> LookupSpan<'a>>(span: &SpanRef<'_, S>) -> bool {
 /// 文件日志的事件格式：`<时间> <级别> <段>|<段>…`；时间格式由 `T` 决定，默认 UTC RFC 3339。
 pub struct GrepFormat<T = SystemTime> {
     timer: T,
+    /// Set only by [`LogHandle::init`](crate::LogHandle::init): close-time backend noise prints as DEBUG.
+    closing: Option<Arc<AtomicBool>>,
 }
 
 impl GrepFormat {
     /// 使用 UTC RFC 3339 时间。
     pub fn utc() -> Self {
-        Self { timer: SystemTime }
+        Self {
+            timer: SystemTime,
+            closing: None,
+        }
+    }
+
+    pub(crate) fn utc_closing(closing: Arc<AtomicBool>) -> Self {
+        Self {
+            timer: SystemTime,
+            closing: Some(closing),
+        }
     }
 }
 
 impl<T: FormatTime> GrepFormat<T> {
     /// 使用宿主提供的时间格式；时间段不得包含空格，否则解析会把它与级别混淆。
     pub fn new(timer: T) -> Self {
-        Self { timer }
+        Self {
+            timer,
+            closing: None,
+        }
     }
 }
 
@@ -226,7 +247,16 @@ where
         event: &Event<'_>,
     ) -> fmt::Result {
         self.timer.format_time(&mut writer)?;
-        write!(writer, " {:<5} ", event.metadata().level())?;
+        let demoted = self
+            .closing
+            .as_ref()
+            .is_some_and(|closing| closing.load(Ordering::Acquire))
+            && crate::shutdown::is_window_handle_noise(event);
+        if demoted {
+            write!(writer, " {:<5} ", tracing::Level::DEBUG)?;
+        } else {
+            write!(writer, " {:<5} ", event.metadata().level())?;
+        }
         let mut line = Line {
             writer: &mut writer,
             first: true,
@@ -295,7 +325,11 @@ where
         };
         event.record(&mut fields);
         fields.result?;
-        if let Some(message) = fields.message {
+        let message = fields.message;
+        if demoted {
+            line.put("Reason", crate::shutdown::REASON)?;
+        }
+        if let Some(message) = message {
             line.put("Msg", message)?;
         }
         writeln!(writer)

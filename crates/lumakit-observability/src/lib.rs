@@ -5,7 +5,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use thiserror::Error;
 use tracing_subscriber::{
@@ -17,6 +20,7 @@ mod operation;
 mod panic_log;
 mod parse;
 mod redact;
+mod shutdown;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -96,6 +100,7 @@ pub struct LogHandle {
     path: PathBuf,
     reload: reload::Handle<EnvFilter, Registry>,
     writer: SharedWriter,
+    closing: Arc<AtomicBool>,
 }
 impl LogHandle {
     /// 创建目录并安装全局日志订阅器，将日志追加到 `app.log`。
@@ -120,24 +125,37 @@ impl LogHandle {
         let (layer, reload) = reload::Layer::new(filter);
         let shared = SharedWriter::open(path.clone(), max_bytes)?;
         let output_writer = shared.clone();
+        let level = Arc::new(Mutex::new(level));
+        let closing = Arc::new(AtomicBool::new(false));
         let output = fmt::layer()
             .with_ansi(false)
-            .event_format(GrepFormat::utc())
+            .event_format(GrepFormat::utc_closing(closing.clone()))
             .with_writer(move || output_writer.clone())
             .log_internal_errors(false);
         Registry::default()
             .with(layer)
+            .with(shutdown::ShutdownNoise {
+                closing: closing.clone(),
+                level: level.clone(),
+            })
             .with(SpanFields)
             .with(output)
             .try_init()
             .map_err(|_| LogError::AlreadyInitialized)?;
         panic_log::install(shared.clone());
         Ok(Self {
-            level: Arc::new(Mutex::new(level)),
+            level,
             path,
             reload,
             writer: shared,
+            closing,
         })
+    }
+    /// 宿主确认窗口即将关闭后调用一次；之后 GPUI Windows 后端对已销毁窗口句柄
+    /// （`0x80070578`/`0x80040102`）的 ERROR 记为 DEBUG 并带 `Reason:UI_WINDOW_HANDLE_CLOSED`。
+    /// 其他错误及关闭前的同类错误保持原级别。
+    pub fn mark_closing(&self) {
+        self.closing.store(true, Ordering::Release);
     }
     /// 返回共享的当前级别；锁中毒时读取锁内最后保存的值，不替换为默认级别。
     pub fn level(&self) -> LogLevel {
