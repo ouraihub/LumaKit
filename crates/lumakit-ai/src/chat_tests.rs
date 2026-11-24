@@ -233,15 +233,20 @@ fn failed_close_preserves_idle_session_for_save_recovery() -> Result<(), TestErr
     Ok(())
 }
 
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+thread_local! {
+    /// This thread's capture buffer while `capture_logs` runs; other threads' events are discarded.
+    static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
 
-impl std::io::Write for LogBuffer {
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .map_err(|_| std::io::Error::other("log buffer poisoned"))?
-            .extend_from_slice(bytes);
+        CAPTURE.with(|capture| {
+            if let Some(buffer) = capture.borrow_mut().as_mut() {
+                buffer.extend_from_slice(bytes);
+            }
+        });
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -249,28 +254,31 @@ impl std::io::Write for LogBuffer {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self {
-        self.clone()
-    }
-}
-
+/// One process-wide subscriber, routed per thread. A scoped `with_default` per test races
+/// tracing's process-wide callsite interest cache: a parallel test registering the same callsite
+/// while no capture subscriber is alive caches it as "never", and the capture loses that event.
 fn capture_logs(
     body: impl FnOnce() -> Result<(), TestError>,
 ) -> Result<Vec<lumakit_observability::LogLine>, TestError> {
     use tracing_subscriber::layer::SubscriberExt;
-    let buffer = LogBuffer::default();
-    let subscriber = tracing_subscriber::Registry::default()
-        .with(lumakit_observability::SpanFields)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .event_format(lumakit_observability::GrepFormat::utc())
-                .with_writer(buffer.clone()),
-        );
-    tracing::subscriber::with_default(subscriber, body)?;
-    let bytes = buffer.0.lock().map_err(|_| "log buffer poisoned")?.clone();
+    static INSTALLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(lumakit_observability::SpanFields)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .event_format(lumakit_observability::GrepFormat::utc())
+                    .with_writer(|| ThreadCapture),
+            );
+        tracing::subscriber::set_global_default(subscriber).is_ok()
+    });
+    if !*INSTALLED {
+        return Err("another global subscriber was installed in lumakit-ai tests".into());
+    }
+    CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+    let result = body();
+    let bytes = CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default());
+    result?;
     Ok(String::from_utf8(bytes)?
         .lines()
         .map(lumakit_observability::parse_line)
