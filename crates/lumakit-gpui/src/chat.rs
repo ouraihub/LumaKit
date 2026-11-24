@@ -427,14 +427,6 @@ impl ChatPanel {
                     Overlay::History,
                     cx,
                 ),
-            ))
-            .child(self.icon_action(
-                "settings",
-                IconName::Settings,
-                "模型设置",
-                true,
-                ChatAction::OpenSettings,
-                cx,
             ));
         // The transcript and composer share one centered column so wide windows keep a readable line length.
         let mut transcript = col().w_full().max_w(size::CONTENT_MAX).gap(space::S16);
