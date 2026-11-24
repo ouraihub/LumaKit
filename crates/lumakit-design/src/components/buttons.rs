@@ -1,7 +1,7 @@
 //! Icon-only buttons: the header icon button and the activity-bar item.
 
 use gpui_kit::{
-    App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce, Role,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_kit::{assets::IconName, component::Icon};
@@ -147,7 +147,9 @@ impl RenderOnce for ActivityItem {
             .h(size::ACTIVITY_BAR)
             .cursor_pointer()
             .text_color(color)
+            .role(Role::Button)
             .aria_label(tooltip.clone())
+            .aria_selected(self.active)
             .when(self.active, |d| d.bg(r.control_bg_selected))
             .when(!self.active, |d| d.hover(|s| s.bg(r.control_bg_hovered)))
             .tooltip(move |window, cx| {

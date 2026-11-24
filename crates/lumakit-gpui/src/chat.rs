@@ -145,7 +145,24 @@ impl ChatPanel {
         ];
         let (picker, subscription) = model_picker::PickerState::new(window, cx);
         subscriptions.push(subscription);
-        let usage_status = cx.new(|cx| lumakit_usage_status::ContextStatusView::new(window, cx));
+        // The status line is the only usage entry; it opens the panel's own usage layer instead of
+        // its smaller built-in popup, so conversation totals and the latest answer's details stay reachable.
+        let usage_status = cx.new(|cx| {
+            let mut view = lumakit_usage_status::ContextStatusView::new(window, cx);
+            view.set_builtin_details(false, cx);
+            view
+        });
+        subscriptions.push(
+            cx.subscribe_in(
+                &usage_status,
+                window,
+                |this, _, event, window, cx| match event {
+                    lumakit_usage_status::UsageStatusEvent::OpenDetails => {
+                        this.open(Overlay::Usage, "usage".into(), window, cx)
+                    }
+                },
+            ),
+        );
         Self {
             input,
             search,
@@ -259,24 +276,6 @@ impl ChatPanel {
             .disabled(!enabled)
             .on_click(cx.listener(move |this, _, _, cx| this.emit(action.clone(), cx)))
     }
-    fn layer_button(
-        &self,
-        id: impl Into<SharedString>,
-        label: impl Into<SharedString>,
-        enabled: bool,
-        layer: Overlay,
-        cx: &Context<Self>,
-    ) -> Button {
-        let key = id.into();
-        Button::new(key.clone())
-            .small()
-            .ghost()
-            .label(label)
-            .disabled(!enabled)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open(layer.clone(), key.clone(), window, cx)
-            }))
-    }
     fn icon_action(
         &self,
         id: impl Into<ElementId>,
@@ -307,7 +306,7 @@ impl ChatPanel {
             }))
     }
     /// Wrap a menu trigger so its bounds are known when the menu opens. `key` MUST equal the trigger's id.
-    fn tracked(&self, key: impl Into<SharedString>, trigger: Button) -> Div {
+    fn tracked(&self, key: impl Into<SharedString>, trigger: impl IntoElement) -> Div {
         let (key, anchors) = (key.into(), self.anchors.clone());
         div()
             .on_children_prepainted(move |bounds, _, _| {
@@ -628,12 +627,7 @@ impl ChatPanel {
                 .accessibility_label("关闭生成图片"),
             );
         }
-        toolbar = toolbar
-            .child(self.model_pill(session, options, cx))
-            .child(self.tracked(
-                "usage",
-                self.layer_button("usage", "用量", true, Overlay::Usage, cx),
-            ));
+        toolbar = toolbar.child(self.model_pill(session, options, cx));
         if !self.follow {
             toolbar = toolbar.child(
                 icon_button("bottom", IconName::ArrowDown, "回到底部").on_click(cx.listener(
@@ -670,7 +664,7 @@ impl ChatPanel {
                         .flex()
                         .justify_end()
                         .overflow_hidden()
-                        .child(self.usage_status.clone()),
+                        .child(self.tracked("usage", self.usage_status.clone())),
                 )
                 .child(if session.busy() {
                     self.icon_action(
