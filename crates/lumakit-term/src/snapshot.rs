@@ -56,7 +56,7 @@ impl From<[u8; 4]> for SnapshotRgba {
 }
 
 /// Colour palette the snapshot resolves against (04 §6.5 host palette).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     /// Default foreground.
     pub foreground: SnapshotRgba,

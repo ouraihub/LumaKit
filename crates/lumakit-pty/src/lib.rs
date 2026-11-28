@@ -15,4 +15,4 @@ mod shells;
 pub use decode::{DecodeError, Decoder};
 pub use ring::RingBuffer;
 pub use runtime::{PtyRuntime, RuntimeError, RuntimeEvent, SpawnOptions, TermSize};
-pub use shells::{Shell, ShellCatalog, discover};
+pub use shells::{Shell, ShellCatalog, ShellKind, discover};

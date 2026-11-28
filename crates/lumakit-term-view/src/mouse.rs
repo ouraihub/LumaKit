@@ -107,6 +107,26 @@ pub fn encode_press(
     })
 }
 
+/// Encode a button release. SGR (1006) reports the released button with a
+/// trailing `m`; the legacy encoding cannot name the button and sends code 3.
+/// `None` when the terminal is not in a mouse-reporting mode.
+pub fn encode_release(
+    button: MouseButton,
+    cell: Cell,
+    modifiers: Modifiers,
+    mode: TermMode,
+) -> Option<String> {
+    if !reports_buttons(mode) && !reports_motion(mode) {
+        return None;
+    }
+    Some(if mode.contains(TermMode::SGR_MOUSE) {
+        let code = modifier_bits(modifiers) | button_code(button);
+        format!("\x1b[<{};{};{}m", code, cell.col + 1, cell.row + 1)
+    } else {
+        encode_basic(modifier_bits(modifiers) | 3, cell, 'M')
+    })
+}
+
 /// Encode a wheel event. When the alt screen is active, this instead
 /// returns the arrow-key sequence so programs that do not opt into mouse
 /// reporting still scroll.
@@ -199,6 +219,7 @@ mod tests {
                 style: gpui_kit::FontStyle::Normal,
                 fallbacks: None,
             },
+            symbols: None,
         }
     }
 
@@ -230,6 +251,33 @@ mod tests {
         )
         .unwrap();
         assert!(encoded.starts_with("\x1b[<0;4;8"));
+    }
+
+    #[test]
+    fn release_uses_lowercase_m_in_sgr_and_code_3_in_legacy() {
+        let cell = Cell { col: 3, row: 7 };
+        let sgr = TermMode::SGR_MOUSE | TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            encode_release(MouseButton::Left, cell, Modifiers::default(), sgr).unwrap(),
+            "\x1b[<0;4;8m"
+        );
+        let legacy = encode_release(
+            MouseButton::Left,
+            cell,
+            Modifiers::default(),
+            TermMode::MOUSE_REPORT_CLICK,
+        )
+        .unwrap();
+        assert_eq!(legacy.as_bytes()[3], 3 + 32);
+        assert!(
+            encode_release(
+                MouseButton::Left,
+                cell,
+                Modifiers::default(),
+                TermMode::empty()
+            )
+            .is_none()
+        );
     }
 
     #[test]

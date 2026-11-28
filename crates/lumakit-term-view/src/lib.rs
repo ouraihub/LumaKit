@@ -19,8 +19,8 @@ mod palette;
 pub use element::{TermElement, TermPrepaint};
 pub use input::{encode_key, replace_composition, utf16_byte};
 pub use mouse::{
-    Cell, Modifiers, MouseButton, Side, ViewPoint, WheelDirection, encode_press, encode_wheel,
-    hit_test, side,
+    Cell, Modifiers, MouseButton, Side, ViewPoint, WheelDirection, encode_press, encode_release,
+    encode_wheel, hit_test, side,
 };
 pub use overlay::{CellRange, GhostText, HighlightBand, Overlays};
 pub use paint::{Metrics, paint_frame};

@@ -23,6 +23,10 @@ pub struct Metrics {
     pub font_size: Pixels,
     /// Base font to use for shaped segments.
     pub font: Font,
+    /// Font for Private Use Area glyphs (Nerd Font icons). Platform
+    /// fallback chains only search installed fonts, so a bundled symbols
+    /// font must be named explicitly; `None` leaves PUA text to `font`.
+    pub symbols: Option<Font>,
 }
 
 /// Paint one snapshot. Returns the number of `shape_line` calls made (used
@@ -110,11 +114,7 @@ pub fn paint_frame(
             if !decorated && seg.text.trim_end().is_empty() {
                 continue;
             }
-            let runs: Vec<TextRun> = seg
-                .runs
-                .iter()
-                .map(|run| make_run(run.len, run.style, m))
-                .collect();
+            let runs = split_symbols(&seg.text, &seg.runs, m);
             let advance = if seg.wide { 2.0 } else { 1.0 } * m.cell_width;
             let line = window.text_system().shape_line(
                 SharedString::from(seg.text.clone()),
@@ -227,5 +227,127 @@ fn make_run(len: usize, style: lumakit_term::RunStyle, m: &Metrics) -> TextRun {
             color: Some(fg),
             thickness: px(1.0),
         }),
+    }
+}
+
+/// U+E000–U+F8FF and the supplementary private-use planes.
+fn is_private_use(c: char) -> bool {
+    matches!(c as u32, 0xE000..=0xF8FF | 0xF0000..=0x10FFFD)
+}
+
+/// Text runs for one segment; with a symbols font, each style run is cut
+/// where text enters or leaves the Private Use Area.
+fn split_symbols(text: &str, runs: &[lumakit_term::StyleRun], m: &Metrics) -> Vec<TextRun> {
+    let mut out = Vec::with_capacity(runs.len());
+    let mut start = 0;
+    for run in runs {
+        let end = (start + run.len).min(text.len());
+        let Some(symbols) = &m.symbols else {
+            out.push(make_run(run.len, run.style, m));
+            start = end;
+            continue;
+        };
+        let mut piece_start = start;
+        let mut piece_pua = None;
+        for (offset, c) in text[start..end].char_indices() {
+            let pua = is_private_use(c);
+            if piece_pua.is_some_and(|p| p != pua) {
+                let at = start + offset;
+                out.push(styled(
+                    at - piece_start,
+                    run.style,
+                    piece_pua == Some(true),
+                    symbols,
+                    m,
+                ));
+                piece_start = at;
+            }
+            piece_pua = Some(pua);
+        }
+        if end > piece_start {
+            out.push(styled(
+                end - piece_start,
+                run.style,
+                piece_pua == Some(true),
+                symbols,
+                m,
+            ));
+        }
+        start = end;
+    }
+    out
+}
+
+fn styled(
+    len: usize,
+    style: lumakit_term::RunStyle,
+    symbol: bool,
+    symbols: &Font,
+    m: &Metrics,
+) -> TextRun {
+    let mut run = make_run(len, style, m);
+    if symbol {
+        run.font = Font {
+            weight: run.font.weight,
+            style: run.font.style,
+            ..symbols.clone()
+        };
+    }
+    run
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn font(family: &str) -> Font {
+        Font {
+            family: family.to_owned().into(),
+            features: Default::default(),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+            fallbacks: None,
+        }
+    }
+
+    fn metrics(symbols: Option<Font>) -> Metrics {
+        Metrics {
+            cell_width: 8.0,
+            line_height: 16.0,
+            font_size: px(14.0),
+            font: font("Mono"),
+            symbols,
+        }
+    }
+
+    #[test]
+    fn private_use_glyphs_get_the_symbols_font() {
+        let text = "a\u{e0a0}b";
+        let runs = [lumakit_term::StyleRun {
+            len: text.len(),
+            style: lumakit_term::RunStyle {
+                foreground: SnapshotRgba::new(255, 255, 255, 255),
+                bold: false,
+                italic: false,
+                underline: false,
+                strike: false,
+            },
+        }];
+        let out = split_symbols(text, &runs, &metrics(Some(font("Symbols"))));
+        let families: Vec<_> = out
+            .iter()
+            .map(|r| (r.len, r.font.family.to_string()))
+            .collect();
+        assert_eq!(
+            families,
+            [
+                (1, "Mono".into()),
+                (3, "Symbols".into()),
+                (1, "Mono".into())
+            ]
+        );
+        let plain = split_symbols(text, &runs, &metrics(None));
+        assert_eq!(plain.len(), 1);
     }
 }
